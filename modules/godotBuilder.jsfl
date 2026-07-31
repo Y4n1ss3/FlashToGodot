@@ -1270,6 +1270,10 @@ function _postProcessMasks(root, sym, anim, boundsLookup, exportDir, getExt, sca
                 var maskPos = {x: 0, y: 0};
                 var hasPosTrack = false;
                 var maskPosTrackIdx = -1;
+                var maskScale = {x: 1, y: 1};
+                var hasScaleTrack = false;
+                var maskScaleTrackIdx = -1;
+                
                 if (anim) {
                     for (var tIdx = 0; tIdx < anim.tracks.length; tIdx++) {
                         var trackPath = anim.tracks[tIdx].path;
@@ -1278,6 +1282,12 @@ function _postProcessMasks(root, sym, anim, boundsLookup, exportDir, getExt, sca
                             maskPosTrackIdx = tIdx;
                             if (anim.tracks[tIdx].keys.values.length > 0) {
                                 maskPos = anim.tracks[tIdx].keys.values[0];
+                            }
+                        } else if (trackPath === currentMaskWrapperPath + ":scale") {
+                            hasScaleTrack = true;
+                            maskScaleTrackIdx = tIdx;
+                            if (anim.tracks[tIdx].keys.values.length > 0) {
+                                maskScale = anim.tracks[tIdx].keys.values[0];
                             }
                         } else if (trackPath === currentMaskWrapperPath + ":modulate") {
                             anim.tracks[tIdx].path = maskSpritePath + ":self_modulate";
@@ -1290,7 +1300,10 @@ function _postProcessMasks(root, sym, anim, boundsLookup, exportDir, getExt, sca
                     wrapper: currentMaskWrapper,
                     pos: maskPos,
                     hasPosTrack: hasPosTrack,
-                    posTrackIdx: maskPosTrackIdx
+                    posTrackIdx: maskPosTrackIdx,
+                    scale: maskScale,
+                    hasScaleTrack: hasScaleTrack,
+                    scaleTrackIdx: maskScaleTrackIdx
                 };
             }
         }
@@ -1312,6 +1325,9 @@ function _postProcessMasks(root, sym, anim, boundsLookup, exportDir, getExt, sca
         var maskPos = maskData.pos;
         var hasPosTrack = maskData.hasPosTrack;
         var maskPosTrackIdx = maskData.posTrackIdx;
+        var maskScale = maskData.scale;
+        var hasScaleTrack = maskData.hasScaleTrack;
+        var maskScaleTrackIdx = maskData.scaleTrackIdx;
         var currentMaskLayerName = maskName;
 
         var layerName = _sanitize_name(layer.unique_name);
@@ -1341,6 +1357,11 @@ function _postProcessMasks(root, sym, anim, boundsLookup, exportDir, getExt, sca
             var smatch = currentMaskSprite.properties["scale"].match(/Vector2\(([^,]+),\s*([^)]+)\)/);
             if (smatch) { ssx = parseFloat(smatch[1]); ssy = parseFloat(smatch[2]); }
         }
+        
+        if (hasScaleTrack) {
+            ssx *= maskScale.x;
+            ssy *= maskScale.y;
+        }
 
         var invX = (-mx - sx) / ssx;
         var invY = (-my - sy) / ssy;
@@ -1357,9 +1378,38 @@ function _postProcessMasks(root, sym, anim, boundsLookup, exportDir, getExt, sca
                 var mTime = mTrack.keys.times[m];
                 var mVal = mTrack.keys.values[m];
                 var mTrans = mTrack.keys.transitions[m];
-                var ivX = (-mVal.x - sx) / ssx;
-                var ivY = (-mVal.y - sy) / ssy;
+                var curScaleX = ssx;
+                var curScaleY = ssy;
+                
+                if (hasScaleTrack && maskScaleTrackIdx !== -1) {
+                    var sTrack = anim.tracks[maskScaleTrackIdx];
+                    var scaleMatch = null;
+                    for (var sm = 0; sm < sTrack.keys.times.length; sm++) {
+                        if (sTrack.keys.times[sm] <= mTime) {
+                            scaleMatch = sTrack.keys.values[sm];
+                        } else { break; }
+                    }
+                    if (scaleMatch) {
+                        curScaleX = scaleMatch.x;
+                        curScaleY = scaleMatch.y;
+                    }
+                }
+                
+                var ivX = (-mVal.x - sx) / curScaleX;
+                var ivY = (-mVal.y - sy) / curScaleY;
                 anim.addTrackKey(newPath + ":position", "value", mTime, {x: ivX, y: ivY}, mTrans);
+            }
+        }
+        
+        if (anim && hasScaleTrack && maskScaleTrackIdx !== -1) {
+            var sTrack = anim.tracks[maskScaleTrackIdx];
+            for (var m = 0; m < sTrack.keys.times.length; m++) {
+                var mTime = sTrack.keys.times[m];
+                var mVal = sTrack.keys.values[m];
+                var mTrans = sTrack.keys.transitions[m];
+                var ivX = 1.0 / mVal.x;
+                var ivY = 1.0 / mVal.y;
+                anim.addTrackKey(newPath + ":scale", "value", mTime, {x: ivX, y: ivY}, mTrans);
             }
         }
 
