@@ -1283,10 +1283,14 @@ function _postProcessMasks(root, sym, anim, boundsLookup, exportDir, getExt, sca
                 }
 
                 maskPos = {x: 0, y: 0};
+                var hasPosTrack = false;
+                var maskPosTrackIdx = -1;
                 if (anim) {
                     for (var tIdx = 0; tIdx < anim.tracks.length; tIdx++) {
                         var trackPath = anim.tracks[tIdx].path;
                         if (trackPath === currentMaskWrapperPath + ":position") {
+                            hasPosTrack = true;
+                            maskPosTrackIdx = tIdx;
                             if (anim.tracks[tIdx].keys.values.length > 0) {
                                 maskPos = anim.tracks[tIdx].keys.values[0];
                             }
@@ -1318,9 +1322,11 @@ function _postProcessMasks(root, sym, anim, boundsLookup, exportDir, getExt, sca
             var mx = maskPos.x, my = maskPos.y;
             var sx = 0, sy = 0;
             var ssx = 1.0, ssy = 1.0;
-            if (currentMaskSprite.properties["position"]) {
-                var match = currentMaskSprite.properties["position"].match(/Vector2\(([^,]+),\s*([^)]+)\)/);
-                if (match) { sx = parseFloat(match[1]); sy = parseFloat(match[2]); }
+            if (currentMaskSprite !== currentMaskWrapper) {
+                if (currentMaskSprite.properties["position"]) {
+                    var match = currentMaskSprite.properties["position"].match(/Vector2\(([^,]+),\s*([^)]+)\)/);
+                    if (match) { sx = parseFloat(match[1]); sy = parseFloat(match[2]); }
+                }
             }
             if (currentMaskSprite.properties["scale"]) {
                 var smatch = currentMaskSprite.properties["scale"].match(/Vector2\(([^,]+),\s*([^)]+)\)/);
@@ -1335,6 +1341,19 @@ function _postProcessMasks(root, sym, anim, boundsLookup, exportDir, getExt, sca
             }
 
             var newPath = root.getPathTo(currentMaskSprite) + "/" + layerNode.name;
+            
+            if (anim && hasPosTrack && maskPosTrackIdx !== -1) {
+                var mTrack = anim.tracks[maskPosTrackIdx];
+                for (var m = 0; m < mTrack.keys.times.length; m++) {
+                    var mTime = mTrack.keys.times[m];
+                    var mVal = mTrack.keys.values[m];
+                    var mTrans = mTrack.keys.transitions[m];
+                    var ivX = (-mVal.x - sx) / ssx;
+                    var ivY = (-mVal.y - sy) / ssy;
+                    anim.addTrackKey(newPath + ":position", "value", mTime, {x: ivX, y: ivY}, mTrans);
+                }
+            }
+
             if (anim) {
                 for (var tIdx = 0; tIdx < anim.tracks.length; tIdx++) {
                     var trackPath = anim.tracks[tIdx].path;
@@ -1926,10 +1945,15 @@ function _processElementNode(elem, parent, ownerRoot, anim, startTime, duration,
                     } else {
                         delete polyNode.properties["polygons"];
                     }
-                    polyNode.properties["texture"] = texIdStr;
-                    polyNode.properties["uv"] = uvsStr;
-                    polyNode.properties["color"] = "Color(1, 1, 1, 1)";
-                    polyNode.properties["visible"] = true;
+                    if (elem._isMaskShape) {
+                        polyNode.properties["color"] = "Color(1, 1, 1, 1)";
+                        polyNode.properties["visible"] = true;
+                    } else {
+                        polyNode.properties["texture"] = texIdStr;
+                        polyNode.properties["uv"] = uvsStr;
+                        polyNode.properties["color"] = "Color(1, 1, 1, 1)";
+                        polyNode.properties["visible"] = true;
+                    }
                 } else {
                     anim.addTrackKey(polyPath + ":polygon", "value", startTime, pointsStr, 0.0);
                     if (group.polygons.length > 1) {
@@ -1937,10 +1961,15 @@ function _processElementNode(elem, parent, ownerRoot, anim, startTime, duration,
                     } else {
                         anim.addTrackKey(polyPath + ":polygons", "value", startTime, "[]", 0.0);
                     }
-                    anim.addTrackKey(polyPath + ":texture", "value", startTime, texIdStr, 0.0);
-                    anim.addTrackKey(polyPath + ":uv", "value", startTime, uvsStr, 0.0);
-                    anim.addTrackKey(polyPath + ":color", "value", startTime, "Color(1, 1, 1, 1)", 0.0);
-                    anim.addTrackKey(polyPath + ":visible", "value", startTime, true, 0.0);
+                    if (elem._isMaskShape) {
+                        anim.addTrackKey(polyPath + ":color", "value", startTime, "Color(1, 1, 1, 1)", 0.0);
+                        anim.addTrackKey(polyPath + ":visible", "value", startTime, true, 0.0);
+                    } else {
+                        anim.addTrackKey(polyPath + ":texture", "value", startTime, texIdStr, 0.0);
+                        anim.addTrackKey(polyPath + ":uv", "value", startTime, uvsStr, 0.0);
+                        anim.addTrackKey(polyPath + ":color", "value", startTime, "Color(1, 1, 1, 1)", 0.0);
+                        anim.addTrackKey(polyPath + ":visible", "value", startTime, true, 0.0);
+                    }
                 }
             }
             
@@ -2715,6 +2744,38 @@ function buildSceneForSymbol(sym, frameRate, exportDir, boundsLookup, boundsInde
                     var modulateNeedsCanvasGroup = !!modulateNeedsCanvasGroupMap[fullOccKey];
                     
                     var layerZIndex = (sym.layers.length - 1 - i) * 1000 + e;
+                    
+                    var originalElem = elem;
+                    if (layer.layerType === "mask" && elem.elementType === "instance" && symbolMap) {
+                        var maskSym = symbolMap[elem.symbolName];
+                        var shapeElem = null;
+                        if (maskSym && maskSym.layers) {
+                            for (var ml = 0; ml < maskSym.layers.length; ml++) {
+                                var mlayer = maskSym.layers[ml];
+                                if (mlayer.keyframes && mlayer.keyframes.length > 0) {
+                                    for (var me = 0; me < mlayer.keyframes[0].elements.length; me++) {
+                                        var candidate = mlayer.keyframes[0].elements[me];
+                                        if (candidate.elementType === "shape" || candidate._inlineSprite) {
+                                            shapeElem = candidate;
+                                            break;
+                                        }
+                                    }
+                                }
+                                if (shapeElem) break;
+                            }
+                        }
+                        if (shapeElem) {
+                            elem = _deepClone(shapeElem);
+                            elem._isMaskShape = true;
+                            if (originalElem.matrix && shapeElem.matrix) {
+                                elem.matrix = _composeMatrix(originalElem.matrix, shapeElem.matrix);
+                            } else if (originalElem.matrix) {
+                                elem.matrix = _deepClone(originalElem.matrix);
+                            }
+                            if (typeof fl !== "undefined") fl.trace("  -> [mask inline] inlined shape from " + originalElem.symbolName + " into mask layer " + layer.name);
+                        }
+                    }
+
                     var isInstance = (elem.elementType === "instance");
                     var poolKey = occKey + "_layer_" + layerName;
                     var uniqueNodeName = allocateOrExtendWrapper(targetParent.name, poolKey, fullOccKey, startTime, startTime + duration, isInstance);
