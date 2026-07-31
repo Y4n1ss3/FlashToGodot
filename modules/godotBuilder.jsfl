@@ -1236,45 +1236,30 @@ function _postProcessMasks(root, sym, anim, boundsLookup, exportDir, getExt, sca
         }
     }
 
-    var currentMaskSprite = null;
-    var currentMaskWrapper = null;
-    var currentMaskWrapperPath = "";
-    var currentMaskLayerName = "";
-    var maskPos = {x: 0, y: 0};
+    var maskDataMap = {}; // Maps layer.name to mask data object
 
     for (var i = 0; i < sym.layers.length; i++) {
         var layer = sym.layers[i];
-        var layerName = _sanitize_name(layer.unique_name);
-        var layerNode = root.getNodeOrNull(layerName);
-        if (!layerNode) { currentMaskSprite = null; continue; }
-
-        var isMaskLayer   = (layer.layerType === "mask");
-        var isGuidedLayer = (layer.layerType === "masked")
-            || (layer.layerType === "normal" && layer.parentLayerName && maskLayerNames[layer.parentLayerName] !== undefined);
-
-        if (isMaskLayer) {
-            currentMaskSprite = null;
-            currentMaskWrapper = null;
-            currentMaskLayerName = layer.name;
-
+        if (layer.layerType === "mask") {
+            var layerName = _sanitize_name(layer.unique_name);
+            var layerNode = root.getNodeOrNull(layerName);
+            if (!layerNode) continue;
+            
             var found = _findMaskSprite(layerNode);
             if (found) {
-                currentMaskSprite = found.sprite;
-                currentMaskWrapper = found.wrapper;
-            }
-
-            if (currentMaskSprite && currentMaskWrapper) {
+                var currentMaskSprite = found.sprite;
+                var currentMaskWrapper = found.wrapper;
+                
                 if (currentMaskSprite.type === "PackedScene") {
                     var inlined = _inlineMaskAsSprite(currentMaskSprite, boundsLookup, exportDir, getExt, scaleFactor, root, anim, extResources, extIdMap);
                     if (!inlined) {
                         if (typeof fl !== "undefined") fl.trace("  -> [mask] skipping mask processing for " + sym.name + "/" + layer.name + " (inlining failed)");
-                        currentMaskSprite = null;
-                        currentMaskWrapper = null;
                         continue;
                     }
                 }
+                
                 currentMaskSprite.properties["clip_children"] = 1;
-                currentMaskWrapperPath = root.getPathTo(currentMaskWrapper);
+                var currentMaskWrapperPath = root.getPathTo(currentMaskWrapper);
                 var maskSpritePath = root.getPathTo(currentMaskSprite);
 
                 if (currentMaskWrapper.properties["modulate"] !== undefined) {
@@ -1282,7 +1267,7 @@ function _postProcessMasks(root, sym, anim, boundsLookup, exportDir, getExt, sca
                     delete currentMaskWrapper.properties["modulate"];
                 }
 
-                maskPos = {x: 0, y: 0};
+                var maskPos = {x: 0, y: 0};
                 var hasPosTrack = false;
                 var maskPosTrackIdx = -1;
                 if (anim) {
@@ -1299,74 +1284,93 @@ function _postProcessMasks(root, sym, anim, boundsLookup, exportDir, getExt, sca
                         }
                     }
                 }
+                
+                maskDataMap[layer.name] = {
+                    sprite: currentMaskSprite,
+                    wrapper: currentMaskWrapper,
+                    pos: maskPos,
+                    hasPosTrack: hasPosTrack,
+                    posTrackIdx: maskPosTrackIdx
+                };
             }
-        } else if (isGuidedLayer && currentMaskSprite) {
-            var guidedByCurrentMask = (layer.layerType === "masked")
-                || (layer.parentLayerName && layer.parentLayerName === currentMaskLayerName);
+        }
+    }
 
-            if (!guidedByCurrentMask) {
-                currentMaskSprite = null;
-                continue;
+    for (var i = 0; i < sym.layers.length; i++) {
+        var layer = sym.layers[i];
+        var isGuidedLayer = (layer.layerType === "masked")
+            || (layer.layerType === "normal" && layer.parentLayerName && maskLayerNames[layer.parentLayerName] !== undefined);
+
+        if (!isGuidedLayer) continue;
+        
+        var maskName = layer.parentLayerName;
+        var maskData = maskDataMap[maskName];
+        if (!maskData) continue;
+        
+        var currentMaskSprite = maskData.sprite;
+        var currentMaskWrapper = maskData.wrapper;
+        var maskPos = maskData.pos;
+        var hasPosTrack = maskData.hasPosTrack;
+        var maskPosTrackIdx = maskData.posTrackIdx;
+        var currentMaskLayerName = maskName;
+
+        var layerName = _sanitize_name(layer.unique_name);
+        var layerNode = root.getNodeOrNull(layerName);
+        if (!layerNode) continue;
+        
+        var maskLayerNode = root.getNodeOrNull(_sanitize_name(maskLayerNames[currentMaskLayerName]));
+        if (maskLayerNode && maskLayerNode.properties["visible"] === false) {
+            delete maskLayerNode.properties["visible"];
+        }
+
+        var oldPath = root.getPathTo(layerNode);
+        layerNode.parent.removeChild(layerNode);
+        currentMaskSprite.prependChild(layerNode);
+        layerNode.owner = root;
+
+        var mx = maskPos.x, my = maskPos.y;
+        var sx = 0, sy = 0;
+        var ssx = 1.0, ssy = 1.0;
+        if (currentMaskSprite !== currentMaskWrapper) {
+            if (currentMaskSprite.properties["position"]) {
+                var match = currentMaskSprite.properties["position"].match(/Vector2\(([^,]+),\s*([^)]+)\)/);
+                if (match) { sx = parseFloat(match[1]); sy = parseFloat(match[2]); }
             }
+        }
+        if (currentMaskSprite.properties["scale"]) {
+            var smatch = currentMaskSprite.properties["scale"].match(/Vector2\(([^,]+),\s*([^)]+)\)/);
+            if (smatch) { ssx = parseFloat(smatch[1]); ssy = parseFloat(smatch[2]); }
+        }
 
-            var maskLayerNode = root.getNodeOrNull(_sanitize_name(maskLayerNames[currentMaskLayerName] || currentMaskLayerName));
-            if (maskLayerNode && maskLayerNode.properties["visible"] === false) {
-                delete maskLayerNode.properties["visible"];
+        var invX = (-mx - sx) / ssx;
+        var invY = (-my - sy) / ssy;
+        layerNode.properties["position"] = _vec2(invX, invY);
+        if (ssx !== 1.0 || ssy !== 1.0) {
+            layerNode.properties["scale"] = _vec2(1.0 / ssx, 1.0 / ssy);
+        }
+
+        var newPath = root.getPathTo(currentMaskSprite) + "/" + layerNode.name;
+        
+        if (anim && hasPosTrack && maskPosTrackIdx !== -1) {
+            var mTrack = anim.tracks[maskPosTrackIdx];
+            for (var m = 0; m < mTrack.keys.times.length; m++) {
+                var mTime = mTrack.keys.times[m];
+                var mVal = mTrack.keys.values[m];
+                var mTrans = mTrack.keys.transitions[m];
+                var ivX = (-mVal.x - sx) / ssx;
+                var ivY = (-mVal.y - sy) / ssy;
+                anim.addTrackKey(newPath + ":position", "value", mTime, {x: ivX, y: ivY}, mTrans);
             }
+        }
 
-            var oldPath = root.getPathTo(layerNode);
-            layerNode.parent.removeChild(layerNode);
-            currentMaskSprite.prependChild(layerNode);
-            layerNode.owner = root;
-
-            var mx = maskPos.x, my = maskPos.y;
-            var sx = 0, sy = 0;
-            var ssx = 1.0, ssy = 1.0;
-            if (currentMaskSprite !== currentMaskWrapper) {
-                if (currentMaskSprite.properties["position"]) {
-                    var match = currentMaskSprite.properties["position"].match(/Vector2\(([^,]+),\s*([^)]+)\)/);
-                    if (match) { sx = parseFloat(match[1]); sy = parseFloat(match[2]); }
+        if (anim) {
+            for (var tIdx = 0; tIdx < anim.tracks.length; tIdx++) {
+                var trackPath = anim.tracks[tIdx].path;
+                if (trackPath === oldPath
+                        || trackPath.indexOf(oldPath + "/") === 0
+                        || trackPath.indexOf(oldPath + ":") === 0) {
+                    anim.tracks[tIdx].path = newPath + trackPath.substring(oldPath.length);
                 }
-            }
-            if (currentMaskSprite.properties["scale"]) {
-                var smatch = currentMaskSprite.properties["scale"].match(/Vector2\(([^,]+),\s*([^)]+)\)/);
-                if (smatch) { ssx = parseFloat(smatch[1]); ssy = parseFloat(smatch[2]); }
-            }
-
-            var invX = (-mx - sx) / ssx;
-            var invY = (-my - sy) / ssy;
-            layerNode.properties["position"] = _vec2(invX, invY);
-            if (ssx !== 1.0 || ssy !== 1.0) {
-                layerNode.properties["scale"] = _vec2(1.0 / ssx, 1.0 / ssy);
-            }
-
-            var newPath = root.getPathTo(currentMaskSprite) + "/" + layerNode.name;
-            
-            if (anim && hasPosTrack && maskPosTrackIdx !== -1) {
-                var mTrack = anim.tracks[maskPosTrackIdx];
-                for (var m = 0; m < mTrack.keys.times.length; m++) {
-                    var mTime = mTrack.keys.times[m];
-                    var mVal = mTrack.keys.values[m];
-                    var mTrans = mTrack.keys.transitions[m];
-                    var ivX = (-mVal.x - sx) / ssx;
-                    var ivY = (-mVal.y - sy) / ssy;
-                    anim.addTrackKey(newPath + ":position", "value", mTime, {x: ivX, y: ivY}, mTrans);
-                }
-            }
-
-            if (anim) {
-                for (var tIdx = 0; tIdx < anim.tracks.length; tIdx++) {
-                    var trackPath = anim.tracks[tIdx].path;
-                    if (trackPath === oldPath
-                            || trackPath.indexOf(oldPath + "/") === 0
-                            || trackPath.indexOf(oldPath + ":") === 0) {
-                        anim.tracks[tIdx].path = newPath + trackPath.substring(oldPath.length);
-                    }
-                }
-            }
-        } else {
-            if (layer.layerType !== "normal" || !layer.parentLayerName || maskLayerNames[layer.parentLayerName] === undefined) {
-                currentMaskSprite = null;
             }
         }
     }
@@ -2685,7 +2689,7 @@ function buildSceneForSymbol(sym, frameRate, exportDir, boundsLookup, boundsInde
                 targetParent = folderNodes[layer.parentLayerName];
             }
             
-            var isMaskLayer = (layer.layerType === "mask" || layer.layerType === "masked");
+            var isMaskLayer = (layer.layerType === "mask" || layer.layerType === "masked" || (layer.layerType === "normal" && layer.parentLayerName && maskLayerNames[layer.parentLayerName] !== undefined));
             var isGuidedLayer = (layer.layerType === "guide");
             if (isMaskLayer || isGuidedLayer || layer.layerType === "guide") {
                 var layerNode = targetParent.getNodeOrNull(layerName);

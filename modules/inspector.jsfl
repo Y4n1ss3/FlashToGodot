@@ -2010,9 +2010,93 @@ function _flattenLabeledAnimations(library, scenes) {
             }
         }
 
+        var eventLayerSigs = [];
+        for (var e = 0; e < flattenEvents.length; e++) {
+            eventLayerSigs[e] = [];
+            var ev = flattenEvents[e];
+            for (var i = 0; i < maxSharedLayers; i++) {
+                if (i < ev.childSym.layers.length) {
+                    var cL = ev.childSym.layers[i];
+                    var type = cL.layerType || "normal";
+                    var parentIdx = undefined;
+                    if (cL.parentLayerName) {
+                        for (var p = 0; p < ev.childSym.layers.length; p++) {
+                            if (ev.childSym.layers[p].name === cL.parentLayerName) {
+                                parentIdx = p;
+                                break;
+                            }
+                        }
+                    }
+                    eventLayerSigs[e][i] = type + "|" + parentIdx;
+                } else {
+                    eventLayerSigs[e][i] = null;
+                }
+            }
+        }
+
+        var layerSignatures = [];
+        for (var i = 0; i < maxSharedLayers; i++) {
+            layerSignatures[i] = [];
+            for (var e = 0; e < flattenEvents.length; e++) {
+                var sig = eventLayerSigs[e][i];
+                if (sig !== null) {
+                    var found = false;
+                    for (var s = 0; s < layerSignatures[i].length; s++) {
+                        if (layerSignatures[i][s] === sig) { found = true; break; }
+                    }
+                    if (!found) {
+                        layerSignatures[i].push(sig);
+                    }
+                }
+            }
+            if (layerSignatures[i].length === 0) {
+                layerSignatures[i].push("normal|undefined");
+            }
+        }
+
         var sharedLayers = [];
         for (var i = 0; i < maxSharedLayers; i++) {
-            var sLayer = { name: "SharedLayer_" + i, layerType: "normal", keyframes: [] };
+            for (var s = 0; s < layerSignatures[i].length; s++) {
+                var sig = layerSignatures[i][s];
+                var parts = sig.split("|");
+                var type = parts[0];
+                var parentIdx = parts[1] !== "undefined" ? parseInt(parts[1], 10) : undefined;
+                
+                var lName = (layerSignatures[i].length === 1) ? ("SharedLayer_" + i) : ("SharedLayer_" + i + "_s" + s);
+                var sLayer = { name: lName, layerType: type, keyframes: [], _index: i, _sig: sig, _parentIdx: parentIdx };
+                sharedLayers.push(sLayer);
+            }
+        }
+
+        for (var i = 0; i < sharedLayers.length; i++) {
+            var sLayer = sharedLayers[i];
+            if (sLayer._parentIdx !== undefined) {
+                var parentSig = null;
+                for (var e = 0; e < flattenEvents.length; e++) {
+                    if (eventLayerSigs[e][sLayer._index] === sLayer._sig) {
+                        parentSig = eventLayerSigs[e][sLayer._parentIdx];
+                        break;
+                    }
+                }
+                if (parentSig) {
+                    var pIndex = sLayer._parentIdx;
+                    var pS = -1;
+                    for (var k = 0; k < layerSignatures[pIndex].length; k++) {
+                        if (layerSignatures[pIndex][k] === parentSig) {
+                            pS = k;
+                            break;
+                        }
+                    }
+                    if (pS !== -1) {
+                        var pName = (layerSignatures[pIndex].length === 1) ? ("SharedLayer_" + pIndex) : ("SharedLayer_" + pIndex + "_s" + pS);
+                        sLayer.parentLayerName = pName;
+                    }
+                }
+            }
+        }
+
+        for (var i = 0; i < sharedLayers.length; i++) {
+            var sLayer = sharedLayers[i];
             var currentFrame = 0;
             
             for (var e = 0; e < flattenEvents.length; e++) {
@@ -2022,8 +2106,8 @@ function _flattenLabeledAnimations(library, scenes) {
                     sLayer.keyframes.push({ startFrame: currentFrame, duration: ev.start - currentFrame, elements: [] });
                 }
                 
-                if (i < ev.childSym.layers.length) {
-                    var cLayer = ev.childSym.layers[i];
+                if (sLayer._index < ev.childSym.layers.length && eventLayerSigs[e][sLayer._index] === sLayer._sig) {
+                    var cLayer = ev.childSym.layers[sLayer._index];
                     for (var ck = 0; ck < cLayer.keyframes.length; ck++) {
                         var cKf = _deepClone(cLayer.keyframes[ck]);
                         cKf.startFrame += ev.start;
@@ -2070,7 +2154,9 @@ function _flattenLabeledAnimations(library, scenes) {
                 sLayer.keyframes.push({ startFrame: currentFrame, duration: totalTimelineDuration - currentFrame, elements: [] });
             }
             
-            sharedLayers.push(sLayer);
+            delete sLayer._index;
+            delete sLayer._sig;
+            delete sLayer._parentIdx;
         }
         
         for (var i = 0; i < sharedLayers.length; i++) {
