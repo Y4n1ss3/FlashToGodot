@@ -607,7 +607,7 @@ function _extractColorTransform(ct) {
     };
 }
 
-function _parsePngFilename(fileName) {
+function _parsePngFilename(fname) {
     var info = {
         useAbsoluteBounds: false,
         boundsX: 0.0, boundsY: 0.0,
@@ -941,7 +941,9 @@ GAnimation.prototype.optimizeTracks = function(root) {
         var colonIdx = tr.path.indexOf(":");
         var propName = (colonIdx !== -1) ? tr.path.substring(colonIdx + 1) : tr.path;
         
-        if (propName.indexOf(":") !== -1 || propName.indexOf("/") !== -1) {
+        if (tr.type === "method") {
+            isStatic = false; // Ne jamais optimiser les method tracks
+        } else if (propName.indexOf(":") !== -1 || propName.indexOf("/") !== -1) {
             isStatic = false; // Ne pas optimiser les sous-propriétés
         } else if (tr.keys.times[0] > 0.0005 && (propName === "points" || propName === "polygon" || propName === "polygons" || propName === "uv")) {
             // Seuls les tableaux de géométrie qui apparaissent tardivement DOIVENT rester dynamiques.
@@ -2480,6 +2482,8 @@ function buildSceneForSymbol(sym, frameRate, exportDir, boundsLookup, boundsInde
         return extIdMap[path];
     }
 
+    var actionScripts = []; // Array to store ActionScript
+
     var root = new GNode(sym.isMainScene ? "main" : _sanitize_name(sym.name), "Node2D");
     if (sym.isMainScene) {
         var bg = new GNode("Background", "ColorRect");
@@ -2599,6 +2603,15 @@ function buildSceneForSymbol(sym, frameRate, exportDir, boundsLookup, boundsInde
                 if (st + dur > maxTime) maxTime = st + dur;
                 if (kf.elements && kf.elements.length > 0) hasAnimation = true;
                 if (kf.name && labels[kf.name] === undefined) labels[kf.name] = st;
+
+                if (kf.actionScript && String(kf.actionScript).replace(/^\s+|\s+$/g, '') !== "") {
+                    actionScripts.push({
+                        time: st,
+                        frame: kf.startFrame,
+                        code: String(kf.actionScript)
+                    });
+                    hasAnimation = true;
+                }
 
                 if (!kf.elements) continue;
                 kf.elements = _flattenGroups(kf.elements);
@@ -2890,8 +2903,25 @@ function buildSceneForSymbol(sym, frameRate, exportDir, boundsLookup, boundsInde
 
     _postProcessMasks(root, sym, anim, boundsLookup, exportDir, getExt, scaleFactor, extResources, extIdMap);
 
+    if (actionScripts.length > 0) {
+        for (var asi = 0; asi < actionScripts.length; asi++) {
+            var scriptObj = actionScripts[asi];
+            anim.addTrackKey(".", "method", scriptObj.time, { method: "frame_" + scriptObj.frame, args: [] }, 0.0);
+        }
+    }
+
     if (hasAnimation) {
         anim.optimizeTracks(root);
+        
+        var hasStop = false;
+        if (actionScripts.length > 0) {
+            for (var asi = 0; asi < actionScripts.length; asi++) {
+                if (/stop\s*\(\s*\)/.test(actionScripts[asi].code)) {
+                    hasStop = true;
+                    break;
+                }
+            }
+        }
 
         var isSingleFrame = (maxTime <= (1.001 / frameRate));
 
@@ -2936,7 +2966,7 @@ function buildSceneForSymbol(sym, frameRate, exportDir, boundsLookup, boundsInde
                     var lStart = sorted[i].time;
                     var lEnd = (i + 1 < sorted.length) ? sorted[i+1].time : maxTime;
                     var sliced = _sliceAnimation(anim, lStart, lEnd, true);
-                    var isLooping = onlyDefaultLabel && (_sanitize_name(sorted[i].name) === "default");
+                    var isLooping = !hasStop && onlyDefaultLabel && (_sanitize_name(sorted[i].name) === "default");
                     var aId = "anim_" + nextId();
                     subResources.push('[sub_resource type="Animation" id="' + aId + '"]'
                         + (isLooping ? '\nloop_mode = 1' : '')
@@ -2953,7 +2983,7 @@ function buildSceneForSymbol(sym, frameRate, exportDir, boundsLookup, boundsInde
                 // enchaîner, donc "default" boucle nativement au lieu de
                 // s'arrêter à la dernière frame (évite d'avoir à gérer le
                 // rebouclage à la main côté gameplay pour ce cas simple).
-                var isLooping = true;
+                var isLooping = !hasStop;
                 subResources.push('[sub_resource type="Animation" id="' + aId + '"]'
                     + (isLooping ? '\nloop_mode = 1' : '')
                     + '\nstep = ' + _f(slicedDefault.step)
@@ -2992,21 +3022,154 @@ function buildSceneForSymbol(sym, frameRate, exportDir, boundsLookup, boundsInde
 
     var tscnText = serializeTscn(root, extResources, subResources);
     var scenePath;
+    var gdPath;
     if (sym.isMainScene) {
-        scenePath = exportDir + "main.tscn";
+        scenePath = exportDir + sym.safeName + ".tscn";
+        FLfile.createFolder(exportDir + "scripts");
+        gdPath = exportDir + "scripts/" + sym.safeName + ".gd";
     } else {
         var _spiOut = _symbolPathInfo(sym.name);
         var _subDir = _spiOut.subPath.substring(0, _spiOut.subPath.lastIndexOf("/"));
+        var _accum = exportDir + "symbols";
         if (_subDir.length > 0) {
             var _dirParts = _subDir.split("/");
-            var _accum = exportDir + "symbols";
             for (var _di = 0; _di < _dirParts.length; _di++) {
                 _accum += "/" + _dirParts[_di];
                 FLfile.createFolder(_accum);
             }
         }
         scenePath = exportDir + "symbols/" + _spiOut.subPath + ".tscn";
+        FLfile.createFolder(_accum + "/scripts");
+        gdPath = _accum + "/scripts/" + _spiOut.subPath.substring(_spiOut.subPath.lastIndexOf("/") + 1) + ".gd";
     }
+
+    // Post-process .tscn to attach script if we have actionScripts
+    if (actionScripts.length > 0) {
+        var gdContent = "extends FlashMovieClip\n\n";
+        
+        var methodsDone = {};
+        for (var i = 0; i < actionScripts.length; i++) {
+            var scr = actionScripts[i];
+            var mName = "frame_" + scr.frame;
+            if (methodsDone[mName]) continue;
+            methodsDone[mName] = true;
+            
+            var translatedCode = scr.code;
+            translatedCode = translatedCode.replace(/this\._visible/g, "visible");
+            translatedCode = translatedCode.replace(/_parent\._parent/g, "get_parent().get_parent()");
+            translatedCode = translatedCode.replace(/this\./g, "");
+            translatedCode = translatedCode.replace(/\bthis\b/g, "self");
+            translatedCode = translatedCode.replace(/;/g, "");
+            translatedCode = translatedCode.replace(/\/\//g, "#");
+            translatedCode = translatedCode.replace(/new\s+Date\(\)/g, "Time.get_datetime_dict_from_system()");
+            translatedCode = translatedCode.replace(/\.getHours\(\)/g, ".hour");
+            translatedCode = translatedCode.replace(/Math\.random\(\)/g, "randf()");
+            translatedCode = translatedCode.replace(/Math\.floor\(/g, "floor(");
+            translatedCode = translatedCode.replace(/Math\.round\(/g, "round(");
+            translatedCode = translatedCode.replace(/Math\.ceil\(/g, "ceil(");
+            translatedCode = translatedCode.replace(/Math\.abs\(/g, "abs(");
+            translatedCode = translatedCode.replace(/Math\.max\(/g, "max(");
+            translatedCode = translatedCode.replace(/Math\.min\(/g, "min(");
+            translatedCode = translatedCode.replace(/Math\.PI/g, "PI");
+            translatedCode = translatedCode.replace(/parseInt\(/g, "int(");
+            
+            var lines = translatedCode.split("\n");
+            gdContent += "func " + mName + "():\n";
+            gdContent += "\tpass\n";
+            var hasContent = false;
+            var declaredVars = {};
+            for (var l = 0; l < lines.length; l++) {
+                var line = lines[l].replace(/^\s+|\s+$/g, '');
+                if (line.length > 0) {
+                    // Strip ActionScript types (e.g. :Number)
+                    line = line.replace(/:\s*[a-zA-Z0-9_]+/g, "");
+                    
+                    var isSafeAssignment = false;
+                    
+                    var varMatch = line.match(/^var\s+([a-zA-Z0-9_]+)/);
+                    if (varMatch) {
+                        var vName = varMatch[1];
+                        if (declaredVars[vName]) {
+                            // Already declared, remove 'var ' to avoid Godot error
+                            line = line.replace(/^var\s+/, "");
+                            isSafeAssignment = true;
+                        } else {
+                            declaredVars[vName] = true;
+                        }
+                    } else {
+                        // Auto-add 'var ' if line looks like 'rd = random(20)'
+                        var randMatch = line.match(/^([a-zA-Z0-9_]+)\s*=\s*.*(?:random|randf)/);
+                        if (randMatch) {
+                            var vName = randMatch[1];
+                            if (!declaredVars[vName]) {
+                                line = "var " + line;
+                                declaredVars[vName] = true;
+                            } else {
+                                isSafeAssignment = true;
+                            }
+                        }
+                    }
+                    
+                    var assignMatch = line.match(/^([a-zA-Z0-9_]+)\s*=/);
+                    if (assignMatch && declaredVars[assignMatch[1]]) {
+                        isSafeAssignment = true;
+                    }
+                    
+                    if (
+                        line.indexOf("stop()") === 0 ||
+                        line.indexOf("play()") === 0 ||
+                        line.indexOf("gotoAndStop(") === 0 ||
+                        line.indexOf("gotoAndPlay(") === 0 ||
+                        line.indexOf("nextFrame()") === 0 ||
+                        line.indexOf("prevFrame()") === 0 ||
+                        line.indexOf("var ") === 0 ||
+                        line.indexOf("#") === 0 ||
+                        line === "visible = true" ||
+                        line === "visible = false" ||
+                        isSafeAssignment
+                    ) {
+                        // Safe GDScript or comment
+                        gdContent += "\t" + line + "\n";
+                    } else {
+                        // Unsafe / custom logic, comment it out to prevent parse errors
+                        gdContent += "\t# " + line + "\n";
+                    }
+                    hasContent = true;
+                }
+            }
+            if (!hasContent) gdContent += "\tpass\n";
+            gdContent += "\n";
+        }
+        
+        FLfile.write(gdPath, gdContent);
+        
+        // Add script to .tscn root node manually
+        var resLocalPath = scenePath.replace(exportDir, RES_PREFIX);
+        // Use the exact filename from gdPath for the resource to avoid case mismatch
+        var gdFileName = gdPath.substring(gdPath.lastIndexOf("/") + 1);
+        var gdLocalPath = resLocalPath.substring(0, resLocalPath.lastIndexOf("/") + 1) + "scripts/" + gdFileName;
+        
+        var scriptExtId = (extResources.length + 1) + "_script";
+        var scriptExtStr = '[ext_resource type="Script" path="' + gdLocalPath + '" id="' + scriptExtId + '"]';
+        
+        // Insert after the last ext_resource or after [gd_scene ...]
+        var linesTscn = tscnText.split('\n');
+        var insertIdx = 1;
+        for (var i = 0; i < linesTscn.length; i++) {
+            if (linesTscn[i].indexOf('[ext_resource') === 0) insertIdx = i + 1;
+        }
+        linesTscn.splice(insertIdx, 0, scriptExtStr);
+        
+        // Find root node and attach script
+        for (var i = 0; i < linesTscn.length; i++) {
+            if (linesTscn[i].indexOf('[node name="' + root.name + '"') === 0) {
+                linesTscn.splice(i + 1, 0, 'script = ExtResource("' + scriptExtId + '")');
+                break;
+            }
+        }
+        tscnText = linesTscn.join('\n');
+    }
+
     FLfile.write(scenePath, tscnText);
 }
 
@@ -3041,8 +3204,7 @@ function generateAnimTracksStr(animObj) {
             else if (val && val.x !== undefined)  valsStr.push(_vec2(val.x, val.y));
             else if (val && val.ext)              valsStr.push('ExtResource("' + val.ext + '")');
             else if (tr.type === "method" && val.method) {
-                var argStr = val.args ? val.args : '[]';
-                valsStr.push('{\n"args": ' + argStr + ',\n"method": &"' + val.method + '"\n}');
+                valsStr.push('{\n"args": [],\n"method": &"' + val.method + '"\n}');
             }
             else                                  valsStr.push(val);
         }
@@ -3059,9 +3221,11 @@ function buildGodotScenes(doc, data, exportDir) {
     var uri = exportDir;
     if (uri.charAt(uri.length - 1) === "/") uri = uri.substring(0, uri.length - 1);
     var originalUri = uri;
+    var godotProjectRoot = originalUri;
     RES_PREFIX = "res://";
     while (uri.indexOf("/") !== -1) {
         if (FLfile.exists(uri + "/project.godot")) {
+            godotProjectRoot = uri;
             var rel = originalUri.substring(uri.length);
             if (rel.charAt(0) === "/") rel = rel.substring(1);
             if (rel.length > 0 && rel.charAt(rel.length - 1) !== "/") rel += "/";
@@ -3202,6 +3366,64 @@ function buildGodotScenes(doc, data, exportDir) {
         docHeight: data.document.height || 1080
     };
     buildSceneForSymbol(pseudoMain, data.document.frameRate || 25, exportDir, boundsLookup, boundsIndex, symbolMap, symbolContainsShader);
+
+    // Create FlashMovieClip.gd base class at the root of the Godot project
+    var fmcContent = "extends Node2D\n" +
+    "class_name FlashMovieClip\n\n" +
+    "var _rng: RandomNumberGenerator\n" +
+    "var undefined = null\n\n" +
+    "func _ready():\n" +
+    "\t_rng = RandomNumberGenerator.new()\n" +
+    "\t_rng.seed = hash(Time.get_ticks_msec()) + hash(get_instance_id())\n\n" +
+    "var _currentframe: int:\n" +
+    "\tget:\n" +
+    "\t\tif has_node(\"AnimationPlayer\") and $AnimationPlayer.current_animation != \"\":\n" +
+    "\t\t\treturn int($AnimationPlayer.current_animation_position * 24.0)\n" +
+    "\t\treturn 0\n\n" +
+    "var _totalframes: int:\n" +
+    "\tget:\n" +
+    "\t\tif has_node(\"AnimationPlayer\") and $AnimationPlayer.current_animation != \"\":\n" +
+    "\t\t\treturn int($AnimationPlayer.current_animation_length * 24.0)\n" +
+    "\t\treturn 1\n\n" +
+    "var _level0: Node:\n" +
+    "\tget:\n" +
+    "\t\treturn get_tree().root.get_child(0)\n\n" +
+    "func random(max_val: int) -> int:\n" +
+    "\treturn _rng.randi() % max_val\n\n" +
+    "func gotoAndPlay(frame_or_name):\n" +
+    "\tif not has_node(\"AnimationPlayer\"): return\n" +
+    "\tif typeof(frame_or_name) == TYPE_STRING:\n" +
+    "\t\t$AnimationPlayer.play(frame_or_name)\n" +
+    "\telse:\n" +
+    "\t\tif $AnimationPlayer.current_animation != \"\":\n" +
+    "\t\t\t$AnimationPlayer.seek(frame_or_name / 24.0, true)\n" +
+    "\t\t\t$AnimationPlayer.play($AnimationPlayer.current_animation)\n\n" +
+    "func gotoAndStop(frame_or_name):\n" +
+    "\tif not has_node(\"AnimationPlayer\"): return\n" +
+    "\tif typeof(frame_or_name) == TYPE_STRING:\n" +
+    "\t\t$AnimationPlayer.play(frame_or_name)\n" +
+    "\t\t$AnimationPlayer.pause()\n" +
+    "\t\t$AnimationPlayer.seek(0, true)\n" +
+    "\telse:\n" +
+    "\t\tif $AnimationPlayer.current_animation != \"\":\n" +
+    "\t\t\t$AnimationPlayer.play($AnimationPlayer.current_animation)\n" +
+    "\t\t\t$AnimationPlayer.pause()\n" +
+    "\t\t\t$AnimationPlayer.seek(frame_or_name / 24.0, true)\n\n" +
+    "func nextFrame():\n" +
+    "\tgotoAndStop(_currentframe + 1)\n\n" +
+    "func prevFrame():\n" +
+    "\tgotoAndStop(_currentframe - 1)\n\n" +
+    "func stop():\n" +
+    "\tif has_node(\"AnimationPlayer\"):\n" +
+    "\t\t$AnimationPlayer.pause()\n\n" +
+    "func play():\n" +
+    "\tif has_node(\"AnimationPlayer\") and $AnimationPlayer.current_animation != \"\":\n" +
+    "\t\t$AnimationPlayer.play($AnimationPlayer.current_animation)\n";
+    var scriptDir = godotProjectRoot + "/scripts";
+    if (!FLfile.exists(scriptDir)) {
+        FLfile.createFolder(scriptDir);
+    }
+    FLfile.write(scriptDir + "/FlashMovieClip.gd", fmcContent);
 }
 
 function _preprocessTweens(data, symbolMap) {
