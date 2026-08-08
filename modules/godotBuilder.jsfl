@@ -1,6 +1,81 @@
 if (typeof fl !== "undefined") fl.trace(">>> godotBuilder_v4 LOADED <<<");
 
 /**
+ * godotBuilder v4.11 - Pré-teinte des shapes à couleur statique (color transform)
+ *   - `_bakeStaticShaderTints` : pour toute shape utilisant le shader
+ *     "Advanced Color Effect" de Flash (color_mult/color_offset_255) dont
+ *     la teinte ne change JAMAIS sur toute la timeline (vérifié via
+ *     anim.tracks, qui contient TOUJOURS ces sous-propriétés puisque
+ *     optimizeTracks ne les optimise jamais automatiquement), applique la
+ *     formule exacte du shader (`clamp(tex*mult + offset/255, 0, 1)`,
+ *     reprise de flash_color_normal.gdshader) directement aux couleurs du
+ *     Gradient source, et donne au node une texture déjà teintée à la
+ *     place du shader. Le node n'a alors plus besoin de matériau, et
+ *     devient éligible au bake runtime (v4.8/_markBakeableShapes).
+ *   - Limité au blend mode "normal" (flash_color_normal.gdshader) : "add"/
+ *     "multiply" dépendent du contenu du framebuffer au moment du dessin
+ *     (blend GPU en temps réel), impossible à reproduire en pré-teintant
+ *     une texture — ces shapes gardent leur shader et restent hors bake.
+ *   - Tourne AVANT `_setupMaterials`/`_markBakeableShapes` : une fois le
+ *     matériau retiré, le node est traité comme n'importe quel autre
+ *     Polygon2D statique par le reste du pipeline (v4.8-v4.10).
+ * godotBuilder v4.10 - Aplatissement des wrappers Node2D vides à 1 enfant
+ *   - `_flattenSingleChildGroups` supprime les nodes Node2D purement
+ *     organisationnels (folder/layer/masque) qui n'ont qu'UN SEUL enfant,
+ *     aucun transform propre (position/rotation/scale/skew identité), et
+ *     dont TOUT LE SOUS-ARBRE est garanti non-animé (aucune AnimationPlayer
+ *     track ne référence lui-même ni aucun descendant). L'enfant unique
+ *     remonte directement chez le grand-parent sans recalcul de transform
+ *     nécessaire (le wrapper retiré étant garanti identité). Les chaînes
+ *     de wrappers imbriqués (folder > layer > shape) sont réduites en une
+ *     seule passe.
+ *   - Restriction volontaire au cas transform-identité uniquement (pas de
+ *     composition rotation/scale/skew généralisée) : les sub_resources
+ *     Animation (RESET/labels) sont déjà sérialisées en texte avec des
+ *     NodePath("...") en dur AVANT cette passe, donc toute suppression
+ *     devait garantir qu'aucun NodePath existant n'y référence — d'où la
+ *     restriction aux sous-arbres 100% statiques plutôt qu'une fusion de
+ *     transform généralisée (plus risquée sans pouvoir tester contre un
+ *     vrai rendu Godot).
+ *   - Tourne AVANT `_markBakeableShapes`/`_mergeSameColorSiblings` : en
+ *     remontant des shapes d'un niveau, elle peut faire apparaître de
+ *     nouvelles opportunités de fusion cross-siblings (v4.9).
+ * godotBuilder v4.9 - Fusion cross-elements des Polygon2D statiques de même couleur
+ *   - `_mergeSameColorSiblings` fusionne, entre nodes FRÈRES et CONSÉCUTIFS
+ *     dans l'ordre de rendu, les Polygon2D statiques ("flash_bake") qui
+ *     partagent exactement le même `texture` (donc la même couleur/gradient,
+ *     gradCache dédupliquant déjà les couleurs identiques vers la même
+ *     SubResource). Complémentaire de la fusion intra-shape déjà existante
+ *     (polyGroups/sig, v4.6) qui ne fusionnait que les contours d'UN SEUL
+ *     élément Flash ; celle-ci fusionne à travers des éléments Flash
+ *     différents (ex: deux instances de la même feuille sur le même
+ *     calque), réduisant le nombre de nodes dès le .tscn (éditeur compris,
+ *     pas seulement au runtime via le bake v4.8).
+ *   - Chaque node fusionné amène son propre transform (position/rotation/
+ *     scale/skew) : les vertices "polygon" sont ramenés dans l'espace
+ *     local du parent avant fusion, l'UV n'est jamais touché (déjà correct
+ *     par construction, indépendant du transform du node).
+ *   - Sécurité : ne fusionne que des nodes déjà "flash_bake" (garantis non
+ *     ciblés par une AnimationPlayer track) et sans matériau propre.
+ * godotBuilder v4.8 - Runtime draw baking (Polygon2D/Line2D -> un seul node _draw())
+ *   - Les Polygon2D/Line2D restent des nodes natifs dans le .tscn (édition
+ *     normale dans l'éditeur Godot), MAIS chaque shape STATIQUE (aucune
+ *     AnimationPlayer track ne la cible, ni elle ni un de ses ancêtres dans
+ *     la même scène) est marquée `groups=["flash_bake"]`.
+ *   - `FlashMovieClip.gd` (base class commune) bake au runtime, dans
+ *     `_ready()`, tous les descendants marqués "flash_bake" de la scène
+ *     courante en un seul `_draw()` sur le node racine, puis les libère
+ *     (`queue_free()`). La récursion s'arrête à toute instance de
+ *     sous-symbole (node avec son propre script) : chaque sous-scène bake
+ *     ses propres shapes indépendamment.
+ *   - Les shapes animées (ou sous un ancêtre animé) ne sont jamais marquées
+ *     et restent des Polygon2D/Line2D individuels pilotés par
+ *     l'AnimationPlayer, inchangés.
+ *   - Limite connue : le node racine dessine (via `_draw()`) AVANT ses
+ *     enfants ; une shape statique baked apparaîtra donc toujours DERRIÈRE
+ *     les shapes animées restées en nodes. Ordre à vérifier manuellement
+ *     si une shape statique doit visuellement passer AU-DESSUS d'une shape
+ *     animée dans le même symbole.
  * godotBuilder v4.7 - Réduction du nombre de nodes (wrappers Polygon2D/Line2D)
  *   - v4.7 : deux occurrences où le code créait un wrapper Node2D inutile
  *     alors qu'un mécanisme de nommage "node lui-même = 1er élément, Poly_0/
@@ -1024,6 +1099,434 @@ GAnimation.prototype.optimizeTracks = function(root) {
 };
 
 
+// Supprime les wrappers Node2D "vides" : un container organisationnel
+// (folder/layer/masque) qui n'a QU'UN SEUL enfant, aucun transform propre
+// (position/rotation/scale/skew), aucune propriété "visible"/"material"/
+// "groups", et dont TOUT LE SOUS-ARBRE est garanti non-animé (aucune
+// AnimationPlayer track ne référence lui-même ni aucun de ses descendants).
+// Cette dernière garantie est indispensable : les sub_resources Animation
+// (RESET/labels) sont sérialisés en texte AVANT cette passe (NodePath("...")
+// déjà écrits en dur), donc supprimer un node dont un descendant serait
+// animé casserait ces chemins. En restreignant aux sous-arbres 100% statiques,
+// aucun NodePath existant ne peut jamais référencer un node qu'on retire ici.
+// L'enfant unique remonte tel quel (aucun recalcul de transform nécessaire
+// puisque le wrapper retiré est garanti en transform identité).
+// Les chaînes de wrappers vides imbriqués sont réduites en une seule passe
+// (ex: folder > layer > shape, si les deux wrappers sont éligibles).
+function _flattenSingleChildGroups(root, anim) {
+    var animatedPaths = {};
+    if (anim && anim.tracks) {
+        for (var i = 0; i < anim.tracks.length; i++) {
+            var tr = anim.tracks[i];
+            if (tr.type === "method") continue;
+            var colonIdx = tr.path.indexOf(":");
+            var nodePath = (colonIdx !== -1) ? tr.path.substring(0, colonIdx) : tr.path;
+            animatedPaths[nodePath] = true;
+        }
+    }
+
+    function markSubtreeAnimated(node) {
+        var path = (node === root) ? "." : root.getPathTo(node);
+        var subtreeAnimated = !!animatedPaths[path];
+        for (var i = 0; i < node.children.length; i++) {
+            if (markSubtreeAnimated(node.children[i])) subtreeAnimated = true;
+        }
+        node._subtreeAnimated = subtreeAnimated;
+        return subtreeAnimated;
+    }
+    markSubtreeAnimated(root);
+
+    var TRANSFORM_PROPS = ["position", "rotation", "scale", "skew"];
+    function hasOwnTransform(n) {
+        for (var i = 0; i < TRANSFORM_PROPS.length; i++) {
+            if (n.properties[TRANSFORM_PROPS[i]] !== undefined) return true;
+        }
+        return false;
+    }
+
+    function isEmptyWrapper(n) {
+        return n.type === "Node2D"
+            && n !== root
+            && n.children.length === 1
+            && !n._subtreeAnimated
+            && !hasOwnTransform(n)
+            && n.properties["visible"] === undefined
+            && n.properties["material"] === undefined
+            && n.properties["groups"] === undefined;
+    }
+
+    function processContainer(node) {
+        for (var i = 0; i < node.children.length; i++) {
+            var child = node.children[i];
+            while (isEmptyWrapper(child)) {
+                var grandchild = child.children[0];
+                child.removeChild(grandchild);
+                node.removeChild(child);
+                node.children.splice(i, 0, grandchild);
+                grandchild.parent = node;
+                node._childByName["$" + grandchild.name] = grandchild;
+                child = grandchild;
+            }
+        }
+        for (var k = 0; k < node.children.length; k++) {
+            processContainer(node.children[k]);
+        }
+    }
+    processContainer(root);
+}
+
+// Pour les shapes teintées par le shader "Advanced Color Effect" de Flash
+// (color_mult/color_offset_255, voir has_shader dans _processElementNode) :
+// si la teinte ne change JAMAIS sur toute la timeline de ce node (aucune
+// vraie AnimationPlayer track, cf. optimizeTracks qui exclut TOUJOURS les
+// sous-propriétés "material:shader_parameter/..." de l'optimisation), on
+// peut appliquer la formule du shader directement aux couleurs du gradient
+// source au moment de la génération, et donner au node une texture déjà
+// teintée à la place du shader. Le node n'a alors plus besoin de matériau
+// du tout, et devient éligible au bake runtime (_markBakeableShapes).
+// Formule EXACTE reprise de flash_color_normal.gdshader :
+//   COLOR = clamp(tex * color_mult + color_offset_255/255, 0, 1)
+// Limite volontaire : uniquement le blend mode "normal" (flash_color_
+// normal.gdshader, render_mode blend_mix). "add"/"multiply" dépendent du
+// contenu déjà présent dans le framebuffer au moment du dessin (blend GPU
+// en temps réel) : impossible à reproduire en pré-teintant une texture,
+// donc ces shapes gardent leur matériau et restent hors bake.
+function _bakeStaticShaderTints(root, anim, subResources) {
+    function findSubResource(id) {
+        for (var i = 0; i < subResources.length; i++) {
+            if (subResources[i].indexOf('id="' + id + '"') !== -1) return subResources[i];
+        }
+        return null;
+    }
+    function parseVec4(str) {
+        if (!str) return null;
+        var m = String(str).match(/Vector4\(([^,]+),\s*([^,]+),\s*([^,]+),\s*([^)]+)\)/);
+        if (!m) return null;
+        return [parseFloat(m[1]), parseFloat(m[2]), parseFloat(m[3]), parseFloat(m[4])];
+    }
+    function parseColorArray(str) {
+        if (!str) return null;
+        var m = str.match(/PackedColorArray\(([^)]*)\)/);
+        if (!m) return null;
+        if (m[1].length === 0) return [];
+        var nums = m[1].split(",").map(function(s) { return parseFloat(s); });
+        var cols = [];
+        for (var i = 0; i + 3 < nums.length; i += 4) cols.push([nums[i], nums[i + 1], nums[i + 2], nums[i + 3]]);
+        return cols;
+    }
+    function findLine(block, prefix) {
+        var lines = block.split("\n");
+        for (var i = 0; i < lines.length; i++) {
+            if (lines[i].indexOf(prefix) === 0) return lines[i].substring(prefix.length);
+        }
+        return null;
+    }
+    function trackInfo(nodePath, propSuffix) {
+        var fullPath = nodePath + ":" + propSuffix;
+        for (var i = 0; i < anim.tracks.length; i++) {
+            var tr = anim.tracks[i];
+            if (tr.path !== fullPath) continue;
+            var vals = tr.keys.values;
+            var isStatic = true;
+            for (var k = 1; k < vals.length; k++) {
+                if (!_eq(vals[0], vals[k])) { isStatic = false; break; }
+            }
+            return { exists: true, isStatic: isStatic, value: vals[0], trackIndex: i };
+        }
+        return { exists: false };
+    }
+
+    var tracksToRemove = [];
+
+    function walk(node) {
+        for (var i = 0; i < node.children.length; i++) walk(node.children[i]);
+
+        if (node.type !== "Polygon2D" || !node.properties["material"]) return;
+        var matMatch = String(node.properties["material"]).match(/SubResource\("([^"]+)"\)/);
+        if (!matMatch) return;
+        var matBlock = findSubResource(matMatch[1]);
+        if (!matBlock || matBlock.indexOf("flash_color_normal.gdshader") === -1) return;
+
+        var nodePath = (node === root) ? "." : root.getPathTo(node);
+        var offInfo = trackInfo(nodePath, "material:shader_parameter/color_offset_255");
+        var mulInfo = trackInfo(nodePath, "material:shader_parameter/color_mult");
+        if (!offInfo.exists || !mulInfo.exists) return;
+        if (!offInfo.isStatic || !mulInfo.isStatic) return; // vraie animation : garder le shader
+
+        var off = parseVec4(offInfo.value);
+        var mul = parseVec4(mulInfo.value);
+        if (!off || !mul) return;
+
+        var texMatch = String(node.properties["texture"] || "").match(/SubResource\("([^"]+)"\)/);
+        if (!texMatch) return;
+        var texBlock = findSubResource(texMatch[1]);
+        if (!texBlock) return;
+        var gradMatch = (findLine(texBlock, "gradient = SubResource(\"") || "").match(/^([^"]+)/);
+        if (!gradMatch) return;
+        var gradBlock = findSubResource(gradMatch[1]);
+        if (!gradBlock) return;
+        var colorsLine = findLine(gradBlock, "colors = ");
+        var offsetsLine = findLine(gradBlock, "offsets = ");
+        var colors = parseColorArray(colorsLine);
+        if (!colors || colors.length === 0) return;
+
+        var tintedColors = colors.map(function(c) {
+            return [
+                Math.min(1, Math.max(0, c[0] * mul[0] + off[0] / 255.0)),
+                Math.min(1, Math.max(0, c[1] * mul[1] + off[1] / 255.0)),
+                Math.min(1, Math.max(0, c[2] * mul[2] + off[2] / 255.0)),
+                Math.min(1, Math.max(0, c[3] * mul[3] + off[3] / 255.0))
+            ];
+        });
+
+        var texTypeMatch = texBlock.match(/type="([^"]+)"/);
+        var texType = texTypeMatch ? texTypeMatch[1] : "GradientTexture1D";
+
+        var newGradId = "Gradient_" + nextId();
+        var colorsStr = "PackedColorArray(" + tintedColors.map(function(c) {
+            return _f(c[0]) + ", " + _f(c[1]) + ", " + _f(c[2]) + ", " + _f(c[3]);
+        }).join(", ") + ")";
+        var newGradStr = '[sub_resource type="Gradient" id="' + newGradId + '"]\n'
+            + (offsetsLine ? ('offsets = ' + offsetsLine + '\n') : '')
+            + 'colors = ' + colorsStr;
+        subResources.push(newGradStr);
+
+        var newTexId = "Texture_" + nextId();
+        var newTexStr = '[sub_resource type="' + texType + '" id="' + newTexId + '"]\n'
+            + 'gradient = SubResource("' + newGradId + '")\n'
+            + (texType === "GradientTexture2D"
+                ? 'fill = 1\nfill_from = Vector2(0.5, 0.5)\nfill_to = Vector2(1, 0.5)\n'
+                : 'width = 1\n');
+        subResources.push(newTexStr);
+
+        node.properties["texture"] = 'SubResource("' + newTexId + '")';
+        delete node.properties["material"];
+        delete node.properties["use_parent_material"];
+
+        tracksToRemove.push(offInfo.trackIndex, mulInfo.trackIndex);
+    }
+    walk(root);
+
+    if (tracksToRemove.length > 0) {
+        tracksToRemove.sort(function(a, b) { return b - a; });
+        for (var i = 0; i < tracksToRemove.length; i++) {
+            anim.tracks.splice(tracksToRemove[i], 1);
+        }
+    }
+}
+
+// Marque groups=["flash_bake"] tout Polygon2D/Line2D qui n'est ciblé par
+// AUCUNE AnimationPlayer track (ni lui, ni un de ses ancêtres dans la même
+// scène). À appeler APRÈS anim.optimizeTracks(root), pour que anim.tracks
+// ne contienne plus que les propriétés réellement dynamiques (les tracks
+// "statiques" à une seule valeur ont déjà été inlinées dans node.properties
+// par optimizeTracks et effacées de la liste).
+// Les method tracks (appels de frame scripts, path === ".") sont ignorées :
+// elles n'impliquent aucun changement visuel du node ciblé.
+function _markBakeableShapes(root, anim) {
+    var animatedPaths = {};
+    if (anim && anim.tracks) {
+        for (var i = 0; i < anim.tracks.length; i++) {
+            var tr = anim.tracks[i];
+            if (tr.type === "method") continue;
+            var colonIdx = tr.path.indexOf(":");
+            var nodePath = (colonIdx !== -1) ? tr.path.substring(0, colonIdx) : tr.path;
+            animatedPaths[nodePath] = true;
+        }
+    }
+
+    var markedAny = false;
+    function walk(node, isAnimated, materialAncestor) {
+        var path = (node === root) ? "." : root.getPathTo(node);
+        var nodeAnimated = isAnimated || !!animatedPaths[path];
+        // draw_colored_polygon()/draw_polyline() utilisent TOUJOURS le
+        // matériau du node sur lequel _draw() s'exécute (la racine), jamais
+        // celui d'un node individuel détruit après le bake. Un node avec
+        // son propre "material" (shader de teinte/color transform, voir
+        // has_shader plus haut) OU qui refuse explicitement d'hériter du
+        // matériau parent (use_parent_material=false, ex: les Line2D de
+        // contour, volontairement isolées du shader des fills) ne peut
+        // donc jamais être baké sans perdre/fausser son rendu. Idem pour
+        // tout descendant d'un ancêtre ayant lui-même un vrai matériau :
+        // il en hérite via use_parent_material=true, que le node racine
+        // ne peut pas reproduire.
+        var hasOwnMaterial = !!node.properties["material"];
+        var optsOut = (node.properties["use_parent_material"] === false
+                    || node.properties["use_parent_material"] === "false");
+        var unsafeForBake = materialAncestor || hasOwnMaterial || optsOut;
+        if (!nodeAnimated && !unsafeForBake && node !== root && (node.type === "Polygon2D" || node.type === "Line2D")) {
+            node.properties["groups"] = '["flash_bake"]';
+            markedAny = true;
+        }
+        var childMaterialAncestor = materialAncestor || hasOwnMaterial;
+        for (var i = 0; i < node.children.length; i++) {
+            walk(node.children[i], nodeAnimated, childMaterialAncestor);
+        }
+    }
+    walk(root, false, false);
+    return markedAny;
+}
+
+// Fusionne, entre nodes FRÈRES (même parent direct) et CONSÉCUTIFS dans
+// l'ordre de rendu, les Polygon2D statiques ("flash_bake") qui partagent
+// EXACTEMENT le même texture (= même SubResource, donc même couleur/
+// gradient : gradCache déduplique déjà les couleurs solides identiques
+// vers la même GradientTexture1D). Complémentaire de la fusion intra-shape
+// déjà existante (polyGroups/sig, v4.6) qui ne fusionne que les contours
+// d'UN SEUL élément Flash ; celle-ci fusionne à travers des éléments
+// Flash différents (ex: deux instances de la même feuille sur le même
+// calque), réduisant le nombre de nodes dès le .tscn (pas seulement au
+// runtime).
+// Ne touche jamais l'UV : chaque vertex garde son UV d'origine, calculé
+// correctement dès la génération initiale (peu importe la position finale
+// du node, y compris pour un vrai gradient dont la matrice diffère par
+// shape — seuls les points "polygon" doivent être ramenés dans l'espace
+// local du parent via le transform propre au node fusionné).
+// Ne fusionne QUE des nodes déjà marqués "flash_bake" (donc garantis non
+// ciblés par une AnimationPlayer track) et sans matériau propre, pour ne
+// jamais casser une animation ou un shader spécifique à un node.
+function _mergeSameColorSiblings(root) {
+    function _parsePackedVec2(str) {
+        if (!str) return [];
+        var m = str.match(/PackedVector2Array\(([^)]*)\)/);
+        if (!m || m[1].length === 0) return [];
+        var nums = m[1].split(",");
+        var pts = [];
+        for (var i = 0; i + 1 < nums.length; i += 2) {
+            pts.push({ x: parseFloat(nums[i]), y: parseFloat(nums[i + 1]) });
+        }
+        return pts;
+    }
+    function _parsePolygonsIndexGroups(str) {
+        if (!str) return null;
+        var groups = [];
+        var re = /PackedInt32Array\(([^)]*)\)/g;
+        var m;
+        while ((m = re.exec(str)) !== null) {
+            var idxStr = m[1];
+            var idxs = [];
+            if (idxStr.length > 0) {
+                var parts = idxStr.split(",");
+                for (var i = 0; i < parts.length; i++) idxs.push(parseInt(parts[i], 10));
+            }
+            groups.push(idxs);
+        }
+        return groups;
+    }
+    function _num(str, def) {
+        if (str === undefined) return def;
+        var v = parseFloat(str);
+        return isNaN(v) ? def : v;
+    }
+    function _parseVec2Prop(str, defX, defY) {
+        if (!str) return { x: defX, y: defY };
+        var m = str.match(/Vector2\(([^,]+),\s*([^)]+)\)/);
+        if (!m) return { x: defX, y: defY };
+        return { x: parseFloat(m[1]), y: parseFloat(m[2]) };
+    }
+
+    function isMergeCandidate(n) {
+        return n.type === "Polygon2D"
+            && n.properties["groups"] === '["flash_bake"]'
+            && !!n.properties["texture"]
+            && !!n.properties["polygon"]
+            && n.properties["visible"] !== false
+            && !n.properties["material"]
+            // Un Polygon2D "wrapper" (v4.7) peut lui-même héberger des
+            // enfants Poly_1/Line_0 (autres groupes de couleur de la même
+            // shape) : ne jamais le fusionner, ça détruirait ces enfants
+            // sans les transférer.
+            && n.children.length === 0;
+    }
+
+    function mergeRun(parent, startIdx, endIdxExclusive) {
+        var kids = parent.children.slice(startIdx, endIdxExclusive);
+        var pointsParts = [];
+        var uvParts = [];
+        var polygonsParts = [];
+        var vertexOffset = 0;
+
+        for (var k = 0; k < kids.length; k++) {
+            var kid = kids[k];
+            var pos = _parseVec2Prop(kid.properties["position"], 0, 0);
+            var scale = _parseVec2Prop(kid.properties["scale"], 1, 1);
+            var rot = _num(kid.properties["rotation"], 0);
+            var skew = _num(kid.properties["skew"], 0);
+
+            var cosR = Math.cos(rot), sinR = Math.sin(rot);
+            var cosRS = Math.cos(rot + skew), sinRS = Math.sin(rot + skew);
+            var a = cosR * scale.x, b = sinR * scale.x;
+            var c = -sinRS * scale.y, d = cosRS * scale.y;
+
+            var localPts = _parsePackedVec2(kid.properties["polygon"]);
+            var localUv = _parsePackedVec2(kid.properties["uv"]);
+            var idxGroups = _parsePolygonsIndexGroups(kid.properties["polygons"]);
+            if (!idxGroups || idxGroups.length === 0) {
+                var allIdx = [];
+                for (var vi = 0; vi < localPts.length; vi++) allIdx.push(vi);
+                idxGroups = [allIdx];
+            }
+
+            for (var vi = 0; vi < localPts.length; vi++) {
+                var px = localPts[vi].x, py = localPts[vi].y;
+                var wx = a * px + c * py + pos.x;
+                var wy = b * px + d * py + pos.y;
+                pointsParts.push(_f(wx) + ", " + _f(wy));
+                var uv = localUv[vi] || { x: 0, y: 0 };
+                uvParts.push(_f(uv.x) + ", " + _f(uv.y));
+            }
+            for (var g = 0; g < idxGroups.length; g++) {
+                var shifted = [];
+                for (var ii = 0; ii < idxGroups[g].length; ii++) shifted.push(idxGroups[g][ii] + vertexOffset);
+                polygonsParts.push("PackedInt32Array(" + shifted.join(", ") + ")");
+            }
+            vertexOffset += localPts.length;
+        }
+
+        var merged = new GNode(kids[0].name, "Polygon2D");
+        merged.properties["polygon"] = "PackedVector2Array(" + pointsParts.join(", ") + ")";
+        merged.properties["uv"] = "PackedVector2Array(" + uvParts.join(", ") + ")";
+        if (polygonsParts.length > 1) merged.properties["polygons"] = "[" + polygonsParts.join(", ") + "]";
+        merged.properties["texture"] = kids[0].properties["texture"];
+        merged.properties["color"] = kids[0].properties["color"] || "Color(1, 1, 1, 1)";
+        merged.properties["visible"] = true;
+        merged.properties["groups"] = '["flash_bake"]';
+
+        var ownerRef = kids[0].owner;
+        for (var k = kids.length - 1; k >= 0; k--) parent.removeChild(kids[k]);
+        parent.children.splice(startIdx, 0, merged);
+        merged.parent = parent;
+        parent._childByName["$" + merged.name] = merged;
+        merged.owner = ownerRef;
+    }
+
+    function processContainer(node) {
+        var i = 0;
+        while (i < node.children.length) {
+            var child = node.children[i];
+            if (isMergeCandidate(child)) {
+                var j = i + 1;
+                while (j < node.children.length
+                       && isMergeCandidate(node.children[j])
+                       && node.children[j].properties["texture"] === child.properties["texture"]) {
+                    j++;
+                }
+                if (j - i > 1) {
+                    mergeRun(node, i, j);
+                    i++;
+                    continue;
+                }
+            }
+            i++;
+        }
+        for (var k = 0; k < node.children.length; k++) {
+            processContainer(node.children[k]);
+        }
+    }
+
+    processContainer(root);
+}
+
 GAnimation.prototype.addTrackKey = function(path, typeStr, time, value, transition) {
     var tIdx = this.findTrack(path, typeStr);
     if (tIdx === -1) {
@@ -1542,11 +2045,12 @@ function serializeTscn(root, extResources, subResources) {
 
         for (var p in node.properties) {
             if (p === "instance") nodeLine += ' instance=' + node.properties[p];
+            else if (p === "groups") nodeLine += ' groups=' + node.properties[p];
         }
         lines.push(nodeLine + ']');
 
         for (var p in node.properties) {
-            if (p !== "instance") lines.push(p + ' = ' + node.properties[p]);
+            if (p !== "instance" && p !== "groups") lines.push(p + ' = ' + node.properties[p]);
         }
         lines.push('');
 
@@ -3003,7 +3507,14 @@ function buildSceneForSymbol(sym, frameRate, exportDir, boundsLookup, boundsInde
         if (enabler) root.removeChild(enabler);
     }
 
+    _flattenSingleChildGroups(root, anim);
+
+    _bakeStaticShaderTints(root, anim, subResources);
+
     _setupMaterials(root, true);
+
+    var hasBakeableShapes = _markBakeableShapes(root, anim);
+    _mergeSameColorSiblings(root);
 
     // ----------------------------------------------------------------
     // Réordonner les enfants des nodes `shape` pour que tous les Polygon2D
@@ -3043,8 +3554,11 @@ function buildSceneForSymbol(sym, frameRate, exportDir, boundsLookup, boundsInde
         gdPath = _accum + "/scripts/" + _spiOut.subPath.substring(_spiOut.subPath.lastIndexOf("/") + 1) + ".gd";
     }
 
-    // Post-process .tscn to attach script if we have actionScripts
-    if (actionScripts.length > 0) {
+    // Post-process .tscn to attach script if we have actionScripts, OR if
+    // this scene has static Polygon2D/Line2D nodes to bake at runtime
+    // (v4.8) : sans script sur le root, FlashMovieClip._ready() ne
+    // s'exécute jamais et le bake n'a jamais lieu.
+    if (actionScripts.length > 0 || hasBakeableShapes) {
         var gdContent = "extends FlashMovieClip\n\n";
         
         var methodsDone = {};
@@ -3372,9 +3886,109 @@ function buildGodotScenes(doc, data, exportDir) {
     "class_name FlashMovieClip\n\n" +
     "var _rng: RandomNumberGenerator\n" +
     "var undefined = null\n\n" +
+    "# --- v4.8 runtime draw baking -----------------------------------\n" +
+    "# Les shapes marquées \"flash_bake\" (voir godotBuilder._markBakeableShapes)\n" +
+    "# sont statiques : aucune AnimationPlayer track ne les cible, ni elles ni\n" +
+    "# un de leurs ancêtres dans CETTE scène. On les fusionne en un seul\n" +
+    "# _draw() sur ce node racine et on libère (queue_free) les Polygon2D/\n" +
+    "# Line2D d'origine (qui restent éditables normalement dans l'éditeur\n" +
+    "# Godot : ce bake ne s'exécute qu'au runtime, jamais dans l'éditeur).\n" +
+    "# Une SEULE liste ordonnée (pas un tableau polygones + un tableau lignes\n" +
+    "# séparés) : le z-order Flash original entrelace fills et strokes de\n" +
+    "# différents éléments (ex: le trait d'une forme doit parfois passer\n" +
+    "# AU-DESSUS du fill d'une forme suivante). Deux tableaux séparés\n" +
+    "# dessineraient TOUS les fills avant TOUS les traits, cassant cet ordre.\n" +
+    "var _baked_draws: Array = []\n\n" +
+    "func _bake_static_shapes(node: Node = self, accumulated: Transform2D = Transform2D.IDENTITY, is_root: bool = true) -> void:\n" +
+    "\t# Une instance de sous-symbole a son propre script (FlashMovieClip ou\n" +
+    "\t# dérivé) : elle bake ses propres shapes dans son propre _ready(), donc\n" +
+    "\t# on ne descend jamais dedans depuis le parent.\n" +
+    "\tif not is_root and node.get_script() != null:\n" +
+    "\t\treturn\n" +
+    "\tfor child in node.get_children():\n" +
+    "\t\tif not (child is Node2D):\n" +
+    "\t\t\tcontinue\n" +
+    "\t\tvar child_xform: Transform2D = accumulated * child.transform\n" +
+    "\t\tvar was_baked := false\n" +
+    "\t\tif child is Polygon2D and child.is_in_group(\"flash_bake\"):\n" +
+    "\t\t\t# draw_colored_polygon() triangule UN SEUL contour à la fois,\n" +
+    "\t\t\t# contrairement au node Polygon2D natif qui gère nativement le\n" +
+    "\t\t\t# multi-contours via sa propriété \"polygons\". Si ce node en a\n" +
+    "\t\t\t# plusieurs (ex: 2 zones disjointes de même couleur, v4.6/v4.9),\n" +
+    "\t\t\t# il faut les dessiner séparément, sinon la triangulation d'un\n" +
+    "\t\t\t# seul gros contour combiné échoue (ou produit un rendu faux).\n" +
+    "\t\t\tif child.polygons.is_empty():\n" +
+    "\t\t\t\t_baked_draws.append({\n" +
+    "\t\t\t\t\t\"kind\": \"polygon\",\n" +
+    "\t\t\t\t\t\"points\": child.polygon,\n" +
+    "\t\t\t\t\t\"color\": child.color,\n" +
+    "\t\t\t\t\t\"uv\": child.uv,\n" +
+    "\t\t\t\t\t\"texture\": child.texture,\n" +
+    "\t\t\t\t\t\"transform\": child_xform,\n" +
+    "\t\t\t\t})\n" +
+    "\t\t\telse:\n" +
+    "\t\t\t\tfor idx_group in child.polygons:\n" +
+    "\t\t\t\t\tvar pts := PackedVector2Array()\n" +
+    "\t\t\t\t\tvar uvs := PackedVector2Array()\n" +
+    "\t\t\t\t\tfor idx in idx_group:\n" +
+    "\t\t\t\t\t\tpts.append(child.polygon[idx])\n" +
+    "\t\t\t\t\t\tuvs.append(child.uv[idx] if idx < child.uv.size() else Vector2.ZERO)\n" +
+    "\t\t\t\t\t_baked_draws.append({\n" +
+    "\t\t\t\t\t\t\"kind\": \"polygon\",\n" +
+    "\t\t\t\t\t\t\"points\": pts,\n" +
+    "\t\t\t\t\t\t\"color\": child.color,\n" +
+    "\t\t\t\t\t\t\"uv\": uvs,\n" +
+    "\t\t\t\t\t\t\"texture\": child.texture,\n" +
+    "\t\t\t\t\t\t\"transform\": child_xform,\n" +
+    "\t\t\t\t\t})\n" +
+    "\t\t\twas_baked = true\n" +
+    "\t\telif child is Line2D and child.is_in_group(\"flash_bake\"):\n" +
+    "\t\t\t_baked_draws.append({\n" +
+    "\t\t\t\t\"kind\": \"line\",\n" +
+    "\t\t\t\t\"points\": child.points,\n" +
+    "\t\t\t\t\"width\": child.width,\n" +
+    "\t\t\t\t\"color\": child.default_color,\n" +
+    "\t\t\t\t\"transform\": child_xform,\n" +
+    "\t\t\t})\n" +
+    "\t\t\twas_baked = true\n" +
+    "\t\t# Un Polygon2D/Line2D wrapper peut lui-même avoir des enfants\n" +
+    "\t\t# (Poly_1, Line_0... autres groupes de couleur de la même shape,\n" +
+    "\t\t# voir godotBuilder v4.7) : on descend TOUJOURS dedans, que le\n" +
+    "\t\t# node lui-même ait été baké ou non, sinon ces enfants seraient\n" +
+    "\t\t# détruits par le queue_free() ci-dessous sans jamais être dessinés.\n" +
+    "\t\t_bake_static_shapes(child, child_xform, false)\n" +
+    "\t\tif was_baked:\n" +
+    "\t\t\t# S'il reste des enfants après la récursion (un enfant jamais\n" +
+    "\t\t\t# marqué \"flash_bake\", donc ni baké ni libéré individuellement),\n" +
+    "\t\t\t# le queue_free() ci-dessous les détruirait en cascade SANS\n" +
+    "\t\t\t# qu'ils aient jamais été dessinés. On les remonte chez le\n" +
+    "\t\t\t# grand-parent à la place. reparent() (et non add_child(), qui\n" +
+    "\t\t\t# échoue silencieusement sur un node ayant déjà un parent) gère\n" +
+    "\t\t\t# le détachement ET garde la position visuelle exacte via\n" +
+    "\t\t\t# keep_global_transform (recalcul automatique du transform local).\n" +
+    "\t\t\tfor leftover in child.get_children():\n" +
+    "\t\t\t\tleftover.reparent(node)\n" +
+    "\t\t\tchild.queue_free()\n\n" +
+    "func _draw() -> void:\n" +
+    "\tfor d in _baked_draws:\n" +
+    "\t\tif d.kind == \"polygon\":\n" +
+    "\t\t\tif d.points.size() < 3:\n" +
+    "\t\t\t\tcontinue\n" +
+    "\t\t\tdraw_set_transform_matrix(d.transform)\n" +
+    "\t\t\tdraw_colored_polygon(d.points, d.color, d.uv, d.texture)\n" +
+    "\t\telse:\n" +
+    "\t\t\tif d.points.size() < 2:\n" +
+    "\t\t\t\tcontinue\n" +
+    "\t\t\tdraw_set_transform_matrix(d.transform)\n" +
+    "\t\t\tdraw_polyline(d.points, d.color, d.width, true)\n" +
+    "\tdraw_set_transform_matrix(Transform2D.IDENTITY)\n" +
+    "# -----------------------------------------------------------------\n\n" +
     "func _ready():\n" +
     "\t_rng = RandomNumberGenerator.new()\n" +
-    "\t_rng.seed = hash(Time.get_ticks_msec()) + hash(get_instance_id())\n\n" +
+    "\t_rng.seed = hash(Time.get_ticks_msec()) + hash(get_instance_id())\n" +
+    "\tif not Engine.is_editor_hint():\n" +
+    "\t\t_bake_static_shapes()\n" +
+    "\t\tqueue_redraw()\n\n" +
     "var _currentframe: int:\n" +
     "\tget:\n" +
     "\t\tif has_node(\"AnimationPlayer\") and $AnimationPlayer.current_animation != \"\":\n" +
