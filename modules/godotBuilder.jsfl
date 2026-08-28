@@ -1,6 +1,60 @@
 if (typeof fl !== "undefined") fl.trace(">>> godotBuilder_v4 LOADED <<<");
 
 /**
+ * godotBuilder v4.15 - Un seul VisibleOnScreenEnabler2D par sous-arbre
+ *   - Un symbole qui n'est JAMAIS placé directement par la scène
+ *     principale, et qui est TOUJOURS instancié comme enfant d'au moins un
+ *     autre symbole, n'a plus son propre `VisibleOnScreenEnabler2D` :
+ *     l'ancêtre qui l'instancie porte déjà le sien, qui désactive via
+ *     `process_mode` TOUT son sous-arbre (donc aussi l'AnimationPlayer de
+ *     ce symbole) quand il sort de l'écran — un enabler ici serait
+ *     redondant. Calculé une fois pour tout le projet via le graphe
+ *     `referencedBy` (symbole -> quels symboles l'instancient), déjà
+ *     utilisé pour la propagation des besoins en shader.
+ *   - Sécurité : un symbole gardé son enabler dès qu'il est placé
+ *     directement par la scène principale AU MOINS UNE FOIS, même s'il est
+ *     par ailleurs aussi nesté ailleurs (usage double = pas assez sûr pour
+ *     le retirer). Limite acceptée : si TOUS les parents d'un symbole
+ *     s'avèrent eux-mêmes non-animés (single-frame, donc sans enabler
+ *     propre), ce symbole perd son culling individuel pour rien — cas
+ *     marginal en pratique.
+ * godotBuilder v4.13 - Correction du rect de VisibleOnScreenEnabler2D
+ *   - BUG (présent avant même cette session) : le rect de détection de
+ *     l'enabler ignorait la taille de la bounding box réellement calculée
+ *     (minX/maxX/minY/maxY) et posait une boîte FIXE de 20x20px autour de
+ *     son centre. Sur un symbole animé de taille normale, ce rect minuscule
+ *     sort et rentre du champ de détection à chaque léger mouvement, ce qui
+ *     bascule enabled/disabled en boucle sur le node — thrashing mesuré en
+ *     profiling comme des pics répétés dans le temps de "Processus" (bien
+ *     pires que l'absence totale d'enabler).
+ *   - Corrigé : le rect couvre maintenant la vraie étendue (bbox frame 0 *
+ *     localScaleFactor) avec une marge généreuse (50% de la taille de la
+ *     bbox, mini 100px) pour absorber le débattement typique d'une
+ *     animation (position/rotation/scale) que cette bbox, calculée
+ *     uniquement sur la frame 0, ne capture pas.
+ *   - Cette session a un temps considéré la suppression pure et simple du
+ *     node (-1 node/scène animée) plutôt que de corriger son rect ; mesuré
+ *     en conditions réelles, ça fait disparaître les pics mais fait tourner
+ *     en continu tous les AnimationPlayer même hors écran (FPS moyen en
+ *     baisse sur une salle avec plusieurs instances) — d'où le choix final
+ *     de corriger le rect plutôt que de retirer le mécanisme.
+ * godotBuilder v4.12 - Promotion de la racine de scène en shape unique
+ *   - `_promoteRootSingleShapeChild` : quand la racine d'une scène symbole
+ *     n'a, en dehors d'AnimationPlayer/VisibleOnScreenEnabler2D, qu'UN SEUL enfant de contenu
+ *     (éventuellement au bout d'une chaîne de
+ *     wrappers Node2D purement organisationnels sans transform/visible/
+ *     material/groups propres), et que ce contenu est un Polygon2D/
+ *     Line2D, root ADOPTE directement le type et les propriétés de ce
+ *     shape (même principe que le "node = 1er élément" de v4.7, appliqué
+ *     au root lui-même). Très fréquent sur les petits symboles à une
+ *     seule forme (accessoires, icônes...) : -1 node par scène concernée,
+ *     multiplié par chaque instanciation du symbole au runtime.
+ *   - Tourne AVANT `anim.optimizeTracks`/toute génération de texte
+ *     d'animation (contrairement à v4.10, restreinte aux sous-arbres 100%
+ *     statiques car elle tourne APRÈS que les NodePath soient figées en
+ *     texte) : peut donc promouvoir un shape directement animé, en
+ *     réécrivant en amont, dans anim.tracks, le préfixe de chemin du node
+ *     supprimé pour qu'il pointe vers root une fois le wrapper disparu.
  * godotBuilder v4.11 - Pré-teinte des shapes à couleur statique (color transform)
  *   - `_bakeStaticShaderTints` : pour toute shape utilisant le shader
  *     "Advanced Color Effect" de Flash (color_mult/color_offset_255) dont
@@ -11,14 +65,14 @@ if (typeof fl !== "undefined") fl.trace(">>> godotBuilder_v4 LOADED <<<");
  *     reprise de flash_color_normal.gdshader) directement aux couleurs du
  *     Gradient source, et donne au node une texture déjà teintée à la
  *     place du shader. Le node n'a alors plus besoin de matériau, et
- *     devient éligible au bake runtime (v4.8/_markBakeableShapes).
+ *     devient éligible à la fusion cross-siblings (_markBakeableShapes/v4.9).
  *   - Limité au blend mode "normal" (flash_color_normal.gdshader) : "add"/
  *     "multiply" dépendent du contenu du framebuffer au moment du dessin
  *     (blend GPU en temps réel), impossible à reproduire en pré-teintant
- *     une texture — ces shapes gardent leur shader et restent hors bake.
+ *     une texture — ces shapes gardent leur shader et restent hors fusion.
  *   - Tourne AVANT `_setupMaterials`/`_markBakeableShapes` : une fois le
  *     matériau retiré, le node est traité comme n'importe quel autre
- *     Polygon2D statique par le reste du pipeline (v4.8-v4.10).
+ *     Polygon2D statique par le reste du pipeline (v4.9-v4.10).
  * godotBuilder v4.10 - Aplatissement des wrappers Node2D vides à 1 enfant
  *   - `_flattenSingleChildGroups` supprime les nodes Node2D purement
  *     organisationnels (folder/layer/masque) qui n'ont qu'UN SEUL enfant,
@@ -42,40 +96,23 @@ if (typeof fl !== "undefined") fl.trace(">>> godotBuilder_v4 LOADED <<<");
  *     nouvelles opportunités de fusion cross-siblings (v4.9).
  * godotBuilder v4.9 - Fusion cross-elements des Polygon2D statiques de même couleur
  *   - `_mergeSameColorSiblings` fusionne, entre nodes FRÈRES et CONSÉCUTIFS
- *     dans l'ordre de rendu, les Polygon2D statiques ("flash_bake") qui
- *     partagent exactement le même `texture` (donc la même couleur/gradient,
- *     gradCache dédupliquant déjà les couleurs identiques vers la même
- *     SubResource). Complémentaire de la fusion intra-shape déjà existante
- *     (polyGroups/sig, v4.6) qui ne fusionnait que les contours d'UN SEUL
- *     élément Flash ; celle-ci fusionne à travers des éléments Flash
- *     différents (ex: deux instances de la même feuille sur le même
- *     calque), réduisant le nombre de nodes dès le .tscn (éditeur compris,
- *     pas seulement au runtime via le bake v4.8).
+ *     dans l'ordre de rendu, les Polygon2D statiques (marquées par
+ *     `_markBakeableShapes` : aucune AnimationPlayer track ne les cible, ni
+ *     elles ni un de leurs ancêtres) qui partagent exactement le même
+ *     `texture` (donc la même couleur/gradient, gradCache dédupliquant déjà
+ *     les couleurs identiques vers la même SubResource). Complémentaire de
+ *     la fusion intra-shape déjà existante (polyGroups/sig, v4.6) qui ne
+ *     fusionnait que les contours d'UN SEUL élément Flash ; celle-ci
+ *     fusionne à travers des éléments Flash différents (ex: deux instances
+ *     de la même feuille sur le même calque), réduisant le nombre de nodes
+ *     dès le .tscn (éditeur compris).
  *   - Chaque node fusionné amène son propre transform (position/rotation/
  *     scale/skew) : les vertices "polygon" sont ramenés dans l'espace
  *     local du parent avant fusion, l'UV n'est jamais touché (déjà correct
  *     par construction, indépendant du transform du node).
- *   - Sécurité : ne fusionne que des nodes déjà "flash_bake" (garantis non
- *     ciblés par une AnimationPlayer track) et sans matériau propre.
- * godotBuilder v4.8 - Runtime draw baking (Polygon2D/Line2D -> un seul node _draw())
- *   - Les Polygon2D/Line2D restent des nodes natifs dans le .tscn (édition
- *     normale dans l'éditeur Godot), MAIS chaque shape STATIQUE (aucune
- *     AnimationPlayer track ne la cible, ni elle ni un de ses ancêtres dans
- *     la même scène) est marquée `groups=["flash_bake"]`.
- *   - `FlashMovieClip.gd` (base class commune) bake au runtime, dans
- *     `_ready()`, tous les descendants marqués "flash_bake" de la scène
- *     courante en un seul `_draw()` sur le node racine, puis les libère
- *     (`queue_free()`). La récursion s'arrête à toute instance de
- *     sous-symbole (node avec son propre script) : chaque sous-scène bake
- *     ses propres shapes indépendamment.
- *   - Les shapes animées (ou sous un ancêtre animé) ne sont jamais marquées
- *     et restent des Polygon2D/Line2D individuels pilotés par
- *     l'AnimationPlayer, inchangés.
- *   - Limite connue : le node racine dessine (via `_draw()`) AVANT ses
- *     enfants ; une shape statique baked apparaîtra donc toujours DERRIÈRE
- *     les shapes animées restées en nodes. Ordre à vérifier manuellement
- *     si une shape statique doit visuellement passer AU-DESSUS d'une shape
- *     animée dans le même symbole.
+ *   - Sécurité : ne fusionne que des nodes déjà marqués comme statiques par
+ *     `_markBakeableShapes` (garantis non ciblés par une AnimationPlayer
+ *     track) et sans matériau propre.
  * godotBuilder v4.7 - Réduction du nombre de nodes (wrappers Polygon2D/Line2D)
  *   - v4.7 : deux occurrences où le code créait un wrapper Node2D inutile
  *     alors qu'un mécanisme de nommage "node lui-même = 1er élément, Poly_0/
@@ -1099,6 +1136,102 @@ GAnimation.prototype.optimizeTracks = function(root) {
 };
 
 
+// Promeut la racine de scène elle-même en shape unique (même principe que
+// le "node lui-même = 1er élément" de v4.7, mais appliqué au ROOT de la
+// scène) : quand root n'a, en dehors d'AnimationPlayer/VisibleOnScreenEnabler2D, qu'UN SEUL enfant
+// de contenu, et que cet enfant (ou une
+// chaîne de wrappers Node2D "passe-plat" purement organisationnels sans
+// transform/visible/material/groups propres qui mène à lui) est un
+// Polygon2D/Line2D, root ADOPTE le type et les propriétés de ce shape :
+// le wrapper disparaît, root DEVIENT directement le Polygon2D/Line2D, et
+// les éventuels petits-enfants (Poly_1/Line_0... autres groupes de couleur
+// de la même shape, v4.7) remontent en enfants directs de root.
+// Cas très fréquent sur les petits symboles à une seule forme (accessoires,
+// icônes...) : leur scène entière n'était jusqu'ici composée que d'un
+// Node2D racine "vide" enveloppant ce shape unique.
+// Contrairement à `_flattenSingleChildGroups` (v4.10, restreint aux sous-
+// arbres 100% statiques car les NodePath des animations sont déjà
+// sérialisées en texte au moment où elle tourne), cette passe s'exécute
+// AVANT `anim.optimizeTracks`/toute génération de texte d'animation (voir
+// site d'appel), donc AVANT qu'aucun NodePath("...") ne soit figé : elle
+// peut donc aussi promouvoir un shape directement animé (position/
+// rotation/couleur/polygon...), en réécrivant simplement en amont, dans
+// anim.tracks, le préfixe de chemin du node supprimé ("Wrap/shape:prop"
+// -> ".:prop", "Wrap/shape/enfant:prop" -> "enfant:prop") pour qu'il
+// pointe vers root une fois le wrapper disparu.
+function _promoteRootSingleShapeChild(root, anim) {
+    var HELPER_TYPES = { "AnimationPlayer": true, "VisibleOnScreenEnabler2D": true };
+    function contentChildrenOf(node) {
+        var out = [];
+        for (var i = 0; i < node.children.length; i++) {
+            if (!HELPER_TYPES[node.children[i].type]) out.push(node.children[i]);
+        }
+        return out;
+    }
+    var TRANSFORM_PROPS = ["position", "rotation", "scale", "skew"];
+    function isPassThroughWrapper(n) {
+        if (n.type !== "Node2D") return false;
+        for (var i = 0; i < TRANSFORM_PROPS.length; i++) {
+            if (n.properties[TRANSFORM_PROPS[i]] !== undefined) return false;
+        }
+        // "modulate" : un Node2D wrapper d'instance peut porter une vraie
+        // teinte "Advanced Color Effect" sans passer par un shader/material
+        // (cf. le "else" de la gestion du color effect, qui écrit
+        // modulate/self_modulate directement sur le wrapper) — jamais
+        // silencieusement perdue en traversant le wrapper.
+        return n.properties["visible"] === undefined
+            && n.properties["material"] === undefined
+            && n.properties["groups"] === undefined
+            && n.properties["modulate"] === undefined
+            && n.properties["self_modulate"] === undefined;
+    }
+
+    // Descend depuis root tant qu'on ne croise que des wrappers "passe-
+    // plat" à un seul enfant, jusqu'à trouver le shape terminal (ou
+    // abandonner si la structure ne correspond pas au patron attendu).
+    var wrappers = [];
+    var cursor = root;
+    var shape = null;
+    while (true) {
+        var kids = contentChildrenOf(cursor);
+        if (kids.length !== 1) return;
+        var only = kids[0];
+        if (only.type === "Polygon2D" || only.type === "Line2D") { shape = only; break; }
+        if (!isPassThroughWrapper(only)) return;
+        wrappers.push(only);
+        cursor = only;
+    }
+
+    var oldPrefix = root.getPathTo(shape);
+    if (anim && anim.tracks) {
+        for (var t = 0; t < anim.tracks.length; t++) {
+            var tr = anim.tracks[t];
+            if (tr.type === "method") continue;
+            var colonIdx = tr.path.indexOf(":");
+            var nodePath = (colonIdx !== -1) ? tr.path.substring(0, colonIdx) : tr.path;
+            var propSuffix = (colonIdx !== -1) ? tr.path.substring(colonIdx) : "";
+            if (nodePath === oldPrefix) {
+                tr.path = "." + propSuffix;
+            } else if (nodePath.indexOf(oldPrefix + "/") === 0) {
+                tr.path = nodePath.substring(oldPrefix.length + 1) + propSuffix;
+            }
+        }
+    }
+
+    root.type = shape.type;
+    for (var key in shape.properties) {
+        if (shape.properties.hasOwnProperty(key)) root.properties[key] = shape.properties[key];
+    }
+
+    var grandchildren = shape.children.slice();
+    shape.parent.removeChild(shape);
+    for (var g = 0; g < grandchildren.length; g++) root.addChild(grandchildren[g]);
+    for (var w = 0; w < wrappers.length; w++) {
+        if (wrappers[w].parent) wrappers[w].parent.removeChild(wrappers[w]);
+    }
+}
+
+
 // Supprime les wrappers Node2D "vides" : un container organisationnel
 // (folder/layer/masque) qui n'a QU'UN SEUL enfant, aucun transform propre
 // (position/rotation/scale/skew), aucune propriété "visible"/"material"/
@@ -1315,12 +1448,15 @@ function _bakeStaticShaderTints(root, anim, subResources) {
     }
 }
 
-// Marque groups=["flash_bake"] tout Polygon2D/Line2D qui n'est ciblé par
-// AUCUNE AnimationPlayer track (ni lui, ni un de ses ancêtres dans la même
-// scène). À appeler APRÈS anim.optimizeTracks(root), pour que anim.tracks
-// ne contienne plus que les propriétés réellement dynamiques (les tracks
-// "statiques" à une seule valeur ont déjà été inlinées dans node.properties
-// par optimizeTracks et effacées de la liste).
+// Marque en interne (node._mergeSafe, jamais sérialisé dans le .tscn) tout
+// Polygon2D/Line2D qui n'est ciblé par AUCUNE AnimationPlayer track (ni lui,
+// ni un de ses ancêtres dans la même scène). Sert uniquement de critère de
+// sécurité à `_mergeSameColorSiblings` (v4.9) pour savoir quels nodes
+// peuvent être fusionnés sans jamais casser une animation. À appeler APRÈS
+// anim.optimizeTracks(root), pour que anim.tracks ne contienne plus que les
+// propriétés réellement dynamiques (les tracks "statiques" à une seule
+// valeur ont déjà été inlinées dans node.properties par optimizeTracks et
+// effacées de la liste).
 // Les method tracks (appels de frame scripts, path === ".") sont ignorées :
 // elles n'impliquent aucun changement visuel du node ciblé.
 function _markBakeableShapes(root, anim) {
@@ -1339,23 +1475,20 @@ function _markBakeableShapes(root, anim) {
     function walk(node, isAnimated, materialAncestor) {
         var path = (node === root) ? "." : root.getPathTo(node);
         var nodeAnimated = isAnimated || !!animatedPaths[path];
-        // draw_colored_polygon()/draw_polyline() utilisent TOUJOURS le
-        // matériau du node sur lequel _draw() s'exécute (la racine), jamais
-        // celui d'un node individuel détruit après le bake. Un node avec
-        // son propre "material" (shader de teinte/color transform, voir
-        // has_shader plus haut) OU qui refuse explicitement d'hériter du
-        // matériau parent (use_parent_material=false, ex: les Line2D de
-        // contour, volontairement isolées du shader des fills) ne peut
-        // donc jamais être baké sans perdre/fausser son rendu. Idem pour
-        // tout descendant d'un ancêtre ayant lui-même un vrai matériau :
-        // il en hérite via use_parent_material=true, que le node racine
-        // ne peut pas reproduire.
+        // Un Polygon2D/Line2D fusionné (v4.9) doit garder EXACTEMENT le
+        // rendu de ses nodes d'origine : un node avec son propre "material"
+        // (shader de teinte/color transform, voir has_shader plus haut) OU
+        // qui refuse explicitement d'hériter du matériau parent
+        // (use_parent_material=false, ex: les Line2D de contour,
+        // volontairement isolées du shader des fills) ne peut donc jamais
+        // être fusionné sans perdre/fausser son rendu. Idem pour tout
+        // descendant d'un ancêtre ayant lui-même un vrai matériau.
         var hasOwnMaterial = !!node.properties["material"];
         var optsOut = (node.properties["use_parent_material"] === false
                     || node.properties["use_parent_material"] === "false");
-        var unsafeForBake = materialAncestor || hasOwnMaterial || optsOut;
-        if (!nodeAnimated && !unsafeForBake && node !== root && (node.type === "Polygon2D" || node.type === "Line2D")) {
-            node.properties["groups"] = '["flash_bake"]';
+        var unsafeForMerge = materialAncestor || hasOwnMaterial || optsOut;
+        if (!nodeAnimated && !unsafeForMerge && node !== root && (node.type === "Polygon2D" || node.type === "Line2D")) {
+            node._mergeSafe = true;
             markedAny = true;
         }
         var childMaterialAncestor = materialAncestor || hasOwnMaterial;
@@ -1368,21 +1501,20 @@ function _markBakeableShapes(root, anim) {
 }
 
 // Fusionne, entre nodes FRÈRES (même parent direct) et CONSÉCUTIFS dans
-// l'ordre de rendu, les Polygon2D statiques ("flash_bake") qui partagent
-// EXACTEMENT le même texture (= même SubResource, donc même couleur/
-// gradient : gradCache déduplique déjà les couleurs solides identiques
-// vers la même GradientTexture1D). Complémentaire de la fusion intra-shape
-// déjà existante (polyGroups/sig, v4.6) qui ne fusionne que les contours
-// d'UN SEUL élément Flash ; celle-ci fusionne à travers des éléments
-// Flash différents (ex: deux instances de la même feuille sur le même
-// calque), réduisant le nombre de nodes dès le .tscn (pas seulement au
-// runtime).
+// l'ordre de rendu, les Polygon2D statiques (marquées _mergeSafe par
+// _markBakeableShapes) qui partagent EXACTEMENT le même texture (= même
+// SubResource, donc même couleur/gradient : gradCache déduplique déjà les
+// couleurs solides identiques vers la même GradientTexture1D). Complémentaire
+// de la fusion intra-shape déjà existante (polyGroups/sig, v4.6) qui ne
+// fusionne que les contours d'UN SEUL élément Flash ; celle-ci fusionne à
+// travers des éléments Flash différents (ex: deux instances de la même
+// feuille sur le même calque), réduisant le nombre de nodes dès le .tscn.
 // Ne touche jamais l'UV : chaque vertex garde son UV d'origine, calculé
 // correctement dès la génération initiale (peu importe la position finale
 // du node, y compris pour un vrai gradient dont la matrice diffère par
 // shape — seuls les points "polygon" doivent être ramenés dans l'espace
 // local du parent via le transform propre au node fusionné).
-// Ne fusionne QUE des nodes déjà marqués "flash_bake" (donc garantis non
+// Ne fusionne QUE des nodes déjà marqués _mergeSafe (donc garantis non
 // ciblés par une AnimationPlayer track) et sans matériau propre, pour ne
 // jamais casser une animation ou un shader spécifique à un node.
 function _mergeSameColorSiblings(root) {
@@ -1427,7 +1559,7 @@ function _mergeSameColorSiblings(root) {
 
     function isMergeCandidate(n) {
         return n.type === "Polygon2D"
-            && n.properties["groups"] === '["flash_bake"]'
+            && n._mergeSafe === true
             && !!n.properties["texture"]
             && !!n.properties["polygon"]
             && n.properties["visible"] !== false
@@ -1490,7 +1622,6 @@ function _mergeSameColorSiblings(root) {
         merged.properties["texture"] = kids[0].properties["texture"];
         merged.properties["color"] = kids[0].properties["color"] || "Color(1, 1, 1, 1)";
         merged.properties["visible"] = true;
-        merged.properties["groups"] = '["flash_bake"]';
 
         var ownerRef = kids[0].owner;
         for (var k = kids.length - 1; k >= 0; k--) parent.removeChild(kids[k]);
@@ -2967,7 +3098,7 @@ function _reorderShapePolysAndLines(node, isTopLevel) {
     }
 }
 
-function buildSceneForSymbol(sym, frameRate, exportDir, boundsLookup, boundsIndex, symbolMap, symbolContainsShader) {
+function buildSceneForSymbol(sym, frameRate, exportDir, boundsLookup, boundsIndex, symbolMap, symbolContainsShader, skipEnablerFor) {
     if (!sym.safeName) sym.safeName = sanitizeForLookup(sym.name);
     var extResources = [];
     var extIdMap = {};
@@ -3000,6 +3131,15 @@ function buildSceneForSymbol(sym, frameRate, exportDir, boundsLookup, boundsInde
         bg.properties["color"] = "Color(" + _f(r) + ", " + _f(g) + ", " + _f(b) + ", 1.0)";
         bg.properties["mouse_filter"] = 2;
         root.addChild(bg);
+    } else if (skipEnablerFor && skipEnablerFor[sym.name]) {
+        // v4.15 : ce symbole n'est instancié QUE comme enfant d'autres
+        // symboles (jamais placé directement par la scène principale) --
+        // l'ancêtre animé qui l'instancie porte déjà son propre
+        // VisibleOnScreenEnabler2D, qui désactive via process_mode TOUT le
+        // sous-arbre (donc aussi l'AnimationPlayer de ce symbole) quand il
+        // sort de l'écran. Un enabler ici serait redondant : -1 node par
+        // instanciation, sans perte de culling réel. Voir le calcul de
+        // `referencedBy`/`skipEnablerFor` dans l'appelant.
     } else {
         var localScaleFactor = 4.166667;
         var minX = 999999, maxX = -999999, minY = 999999, maxY = -999999;
@@ -3039,13 +3179,28 @@ function buildSceneForSymbol(sym, frameRate, exportDir, boundsLookup, boundsInde
                 }
             }
         }
-        var cx = 0, cy = 0;
-        if (hasBounds && minX <= maxX) {
-            cx = (minX + maxX) / 2.0 * localScaleFactor;
-            cy = (minY + maxY) / 2.0 * localScaleFactor;
-        }
+        // v4.14-fix : le rect DOIT couvrir la vraie étendue du contenu (pas
+        // juste son centre dans une boîte fixe 20x20 comme avant v4.13) :
+        // sinon le node sort/rentre du champ de détection à chaque frame
+        // dès que l'animation bouge un peu, ce qui déclenche un thrashing
+        // enable/disable permanent -- pire pour les perfs (pics de
+        // "Processus") que l'absence totale d'enabler. Marge généreuse
+        // (50% de la taille de la bbox, mini 100px) pour absorber le
+        // débattement typique d'une animation (position/rotation/scale)
+        // qui n'est calculée QUE sur la frame 0 ici.
         var enabler = new GNode("VisibilityEnabler", "VisibleOnScreenEnabler2D");
-        enabler.properties["rect"] = "Rect2(" + _f(cx - 10) + ", " + _f(cy - 10) + ", 20, 20)";
+        if (hasBounds && minX <= maxX) {
+            var bx0 = minX * localScaleFactor, by0 = minY * localScaleFactor;
+            var bw = (maxX - minX) * localScaleFactor, bh = (maxY - minY) * localScaleFactor;
+            var padX = Math.max(bw * 0.5, 100);
+            var padY = Math.max(bh * 0.5, 100);
+            enabler.properties["rect"] = "Rect2(" + _f(bx0 - padX) + ", " + _f(by0 - padY) + ", "
+                + _f(bw + padX * 2) + ", " + _f(bh + padY * 2) + ")";
+        } else {
+            // Pas de bounds calculables (frame 0 vide) : grand rect de
+            // secours plutôt que le minuscule 20x20 d'origine.
+            enabler.properties["rect"] = "Rect2(-200, -200, 400, 400)";
+        }
         root.addChild(enabler);
         enabler.owner = root;
     }
@@ -3414,6 +3569,13 @@ function buildSceneForSymbol(sym, frameRate, exportDir, boundsLookup, boundsInde
         }
     }
 
+    // v4.12 : DOIT tourner avant toute génération de texte d'animation
+    // (RESET/labels ci-dessous, et même avant optimizeTracks) : elle
+    // réécrit les chemins dans anim.tracks, donc tout ce qui lit ces
+    // chemins après coup (optimizeTracks compris) doit voir la version
+    // déjà corrigée.
+    _promoteRootSingleShapeChild(root, anim);
+
     if (hasAnimation) {
         anim.optimizeTracks(root);
         
@@ -3431,10 +3593,9 @@ function buildSceneForSymbol(sym, frameRate, exportDir, boundsLookup, boundsInde
 
         if (isSingleFrame) {
             root.removeChild(animPlayer);
-            // Rien à mettre en pause hors-écran : la shape est statique.
-            // VisibleOnScreenEnabler2D ne fait rien économiser ici (le
-            // culling de rendu est déjà géré nativement par Godot), donc
-            // le node est pur surcoût. Voir création plus haut.
+            // Rien à mettre en pause hors-écran : la shape est statique, le
+            // culling de RENDU est déjà géré nativement par Godot. Voir
+            // création de l'enabler plus haut.
             if (enabler) root.removeChild(enabler);
         } else {
             var libId = "lib_" + nextId();
@@ -3513,7 +3674,7 @@ function buildSceneForSymbol(sym, frameRate, exportDir, boundsLookup, boundsInde
 
     _setupMaterials(root, true);
 
-    var hasBakeableShapes = _markBakeableShapes(root, anim);
+    _markBakeableShapes(root, anim);
     _mergeSameColorSiblings(root);
 
     // ----------------------------------------------------------------
@@ -3554,11 +3715,8 @@ function buildSceneForSymbol(sym, frameRate, exportDir, boundsLookup, boundsInde
         gdPath = _accum + "/scripts/" + _spiOut.subPath.substring(_spiOut.subPath.lastIndexOf("/") + 1) + ".gd";
     }
 
-    // Post-process .tscn to attach script if we have actionScripts, OR if
-    // this scene has static Polygon2D/Line2D nodes to bake at runtime
-    // (v4.8) : sans script sur le root, FlashMovieClip._ready() ne
-    // s'exécute jamais et le bake n'a jamais lieu.
-    if (actionScripts.length > 0 || hasBakeableShapes) {
+    // Post-process .tscn to attach script if we have actionScripts
+    if (actionScripts.length > 0) {
         var gdContent = "extends FlashMovieClip\n\n";
         
         var methodsDone = {};
@@ -3861,12 +4019,49 @@ function buildGodotScenes(doc, data, exportDir) {
         }
     }
 
+    // v4.15 : un symbole qui n'est JAMAIS placé directement par la scène
+    // principale, et qui est TOUJOURS instancié comme enfant d'au moins un
+    // autre symbole, n'a pas besoin de son propre VisibleOnScreenEnabler2D
+    // -- l'ancêtre qui l'instancie désactive déjà tout son sous-arbre via
+    // process_mode quand il sort de l'écran, donc aussi l'AnimationPlayer
+    // de ce symbole (voir _promoteRootSingleShapeChild... non, voir plutôt
+    // la création de l'enabler dans buildSceneForSymbol). Réutilise le
+    // graphe `referencedBy` déjà calculé ci-dessus pour le worklist shader.
+    // Limite acceptée : si TOUS les parents d'un symbole s'avèrent
+    // eux-mêmes non-animés (single-frame, donc sans enabler propre), ce
+    // symbole perd son culling individuel pour rien -- cas marginal en
+    // pratique (avoir plusieurs frames d'animation interne, condition pour
+    // porter son propre enabler, implique presque toujours un parent
+    // lui-même animé).
+    var mainSceneUsesSymbol = {};
+    var _mainScene = data.scenes[0];
+    if (_mainScene && _mainScene.layers) {
+        for (var l = 0; l < _mainScene.layers.length; l++) {
+            var layer = _mainScene.layers[l];
+            if (!layer.keyframes) continue;
+            for (var k = 0; k < layer.keyframes.length; k++) {
+                var kf = layer.keyframes[k];
+                if (!kf.elements) continue;
+                for (var e = 0; e < kf.elements.length; e++) {
+                    if (kf.elements[e].symbolName) mainSceneUsesSymbol[kf.elements[e].symbolName] = true;
+                }
+            }
+        }
+    }
+    var skipEnablerFor = {};
+    for (var i = 0; i < data.library.symbols.length; i++) {
+        var symName = data.library.symbols[i].name;
+        if (referencedBy[symName] && referencedBy[symName].length > 0 && !mainSceneUsesSymbol[symName]) {
+            skipEnablerFor[symName] = true;
+        }
+    }
+
     _preprocessTweens(data, symbolMap);
 
     for (var i = 0; i < data.library.symbols.length; i++) {
         var s = data.library.symbols[i];
         if (_isAutoTweenName(s.name)) continue;
-        buildSceneForSymbol(s, data.document.frameRate || 25, exportDir, boundsLookup, boundsIndex, symbolMap, symbolContainsShader);
+        buildSceneForSymbol(s, data.document.frameRate || 25, exportDir, boundsLookup, boundsIndex, symbolMap, symbolContainsShader, skipEnablerFor);
     }
 
     var scene = data.scenes[0];
@@ -3886,109 +4081,9 @@ function buildGodotScenes(doc, data, exportDir) {
     "class_name FlashMovieClip\n\n" +
     "var _rng: RandomNumberGenerator\n" +
     "var undefined = null\n\n" +
-    "# --- v4.8 runtime draw baking -----------------------------------\n" +
-    "# Les shapes marquées \"flash_bake\" (voir godotBuilder._markBakeableShapes)\n" +
-    "# sont statiques : aucune AnimationPlayer track ne les cible, ni elles ni\n" +
-    "# un de leurs ancêtres dans CETTE scène. On les fusionne en un seul\n" +
-    "# _draw() sur ce node racine et on libère (queue_free) les Polygon2D/\n" +
-    "# Line2D d'origine (qui restent éditables normalement dans l'éditeur\n" +
-    "# Godot : ce bake ne s'exécute qu'au runtime, jamais dans l'éditeur).\n" +
-    "# Une SEULE liste ordonnée (pas un tableau polygones + un tableau lignes\n" +
-    "# séparés) : le z-order Flash original entrelace fills et strokes de\n" +
-    "# différents éléments (ex: le trait d'une forme doit parfois passer\n" +
-    "# AU-DESSUS du fill d'une forme suivante). Deux tableaux séparés\n" +
-    "# dessineraient TOUS les fills avant TOUS les traits, cassant cet ordre.\n" +
-    "var _baked_draws: Array = []\n\n" +
-    "func _bake_static_shapes(node: Node = self, accumulated: Transform2D = Transform2D.IDENTITY, is_root: bool = true) -> void:\n" +
-    "\t# Une instance de sous-symbole a son propre script (FlashMovieClip ou\n" +
-    "\t# dérivé) : elle bake ses propres shapes dans son propre _ready(), donc\n" +
-    "\t# on ne descend jamais dedans depuis le parent.\n" +
-    "\tif not is_root and node.get_script() != null:\n" +
-    "\t\treturn\n" +
-    "\tfor child in node.get_children():\n" +
-    "\t\tif not (child is Node2D):\n" +
-    "\t\t\tcontinue\n" +
-    "\t\tvar child_xform: Transform2D = accumulated * child.transform\n" +
-    "\t\tvar was_baked := false\n" +
-    "\t\tif child is Polygon2D and child.is_in_group(\"flash_bake\"):\n" +
-    "\t\t\t# draw_colored_polygon() triangule UN SEUL contour à la fois,\n" +
-    "\t\t\t# contrairement au node Polygon2D natif qui gère nativement le\n" +
-    "\t\t\t# multi-contours via sa propriété \"polygons\". Si ce node en a\n" +
-    "\t\t\t# plusieurs (ex: 2 zones disjointes de même couleur, v4.6/v4.9),\n" +
-    "\t\t\t# il faut les dessiner séparément, sinon la triangulation d'un\n" +
-    "\t\t\t# seul gros contour combiné échoue (ou produit un rendu faux).\n" +
-    "\t\t\tif child.polygons.is_empty():\n" +
-    "\t\t\t\t_baked_draws.append({\n" +
-    "\t\t\t\t\t\"kind\": \"polygon\",\n" +
-    "\t\t\t\t\t\"points\": child.polygon,\n" +
-    "\t\t\t\t\t\"color\": child.color,\n" +
-    "\t\t\t\t\t\"uv\": child.uv,\n" +
-    "\t\t\t\t\t\"texture\": child.texture,\n" +
-    "\t\t\t\t\t\"transform\": child_xform,\n" +
-    "\t\t\t\t})\n" +
-    "\t\t\telse:\n" +
-    "\t\t\t\tfor idx_group in child.polygons:\n" +
-    "\t\t\t\t\tvar pts := PackedVector2Array()\n" +
-    "\t\t\t\t\tvar uvs := PackedVector2Array()\n" +
-    "\t\t\t\t\tfor idx in idx_group:\n" +
-    "\t\t\t\t\t\tpts.append(child.polygon[idx])\n" +
-    "\t\t\t\t\t\tuvs.append(child.uv[idx] if idx < child.uv.size() else Vector2.ZERO)\n" +
-    "\t\t\t\t\t_baked_draws.append({\n" +
-    "\t\t\t\t\t\t\"kind\": \"polygon\",\n" +
-    "\t\t\t\t\t\t\"points\": pts,\n" +
-    "\t\t\t\t\t\t\"color\": child.color,\n" +
-    "\t\t\t\t\t\t\"uv\": uvs,\n" +
-    "\t\t\t\t\t\t\"texture\": child.texture,\n" +
-    "\t\t\t\t\t\t\"transform\": child_xform,\n" +
-    "\t\t\t\t\t})\n" +
-    "\t\t\twas_baked = true\n" +
-    "\t\telif child is Line2D and child.is_in_group(\"flash_bake\"):\n" +
-    "\t\t\t_baked_draws.append({\n" +
-    "\t\t\t\t\"kind\": \"line\",\n" +
-    "\t\t\t\t\"points\": child.points,\n" +
-    "\t\t\t\t\"width\": child.width,\n" +
-    "\t\t\t\t\"color\": child.default_color,\n" +
-    "\t\t\t\t\"transform\": child_xform,\n" +
-    "\t\t\t})\n" +
-    "\t\t\twas_baked = true\n" +
-    "\t\t# Un Polygon2D/Line2D wrapper peut lui-même avoir des enfants\n" +
-    "\t\t# (Poly_1, Line_0... autres groupes de couleur de la même shape,\n" +
-    "\t\t# voir godotBuilder v4.7) : on descend TOUJOURS dedans, que le\n" +
-    "\t\t# node lui-même ait été baké ou non, sinon ces enfants seraient\n" +
-    "\t\t# détruits par le queue_free() ci-dessous sans jamais être dessinés.\n" +
-    "\t\t_bake_static_shapes(child, child_xform, false)\n" +
-    "\t\tif was_baked:\n" +
-    "\t\t\t# S'il reste des enfants après la récursion (un enfant jamais\n" +
-    "\t\t\t# marqué \"flash_bake\", donc ni baké ni libéré individuellement),\n" +
-    "\t\t\t# le queue_free() ci-dessous les détruirait en cascade SANS\n" +
-    "\t\t\t# qu'ils aient jamais été dessinés. On les remonte chez le\n" +
-    "\t\t\t# grand-parent à la place. reparent() (et non add_child(), qui\n" +
-    "\t\t\t# échoue silencieusement sur un node ayant déjà un parent) gère\n" +
-    "\t\t\t# le détachement ET garde la position visuelle exacte via\n" +
-    "\t\t\t# keep_global_transform (recalcul automatique du transform local).\n" +
-    "\t\t\tfor leftover in child.get_children():\n" +
-    "\t\t\t\tleftover.reparent(node)\n" +
-    "\t\t\tchild.queue_free()\n\n" +
-    "func _draw() -> void:\n" +
-    "\tfor d in _baked_draws:\n" +
-    "\t\tif d.kind == \"polygon\":\n" +
-    "\t\t\tif d.points.size() < 3:\n" +
-    "\t\t\t\tcontinue\n" +
-    "\t\t\tdraw_set_transform_matrix(d.transform)\n" +
-    "\t\t\tdraw_colored_polygon(d.points, d.color, d.uv, d.texture)\n" +
-    "\t\telse:\n" +
-    "\t\t\tif d.points.size() < 2:\n" +
-    "\t\t\t\tcontinue\n" +
-    "\t\t\tdraw_set_transform_matrix(d.transform)\n" +
-    "\t\t\tdraw_polyline(d.points, d.color, d.width, true)\n" +
-    "\tdraw_set_transform_matrix(Transform2D.IDENTITY)\n" +
-    "# -----------------------------------------------------------------\n\n" +
     "func _ready():\n" +
     "\t_rng = RandomNumberGenerator.new()\n" +
-    "\t_rng.seed = hash(Time.get_ticks_msec()) + hash(get_instance_id())\n" +
-    "\tif not Engine.is_editor_hint():\n" +
-    "\t\t_bake_static_shapes()\n" +
-    "\t\tqueue_redraw()\n\n" +
+    "\t_rng.seed = hash(Time.get_ticks_msec()) + hash(get_instance_id())\n\n" +
     "var _currentframe: int:\n" +
     "\tget:\n" +
     "\t\tif has_node(\"AnimationPlayer\") and $AnimationPlayer.current_animation != \"\":\n" +
