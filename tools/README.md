@@ -58,6 +58,31 @@ node tools/pipeline_snapshot.js debug_data.json /tmp/new_output
 diff -rq /tmp/old_output /tmp/new_output
 ```
 
+### 4. Generate equipment variant scenes (`buildVariantScenes`)
+
+Some FLA libraries pack multiple DESIGNS of the same piece of equipment as
+separate FRAMES of a handful of parallel clips, one clip per view — e.g.
+`HAT/HAT_FRONT`, `HAT/HAT_BACK`, `HAT/HAT_LEFT`, `HAT/HAT_RIGHT`: frame N of
+each clip is the SAME hat design, seen from a different angle.
+
+```
+node tools/build_variant_scenes.js debug_data.json <output_dir>
+```
+
+Scans the whole library for every `<folder>/<prefix>_<FRONT|BACK|LEFT|RIGHT>`
+group automatically (nothing to configure) and, for every frame N common to
+all of a group's parts, writes one combined scene
+`<output_dir>/variants/<prefix>/<N>.tscn` (Flash's 1-based frame numbering):
+one child group per orientation, plus an `AnimationPlayer` with one
+`visible`-toggling animation per orientation — gameplay picks the view with
+`AnimationPlayer.play("FRONT")`/`("BACK")`/`("LEFT")`/`("RIGHT")`. Reuses the
+exact same rendering pipeline as a normal export (shapes, gradients,
+shaders, masks), so the parts look identical to what `buildGodotScenes`
+would have produced for the same content.
+
+Independent of `pipeline_snapshot.js`/`buildGodotScenes` — safe to run
+against the same `debug_data.json`/output folder on its own.
+
 ## Known limitations
 
 - `nextId()` is made deterministic (a counter instead of `Math.random()`)

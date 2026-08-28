@@ -289,7 +289,22 @@ function _removeSelfIntersections(verts) {
                 if (Math.abs(den) > 0.0001) {
                     var ua = ((D.x - C.x)*(A.y - C.y) - (D.y - C.y)*(A.x - C.x)) / den;
                     var ub = ((B.x - A.x)*(A.y - C.y) - (B.y - A.y)*(A.x - C.x)) / den;
-                    if (ua > 0.01 && ua < 0.99 && ub > 0.01 && ub < 0.99) {
+                    // BUG: this used to require ua/ub in (0.01, 0.99),
+                    // excluding any crossing within 1% of either segment's
+                    // endpoint from being "fixable" -- but _hasSelfIntersection
+                    // (both the initial check above and the post-repair
+                    // verification in _cleanupPolygonVertices) uses a
+                    // STRICT, zero-tolerance crossing test (_segCross:
+                    // d1*d2<0 && d3*d4<0, no threshold at all). A near-
+                    // endpoint crossing landed in the gap between these two
+                    // thresholds: flagged as a real problem, but never
+                    // eligible for this repair -- Godot's earcut then fails
+                    // to triangulate it (invisible/malformed Polygon2D).
+                    // Narrowed to match _hasSelfIntersection's strictness
+                    // (still excluding the true endpoints themselves, where
+                    // the crossing IS the shared vertex -- not a real
+                    // problem, and "fixing" it would be meaningless).
+                    if (ua > 0.0001 && ua < 0.9999 && ub > 0.0001 && ub < 0.9999) {
                         // Instead of removing part of the shape (which causes holes),
                         // "un-twist" it by reversing the vertex order within the loop.
                         // This turns a crossed figure-8 into a simple polygon by
@@ -475,7 +490,25 @@ function _cleanupPolygonVertices(effectiveVerts) {
     }
 
     if (finalVerts.length > 3 && finalVerts.length <= 500 && _hasSelfIntersection(finalVerts)) {
-        finalVerts = _removeSelfIntersections(finalVerts);
+        var repaired = _removeSelfIntersections(finalVerts);
+        // _removeSelfIntersections never verifies its OWN result: its
+        // "un-twist by reversing" loop is bounded to 10 internal
+        // iterations, which isn't always enough on a complex multi-crossing
+        // contour (e.g. one edge crossing two others near a cusp) -- it can
+        // return with a residual crossing still in place (invisible
+        // Polygon2D in Godot: earcut fails on self-intersections). Give it
+        // a few more full passes; each call is a fresh attempt from where
+        // the last one left off, and a run that makes no further progress
+        // returns its input UNCHANGED (safe to detect via reference
+        // equality) so this loop can't spin uselessly.
+        var repairAttempts = 0;
+        while (repairAttempts < 4 && _hasSelfIntersection(repaired)) {
+            var next = _removeSelfIntersections(repaired);
+            repairAttempts++;
+            if (next === repaired) break;
+            repaired = next;
+        }
+        finalVerts = repaired;
     }
 
     return finalVerts;
@@ -1345,60 +1378,92 @@ function _markBakeableShapes(root, anim) {
 // ONLY merges nodes already marked _mergeSafe (so guaranteed not targeted
 // by any AnimationPlayer track) and without their own material, so as to
 // never break an animation or a node-specific shader.
+// Shared by _mergeSameColorSiblings and _mergeSameColorAcrossTree: parsing
+// of already-serialized .tscn property strings back into plain numbers/
+// points, and the eligibility test for a Polygon2D to be merge-safe at all.
+function _parsePackedVec2(str) {
+    if (!str) return [];
+    var m = str.match(/PackedVector2Array\(([^)]*)\)/);
+    if (!m || m[1].length === 0) return [];
+    var nums = m[1].split(",");
+    var pts = [];
+    for (var i = 0; i + 1 < nums.length; i += 2) {
+        pts.push({ x: parseFloat(nums[i]), y: parseFloat(nums[i + 1]) });
+    }
+    return pts;
+}
+function _parsePolygonsIndexGroups(str) {
+    if (!str) return null;
+    var groups = [];
+    var re = /PackedInt32Array\(([^)]*)\)/g;
+    var m;
+    while ((m = re.exec(str)) !== null) {
+        var idxStr = m[1];
+        var idxs = [];
+        if (idxStr.length > 0) {
+            var parts = idxStr.split(",");
+            for (var i = 0; i < parts.length; i++) idxs.push(parseInt(parts[i], 10));
+        }
+        groups.push(idxs);
+    }
+    return groups;
+}
+function _num(str, def) {
+    if (str === undefined) return def;
+    var v = parseFloat(str);
+    return isNaN(v) ? def : v;
+}
+function _parseVec2Prop(str, defX, defY) {
+    if (!str) return { x: defX, y: defY };
+    var m = str.match(/Vector2\(([^,]+),\s*([^)]+)\)/);
+    if (!m) return { x: defX, y: defY };
+    return { x: parseFloat(m[1]), y: parseFloat(m[2]) };
+}
+function _isMergeCandidate(n) {
+    return n.type === "Polygon2D"
+        && n._mergeSafe === true
+        && !!n.properties["texture"]
+        && !!n.properties["polygon"]
+        && n.properties["visible"] !== false
+        && !n.properties["material"]
+        // A Polygon2D "wrapper" (v4.7) can itself host Poly_1/Line_0
+        // children (other color groups of the same shape): never
+        // merge it, that would destroy those children without
+        // transferring them.
+        && n.children.length === 0;
+}
+
+// 2D affine helpers (a,b,c,d,tx,ty), consistent with the position/rotation/
+// scale/skew -> matrix reconstruction already used above (and with
+// _composeMatrix's M2*M1 = "M1 applied first, then M2" convention).
+function _affineFromNode(node) {
+    var pos = _parseVec2Prop(node.properties["position"], 0, 0);
+    var scale = _parseVec2Prop(node.properties["scale"], 1, 1);
+    var rot = _num(node.properties["rotation"], 0);
+    var skew = _num(node.properties["skew"], 0);
+    var cosR = Math.cos(rot), sinR = Math.sin(rot);
+    var cosRS = Math.cos(rot + skew), sinRS = Math.sin(rot + skew);
+    return {
+        a: cosR * scale.x, b: sinR * scale.x,
+        c: -sinRS * scale.y, d: cosRS * scale.y,
+        tx: pos.x, ty: pos.y
+    };
+}
+function _affineApplyPoint(M, x, y) {
+    return { x: M.a * x + M.c * y + M.tx, y: M.b * x + M.d * y + M.ty };
+}
+function _affineInvert(M) {
+    var det = M.a * M.d - M.b * M.c;
+    if (Math.abs(det) < 1e-9) return null; // degenerate (zero scale) -- caller must skip
+    var ia = M.d / det, ib = -M.b / det, ic = -M.c / det, id = M.a / det;
+    return {
+        a: ia, b: ib, c: ic, d: id,
+        tx: -(ia * M.tx + ic * M.ty),
+        ty: -(ib * M.tx + id * M.ty)
+    };
+}
+
 function _mergeSameColorSiblings(root) {
-    function _parsePackedVec2(str) {
-        if (!str) return [];
-        var m = str.match(/PackedVector2Array\(([^)]*)\)/);
-        if (!m || m[1].length === 0) return [];
-        var nums = m[1].split(",");
-        var pts = [];
-        for (var i = 0; i + 1 < nums.length; i += 2) {
-            pts.push({ x: parseFloat(nums[i]), y: parseFloat(nums[i + 1]) });
-        }
-        return pts;
-    }
-    function _parsePolygonsIndexGroups(str) {
-        if (!str) return null;
-        var groups = [];
-        var re = /PackedInt32Array\(([^)]*)\)/g;
-        var m;
-        while ((m = re.exec(str)) !== null) {
-            var idxStr = m[1];
-            var idxs = [];
-            if (idxStr.length > 0) {
-                var parts = idxStr.split(",");
-                for (var i = 0; i < parts.length; i++) idxs.push(parseInt(parts[i], 10));
-            }
-            groups.push(idxs);
-        }
-        return groups;
-    }
-    function _num(str, def) {
-        if (str === undefined) return def;
-        var v = parseFloat(str);
-        return isNaN(v) ? def : v;
-    }
-    function _parseVec2Prop(str, defX, defY) {
-        if (!str) return { x: defX, y: defY };
-        var m = str.match(/Vector2\(([^,]+),\s*([^)]+)\)/);
-        if (!m) return { x: defX, y: defY };
-        return { x: parseFloat(m[1]), y: parseFloat(m[2]) };
-    }
-
-    function isMergeCandidate(n) {
-        return n.type === "Polygon2D"
-            && n._mergeSafe === true
-            && !!n.properties["texture"]
-            && !!n.properties["polygon"]
-            && n.properties["visible"] !== false
-            && !n.properties["material"]
-            // A Polygon2D "wrapper" (v4.7) can itself host Poly_1/Line_0
-            // children (other color groups of the same shape): never
-            // merge it, that would destroy those children without
-            // transferring them.
-            && n.children.length === 0;
-    }
-
     function mergeRun(parent, startIdx, endIdxExclusive) {
         var kids = parent.children.slice(startIdx, endIdxExclusive);
         var pointsParts = [];
@@ -1408,15 +1473,7 @@ function _mergeSameColorSiblings(root) {
 
         for (var k = 0; k < kids.length; k++) {
             var kid = kids[k];
-            var pos = _parseVec2Prop(kid.properties["position"], 0, 0);
-            var scale = _parseVec2Prop(kid.properties["scale"], 1, 1);
-            var rot = _num(kid.properties["rotation"], 0);
-            var skew = _num(kid.properties["skew"], 0);
-
-            var cosR = Math.cos(rot), sinR = Math.sin(rot);
-            var cosRS = Math.cos(rot + skew), sinRS = Math.sin(rot + skew);
-            var a = cosR * scale.x, b = sinR * scale.x;
-            var c = -sinRS * scale.y, d = cosRS * scale.y;
+            var M = _affineFromNode(kid);
 
             var localPts = _parsePackedVec2(kid.properties["polygon"]);
             var localUv = _parsePackedVec2(kid.properties["uv"]);
@@ -1428,10 +1485,8 @@ function _mergeSameColorSiblings(root) {
             }
 
             for (var vi = 0; vi < localPts.length; vi++) {
-                var px = localPts[vi].x, py = localPts[vi].y;
-                var wx = a * px + c * py + pos.x;
-                var wy = b * px + d * py + pos.y;
-                pointsParts.push(_f(wx) + ", " + _f(wy));
+                var wp = _affineApplyPoint(M, localPts[vi].x, localPts[vi].y);
+                pointsParts.push(_f(wp.x) + ", " + _f(wp.y));
                 var uv = localUv[vi] || { x: 0, y: 0 };
                 uvParts.push(_f(uv.x) + ", " + _f(uv.y));
             }
@@ -1463,10 +1518,10 @@ function _mergeSameColorSiblings(root) {
         var i = 0;
         while (i < node.children.length) {
             var child = node.children[i];
-            if (isMergeCandidate(child)) {
+            if (_isMergeCandidate(child)) {
                 var j = i + 1;
                 while (j < node.children.length
-                       && isMergeCandidate(node.children[j])
+                       && _isMergeCandidate(node.children[j])
                        && node.children[j].properties["texture"] === child.properties["texture"]) {
                     j++;
                 }
@@ -1484,6 +1539,227 @@ function _mergeSameColorSiblings(root) {
     }
 
     processContainer(root);
+}
+
+// Generalizes _mergeSameColorSiblings across the WHOLE tree: candidates no
+// longer need to be direct siblings, nor immediately consecutive under
+// their parent. A run of same-texture _isMergeCandidate Polygon2D is
+// merged as long as NOTHING else actually painted between them (in Godot's
+// real paint order -- a preorder walk, since this pipeline never writes
+// z_index) visually overlaps their combined bounding box: reordering two
+// shapes that never touch anything drawn between them cannot change what
+// ends up on top of what.
+// Conservative by construction: a node whose bounds this function can't
+// compute (Sprite2D, PackedScene, ColorRect...) is treated as an opaque,
+// ALWAYS-blocking obstacle, and merging never crosses a CanvasGroup
+// boundary (that changes compositing semantics for its whole subtree).
+// Missing a possible merge is an acceptable cost; wrongly reordering
+// visible content is not.
+// Run AFTER _mergeSameColorSiblings (the strictly-safer same-parent pass)
+// so it only has to pick up whatever that pass couldn't reach. Reuses its
+// exact vertex/uv/texture composition, generalized to convert each
+// candidate's LOCAL polygon into the destination parent's local space via
+// full world-matrix composition + inversion instead of a single shared
+// parent's space.
+function _mergeSameColorAcrossTree(root) {
+    var paintList = [];
+
+    function localAABB(node) {
+        if (node.type === "Polygon2D" && node.properties["polygon"]) {
+            var pts = _parsePackedVec2(node.properties["polygon"]);
+            if (pts.length === 0) return null;
+            var minX = pts[0].x, maxX = pts[0].x, minY = pts[0].y, maxY = pts[0].y;
+            for (var i = 1; i < pts.length; i++) {
+                if (pts[i].x < minX) minX = pts[i].x;
+                if (pts[i].x > maxX) maxX = pts[i].x;
+                if (pts[i].y < minY) minY = pts[i].y;
+                if (pts[i].y > maxY) maxY = pts[i].y;
+            }
+            return { minX: minX, maxX: maxX, minY: minY, maxY: maxY };
+        }
+        if (node.type === "Line2D" && node.properties["points"]) {
+            var lp = _parsePackedVec2(node.properties["points"]);
+            if (lp.length === 0) return null;
+            var w = _num(node.properties["width"], 1) * 0.5 + 0.01;
+            var minX2 = lp[0].x - w, maxX2 = lp[0].x + w, minY2 = lp[0].y - w, maxY2 = lp[0].y + w;
+            for (var j = 1; j < lp.length; j++) {
+                if (lp[j].x - w < minX2) minX2 = lp[j].x - w;
+                if (lp[j].x + w > maxX2) maxX2 = lp[j].x + w;
+                if (lp[j].y - w < minY2) minY2 = lp[j].y - w;
+                if (lp[j].y + w > maxY2) maxY2 = lp[j].y + w;
+            }
+            return { minX: minX2, maxX: maxX2, minY: minY2, maxY: maxY2 };
+        }
+        return null; // unknown geometry -- caller treats as always-blocking
+    }
+
+    function worldAABB(local, M) {
+        if (!local) return null;
+        var c1 = _affineApplyPoint(M, local.minX, local.minY);
+        var c2 = _affineApplyPoint(M, local.maxX, local.minY);
+        var c3 = _affineApplyPoint(M, local.maxX, local.maxY);
+        var c4 = _affineApplyPoint(M, local.minX, local.maxY);
+        return {
+            minX: Math.min(c1.x, c2.x, c3.x, c4.x), maxX: Math.max(c1.x, c2.x, c3.x, c4.x),
+            minY: Math.min(c1.y, c2.y, c3.y, c4.y), maxY: Math.max(c1.y, c2.y, c3.y, c4.y)
+        };
+    }
+
+    function walk(node, parentWorld, canvasGroupAncestor) {
+        var worldM = _composeMatrix(parentWorld, _affineFromNode(node));
+        var myCanvasGroupAncestor = (node.type === "CanvasGroup") ? node : canvasGroupAncestor;
+
+        // Purely structural nodes draw nothing themselves and never affect
+        // paint order -- skip entirely rather than recording them as an
+        // (unknown-geometry, always-blocking) obstacle.
+        var isStructural = (node === root) || node.type === "Node2D" || node.type === "CanvasGroup"
+            || node.type === "AnimationPlayer" || node.type === "VisibleOnScreenEnabler2D";
+        if (!isStructural) {
+            paintList.push({
+                node: node,
+                parent: node.parent,
+                worldMatrix: worldM,
+                parentWorldMatrix: parentWorld,
+                aabb: worldAABB(localAABB(node), worldM),
+                canvasGroupAncestor: canvasGroupAncestor,
+                texture: node.properties ? node.properties["texture"] : undefined,
+                mergeable: _isMergeCandidate(node)
+            });
+        }
+        for (var i = 0; i < node.children.length; i++) {
+            walk(node.children[i], worldM, myCanvasGroupAncestor);
+        }
+    }
+    walk(root, { a: 1, b: 0, c: 0, d: 1, tx: 0, ty: 0 }, null);
+
+    function aabbOverlap(a, b) {
+        if (!a || !b) return true; // unknown bounds -> assume overlap (safe)
+        var pad = 0.01;
+        return !(a.maxX + pad < b.minX - pad || b.maxX + pad < a.minX - pad
+               || a.maxY + pad < b.minY - pad || b.maxY + pad < a.minY - pad);
+    }
+    function aabbUnion(a, b) {
+        return { minX: Math.min(a.minX, b.minX), maxX: Math.max(a.maxX, b.maxX),
+                 minY: Math.min(a.minY, b.minY), maxY: Math.max(a.maxY, b.maxY) };
+    }
+    function nodeInRun(run, n) {
+        for (var q = 0; q < run.length; q++) if (paintList[run[q]].node === n) return true;
+        return false;
+    }
+
+    function buildMergedRun(run) {
+        var destEntry = paintList[run[0]];
+        var destParent = destEntry.parent;
+        var invDestParentWorld = _affineInvert(destEntry.parentWorldMatrix);
+        if (!invDestParentWorld) return; // degenerate parent transform (extremely rare) -- skip, safe no-op
+
+        var pointsParts = [];
+        var uvParts = [];
+        var polygonsParts = [];
+        var vertexOffset = 0;
+
+        for (var k = 0; k < run.length; k++) {
+            var entry = paintList[run[k]];
+            var kid = entry.node;
+            var toDestLocal = _composeMatrix(invDestParentWorld, entry.worldMatrix);
+
+            var localPts = _parsePackedVec2(kid.properties["polygon"]);
+            var localUv = _parsePackedVec2(kid.properties["uv"]);
+            var idxGroups = _parsePolygonsIndexGroups(kid.properties["polygons"]);
+            if (!idxGroups || idxGroups.length === 0) {
+                var allIdx = [];
+                for (var vi = 0; vi < localPts.length; vi++) allIdx.push(vi);
+                idxGroups = [allIdx];
+            }
+            for (var vi2 = 0; vi2 < localPts.length; vi2++) {
+                var wp = _affineApplyPoint(toDestLocal, localPts[vi2].x, localPts[vi2].y);
+                pointsParts.push(_f(wp.x) + ", " + _f(wp.y));
+                var uv = localUv[vi2] || { x: 0, y: 0 };
+                uvParts.push(_f(uv.x) + ", " + _f(uv.y));
+            }
+            for (var g = 0; g < idxGroups.length; g++) {
+                var shifted = [];
+                for (var ii = 0; ii < idxGroups[g].length; ii++) shifted.push(idxGroups[g][ii] + vertexOffset);
+                polygonsParts.push("PackedInt32Array(" + shifted.join(", ") + ")");
+            }
+            vertexOffset += localPts.length;
+        }
+
+        var first = destEntry.node;
+        var merged = new GNode(first.name, "Polygon2D");
+        merged.properties["polygon"] = "PackedVector2Array(" + pointsParts.join(", ") + ")";
+        merged.properties["uv"] = "PackedVector2Array(" + uvParts.join(", ") + ")";
+        if (polygonsParts.length > 1) merged.properties["polygons"] = "[" + polygonsParts.join(", ") + "]";
+        merged.properties["texture"] = first.properties["texture"];
+        merged.properties["color"] = first.properties["color"] || "Color(1, 1, 1, 1)";
+        merged.properties["visible"] = true;
+        var ownerRef = first.owner;
+
+        // Keep the merged node at run[0]'s relative position among
+        // destParent's OTHER, untouched children: find the first sibling
+        // after it that isn't itself part of this run.
+        var siblingAfter = null;
+        var idxInDest = destParent.children.indexOf(first);
+        if (idxInDest !== -1) {
+            for (var si = idxInDest + 1; si < destParent.children.length; si++) {
+                if (!nodeInRun(run, destParent.children[si])) { siblingAfter = destParent.children[si]; break; }
+            }
+        }
+
+        for (var k2 = 0; k2 < run.length; k2++) {
+            var e2 = paintList[run[k2]];
+            e2.parent.removeChild(e2.node);
+        }
+
+        var insertAt = siblingAfter ? destParent.children.indexOf(siblingAfter) : -1;
+        if (insertAt === -1) insertAt = destParent.children.length;
+        destParent.children.splice(insertAt, 0, merged);
+        merged.parent = destParent;
+        destParent._childByName["$" + merged.name] = merged;
+        merged.owner = ownerRef;
+    }
+
+    // Group candidate paintList indices by texture (preserving paint
+    // order); CanvasGroup-boundary and overlap checks happen inline below.
+    var byTexture = {};
+    var order = [];
+    for (var idx = 0; idx < paintList.length; idx++) {
+        var e = paintList[idx];
+        if (!e.mergeable) continue;
+        var key = "$" + e.texture;
+        if (!byTexture[key]) { byTexture[key] = []; order.push(key); }
+        byTexture[key].push(idx);
+    }
+
+    for (var oi = 0; oi < order.length; oi++) {
+        var indices = byTexture[order[oi]];
+        var i2 = 0;
+        while (i2 < indices.length) {
+            var run = [indices[i2]];
+            var runBBox = paintList[indices[i2]].aabb;
+            var j2 = i2 + 1;
+            while (j2 < indices.length) {
+                var candIdx = indices[j2];
+                var cand = paintList[candIdx];
+                var last = paintList[run[run.length - 1]];
+                var blocked = (cand.canvasGroupAncestor !== last.canvasGroupAncestor)
+                    || (runBBox === null) || (cand.aabb === null);
+                if (!blocked) {
+                    for (var p = run[run.length - 1] + 1; p < candIdx; p++) {
+                        if (aabbOverlap(paintList[p].aabb, runBBox) || aabbOverlap(paintList[p].aabb, cand.aabb)) {
+                            blocked = true; break;
+                        }
+                    }
+                }
+                if (blocked) break;
+                run.push(candIdx);
+                runBBox = aabbUnion(runBBox, cand.aabb);
+                j2++;
+            }
+            if (run.length > 1) buildMergedRun(run);
+            i2 = (j2 > i2 + 1) ? j2 : i2 + 1;
+        }
+    }
 }
 
 GAnimation.prototype.addTrackKey = function(path, typeStr, time, value, transition) {
@@ -2070,6 +2346,26 @@ function _setupMaterials(node, isRoot) {
 // anim._trackIndex). Identical block in both original cases, factored out
 // here.
 function _demoteLine2DToNode2D(node, variantPathStr, anim) {
+    // BUG (found via buildVariantScenes -- a real Flash animation almost
+    // never hits it, but a variant "keyframe" jumping between unrelated
+    // designs does): this function used to only rewrite the ANIMATION
+    // TRACK paths below to "<path>/Line_0:...", assuming a Line_0 child
+    // would get created by _processElementNode's own stroke loop later in
+    // THIS SAME keyframe. That's only true if this keyframe ALSO has its
+    // own stroke (elem.strokes.length > 0) to draw -- if it gained a fill
+    // but lost its stroke in the very same transition, the stroke loop
+    // never runs, Line_0 never gets created, and the rewritten tracks
+    // dangle (Godot: "couldn't resolve track"). Create the real Line_0
+    // child up front instead, carrying over whatever static state `node`
+    // already had as a bare Line2D -- exactly the properties cleared below.
+    var line0 = new GNode("Line_0", "Line2D");
+    var carriedProps = ["joint_mode", "begin_cap_mode", "end_cap_mode", "use_parent_material", "points", "width", "default_color"];
+    for (var c = 0; c < carriedProps.length; c++) {
+        if (node.properties[carriedProps[c]] !== undefined) line0.properties[carriedProps[c]] = node.properties[carriedProps[c]];
+    }
+    node.addChild(line0);
+    line0.owner = node.owner;
+
     node.type = "Node2D";
     delete node.properties["joint_mode"];
     delete node.properties["begin_cap_mode"];
@@ -2912,7 +3208,13 @@ function _reorderShapePolysAndLines(node, isTopLevel) {
     }
 }
 
-function buildSceneForSymbol(sym, frameRate, exportDir, boundsLookup, boundsIndex, symbolMap, symbolContainsShader, skipEnablerFor) {
+// Builds the GNode tree + resource lists for one symbol, WITHOUT writing
+// anything to disk. Split out of buildSceneForSymbol so the same rendering
+// pipeline (shapes, gradients, shaders, masks, materials, reordering...)
+// can be reused to build a subtree that gets embedded into a larger,
+// hand-assembled scene (see buildVariantScenes) instead of always being
+// serialized as its own standalone .tscn file.
+function _buildSceneTree(sym, frameRate, exportDir, boundsLookup, boundsIndex, symbolMap, symbolContainsShader, skipEnablerFor) {
     if (!sym.safeName) sym.safeName = sanitizeForLookup(sym.name);
     var extResources = [];
     var extIdMap = {};
@@ -3498,6 +3800,25 @@ function buildSceneForSymbol(sym, frameRate, exportDir, boundsLookup, boundsInde
     // ----------------------------------------------------------------
     _reorderShapePolysAndLines(root, true);
 
+    // Runs LAST (after every other step that reshapes the tree) so its
+    // paint-order analysis reflects the truly final structure -- see
+    // _mergeSameColorAcrossTree's own header comment for the safety
+    // reasoning (never crosses anything that visually overlaps).
+    _mergeSameColorAcrossTree(root);
+
+    return { root: root, extResources: extResources, subResources: subResources, actionScripts: actionScripts };
+}
+
+// Thin wrapper around _buildSceneTree: builds the tree then serializes it
+// to its own standalone .tscn (+ .gd if it has ActionScript) under
+// exportDir, exactly as before this function was split.
+function buildSceneForSymbol(sym, frameRate, exportDir, boundsLookup, boundsIndex, symbolMap, symbolContainsShader, skipEnablerFor) {
+    var built = _buildSceneTree(sym, frameRate, exportDir, boundsLookup, boundsIndex, symbolMap, symbolContainsShader, skipEnablerFor);
+    var root = built.root;
+    var extResources = built.extResources;
+    var subResources = built.subResources;
+    var actionScripts = built.actionScripts;
+
     var tscnText = serializeTscn(root, extResources, subResources);
     var scenePath;
     var gdPath;
@@ -3692,89 +4013,32 @@ function generateAnimTracksStr(animObj) {
     return L.join("\n");
 }
 
-// =============================================================================
-//  Top-level export entry point
-// =============================================================================
-function buildGodotScenes(doc, data, exportDir) {
-    var uri = exportDir;
-    if (uri.charAt(uri.length - 1) === "/") uri = uri.substring(0, uri.length - 1);
-    var originalUri = uri;
-    var godotProjectRoot = originalUri;
-    RES_PREFIX = "res://";
-    while (uri.indexOf("/") !== -1) {
-        if (FLfile.exists(uri + "/project.godot")) {
-            godotProjectRoot = uri;
-            var rel = originalUri.substring(uri.length);
-            if (rel.charAt(0) === "/") rel = rel.substring(1);
-            if (rel.length > 0 && rel.charAt(rel.length - 1) !== "/") rel += "/";
-            RES_PREFIX = "res://" + rel;
-            break;
-        }
-        var lastSlash = uri.lastIndexOf("/");
-        if (lastSlash === -1) break;
-        uri = uri.substring(0, lastSlash);
-    }
-
-    var boundsLookup = {};
-    var allFiles = FLfile.listFolder(exportDir + "img/", "files") || [];
-    var pngList = [];
-    for (var i = 0; i < allFiles.length; i++) {
-        var fnLower = allFiles[i].toLowerCase();
-        if (fnLower.indexOf(".png") !== -1 && fnLower.indexOf(".import") === -1) {
-            pngList.push(allFiles[i]);
-        }
-    }
-    for (var i = 0; i < pngList.length; i++) {
-        var fn = pngList[i];
-        var noExt = fn.replace(/.png$/i, "");
-        boundsLookup[noExt] = fn;
-    }
-    // Pre-build prefix index: group keys by their baseNoSpace prefix
-    // (everything before _SHAPE_, _BOUNDS_, or _OFFSET_) for O(1) lookup.
-    // Keys prefixed with "$": a symbol/layer whose sanitized name would
-    // literally compose "constructor"/"toString"/etc. would otherwise give
-    // a false result via Object's inherited properties.
-    var boundsIndex = {};
-    for (var fn in boundsLookup) {
-        var sp = fn.indexOf("_SHAPE_");
-        var bp = fn.indexOf("_BOUNDS_");
-        var op = fn.indexOf("_OFFSET_");
-        var base = (sp !== -1) ? fn.substring(0, sp) :
-                   (bp !== -1) ? fn.substring(0, bp) :
-                   (op !== -1) ? fn.substring(0, op) : fn;
-        var bKey = "$" + base;
-        if (!boundsIndex[bKey]) boundsIndex[bKey] = [];
-        boundsIndex[bKey].push(fn);
-    }
-    fl.trace("DEBUG godotBuilder_v4: pngList length = " + (pngList ? pngList.length : "null")
-        + ", boundsLookup count = " + pngList.length + " from path: " + exportDir + "img/*.png");
-
-    FLfile.createFolder(exportDir + "symbols/");
-    FLfile.createFolder(exportDir + "shaders/");
-    FLfile.write(exportDir + "shaders/flash_color_normal.gdshader", SHADER_NORMAL);
-    FLfile.write(exportDir + "shaders/flash_color_add.gdshader",    SHADER_ADD);
-    FLfile.write(exportDir + "shaders/flash_color_mul.gdshader",    SHADER_MUL);
-
+function _buildSymbolMap(symbols) {
     var symbolMap = {};
-    for (var i = 0; i < data.library.symbols.length; i++) {
-        symbolMap[data.library.symbols[i].name] = data.library.symbols[i];
+    for (var i = 0; i < symbols.length; i++) {
+        symbolMap[symbols[i].name] = symbols[i];
     }
+    return symbolMap;
+}
 
-    // Propagation of "this symbol needs a shader" (non-trivial color/blend,
-    // or it instances a symbol that itself needs one). This is a MONOTONE
-    // fixed point (a symbol marks the rest forever): the final result is
-    // unique regardless of the order/strategy used for propagation.
-    // Instead of re-scanning the WHOLE library on every iteration until
-    // stabilization (expensive on nested symbol hierarchies), we compute in
-    // a single pass (a) each symbol's direct need and (b) the reverse graph
-    // "which symbols instance this symbol", then propagate via worklist.
-    // Mathematically identical result, O(elements + symbols) complexity
-    // instead of O(passes * elements).
+// Propagation of "this symbol needs a shader" (non-trivial color/blend, or
+// it instances a symbol that itself needs one). This is a MONOTONE fixed
+// point (a symbol marks the rest forever): the final result is unique
+// regardless of the order/strategy used for propagation. Instead of
+// re-scanning the WHOLE library on every iteration until stabilization
+// (expensive on nested symbol hierarchies), we compute in a single pass
+// (a) each symbol's direct need and (b) the reverse graph "which symbols
+// instance this symbol", then propagate via worklist. Mathematically
+// identical result, O(elements + symbols) complexity instead of
+// O(passes * elements).
+// Also returns `referencedBy` (the reverse-instancing graph), reused by
+// buildGodotScenes for the v4.15 `skipEnablerFor` computation.
+function _computeShaderNeedsAndReferences(symbols) {
     var symbolContainsShader = {};
     var directHasShader = {};
     var referencedBy = {};
-    for (var i = 0; i < data.library.symbols.length; i++) {
-        var sym = data.library.symbols[i];
+    for (var i = 0; i < symbols.length; i++) {
+        var sym = symbols[i];
         var hasShader = false;
         var usedChildren = {};
         if (sym.layers) {
@@ -3805,8 +4069,8 @@ function buildGodotScenes(doc, data, exportDir) {
     }
 
     var shaderWorklist = [];
-    for (var i = 0; i < data.library.symbols.length; i++) {
-        var symName = data.library.symbols[i].name;
+    for (var i = 0; i < symbols.length; i++) {
+        var symName = symbols[i].name;
         if (directHasShader[symName]) {
             symbolContainsShader[symName] = true;
             shaderWorklist.push(symName);
@@ -3824,6 +4088,95 @@ function buildGodotScenes(doc, data, exportDir) {
             }
         }
     }
+
+    return { symbolContainsShader: symbolContainsShader, referencedBy: referencedBy };
+}
+
+// Walks UP from exportDir looking for a project.godot to determine the
+// real RES_PREFIX (exportDir may be a subfolder of the actual Godot
+// project root). Sets the module-level RES_PREFIX global (read by
+// _processElementNode and friends when emitting ext_resource paths) and
+// returns the detected project root (defaults to exportDir itself, with
+// RES_PREFIX "res://", when no project.godot is found above it).
+function _computeGodotProjectRoot(exportDir) {
+    var uri = exportDir;
+    if (uri.charAt(uri.length - 1) === "/") uri = uri.substring(0, uri.length - 1);
+    var originalUri = uri;
+    var godotProjectRoot = originalUri;
+    RES_PREFIX = "res://";
+    while (uri.indexOf("/") !== -1) {
+        if (FLfile.exists(uri + "/project.godot")) {
+            godotProjectRoot = uri;
+            var rel = originalUri.substring(uri.length);
+            if (rel.charAt(0) === "/") rel = rel.substring(1);
+            if (rel.length > 0 && rel.charAt(rel.length - 1) !== "/") rel += "/";
+            RES_PREFIX = "res://" + rel;
+            break;
+        }
+        var lastSlash = uri.lastIndexOf("/");
+        if (lastSlash === -1) break;
+        uri = uri.substring(0, lastSlash);
+    }
+    return godotProjectRoot;
+}
+
+// Indexes exportDir/img/*.png (external bitmaps pre-rendered by a previous
+// step) by their base filename, plus a "$"-prefixed prefix index (grouping
+// keys sharing everything before _SHAPE_/_BOUNDS_/_OFFSET_) for the O(1)
+// lookups _processElementNode does when resolving a shape's custom texture.
+function _computeBoundsIndex(exportDir) {
+    var boundsLookup = {};
+    var allFiles = FLfile.listFolder(exportDir + "img/", "files") || [];
+    var pngList = [];
+    for (var i = 0; i < allFiles.length; i++) {
+        var fnLower = allFiles[i].toLowerCase();
+        if (fnLower.indexOf(".png") !== -1 && fnLower.indexOf(".import") === -1) {
+            pngList.push(allFiles[i]);
+        }
+    }
+    for (var i = 0; i < pngList.length; i++) {
+        var fn = pngList[i];
+        var noExt = fn.replace(/.png$/i, "");
+        boundsLookup[noExt] = fn;
+    }
+    var boundsIndex = {};
+    for (var fn in boundsLookup) {
+        var sp = fn.indexOf("_SHAPE_");
+        var bp = fn.indexOf("_BOUNDS_");
+        var op = fn.indexOf("_OFFSET_");
+        var base = (sp !== -1) ? fn.substring(0, sp) :
+                   (bp !== -1) ? fn.substring(0, bp) :
+                   (op !== -1) ? fn.substring(0, op) : fn;
+        var bKey = "$" + base;
+        if (!boundsIndex[bKey]) boundsIndex[bKey] = [];
+        boundsIndex[bKey].push(fn);
+    }
+    if (typeof fl !== "undefined") fl.trace("DEBUG godotBuilder_v4: pngList length = " + pngList.length
+        + ", boundsLookup count = " + pngList.length + " from path: " + exportDir + "img/*.png");
+    return { boundsLookup: boundsLookup, boundsIndex: boundsIndex };
+}
+
+// =============================================================================
+//  Top-level export entry point
+// =============================================================================
+function buildGodotScenes(doc, data, exportDir) {
+    var godotProjectRoot = _computeGodotProjectRoot(exportDir);
+
+    var _bounds = _computeBoundsIndex(exportDir);
+    var boundsLookup = _bounds.boundsLookup;
+    var boundsIndex = _bounds.boundsIndex;
+
+    FLfile.createFolder(exportDir + "symbols/");
+    FLfile.createFolder(exportDir + "shaders/");
+    FLfile.write(exportDir + "shaders/flash_color_normal.gdshader", SHADER_NORMAL);
+    FLfile.write(exportDir + "shaders/flash_color_add.gdshader",    SHADER_ADD);
+    FLfile.write(exportDir + "shaders/flash_color_mul.gdshader",    SHADER_MUL);
+
+    var symbolMap = _buildSymbolMap(data.library.symbols);
+
+    var _shaderNeeds = _computeShaderNeedsAndReferences(data.library.symbols);
+    var symbolContainsShader = _shaderNeeds.symbolContainsShader;
+    var referencedBy = _shaderNeeds.referencedBy;
 
     // v4.15: a symbol that is NEVER placed directly by the main scene, and
     // is ALWAYS instanced as a child of at least one other symbol, doesn't
@@ -3938,6 +4291,405 @@ function buildGodotScenes(doc, data, exportDir) {
         FLfile.createFolder(scriptDir);
     }
     FLfile.write(scriptDir + "/FlashMovieClip.gd", fmcContent);
+}
+
+// =============================================================================
+//  Equipment variant scenes ("frame swap" folders, e.g. HAT/, ITEM/)
+// =============================================================================
+//
+// Some FLA libraries pack multiple DESIGNS of the same piece of equipment
+// as separate FRAMES of a handful of parallel clips, one clip per view, e.g.
+// HAT/HAT_FRONT, HAT/HAT_BACK, HAT/HAT_LEFT, HAT/HAT_RIGHT: frame N of each
+// is the SAME hat design, seen from a different angle. buildVariantScenes
+// finds every such "<prefix>_<ORIENTATION>" group automatically and, for
+// every frame N common to all of a group's parts, generates ONE combined
+// scene "<N+1>.tscn" (Flash's 1-based frame numbering) containing:
+//   - one child group per orientation, built through the exact same
+//     rendering pipeline as any other symbol (_buildSceneTree: shapes,
+//     gradients, shaders, masks...);
+//   - an AnimationPlayer with one animation per orientation, each toggling
+//     `visible` so only that orientation's parts show at a time -- gameplay
+//     picks the view with AnimationPlayer.play("FRONT")/("BACK")/etc.
+// Independent of buildGodotScenes: safe to run against the same
+// debug_data.json/exportDir either before, after, or instead of a normal
+// export (see tools/build_variant_scenes.js for the Node.js entry point).
+var _VARIANT_ORIENTATIONS = ["FRONT", "BACK", "LEFT", "RIGHT", "PROFILE", "SIT"];
+
+// Finds every symbol name of the form "<folder>/<prefix>_<ORIENTATION>" and
+// groups them by "<folder>/<prefix>". A group needs at least 2 orientations
+// to be worth generating (a single clip has nothing to switch between).
+function _findVariantGroups(symbols) {
+    var groups = {};
+    var order = [];
+    for (var i = 0; i < symbols.length; i++) {
+        var name = symbols[i].name;
+        var slashIdx = name.lastIndexOf("/");
+        var folderPath = (slashIdx === -1) ? "" : name.substring(0, slashIdx);
+        var baseName = (slashIdx === -1) ? name : name.substring(slashIdx + 1);
+        for (var o = 0; o < _VARIANT_ORIENTATIONS.length; o++) {
+            var orient = _VARIANT_ORIENTATIONS[o];
+            var suffix = "_" + orient;
+            if (baseName.length <= suffix.length) continue;
+            if (baseName.substring(baseName.length - suffix.length) !== suffix) continue;
+            var prefix = baseName.substring(0, baseName.length - suffix.length);
+            var groupKey = folderPath + "/" + prefix;
+            if (!groups[groupKey]) {
+                groups[groupKey] = { prefix: prefix, parts: {} };
+                order.push(groupKey);
+            }
+            groups[groupKey].parts[orient] = symbols[i];
+            break;
+        }
+    }
+    var result = [];
+    for (var gi = 0; gi < order.length; gi++) {
+        var g = groups[order[gi]];
+        var count = 0;
+        for (var o in g.parts) count++;
+        if (count >= 2) result.push(g);
+    }
+    return result;
+}
+
+// How many frames a symbol covers, counting only its non-guide/non-folder
+// layers (a guide layer's duration is a drawing aid, not real content).
+function _symbolFrameCount(sym) {
+    var count = 0;
+    if (sym.layers) {
+        for (var l = 0; l < sym.layers.length; l++) {
+            var layer = sym.layers[l];
+            if (layer.layerType === "guide" || layer.layerType === "folder") continue;
+            if (!layer.keyframes) continue;
+            for (var k = 0; k < layer.keyframes.length; k++) {
+                var kf = layer.keyframes[k];
+                var extent = kf.startFrame + (kf.duration || 1);
+                if (extent > count) count = extent;
+            }
+        }
+    }
+    return count;
+}
+
+// A symbol is safe to INLINE (draw its content directly into whatever
+// instances it, instead of a PackedScene sub-scene reference) only if
+// there's nothing about it a flat list of composed elements could lose:
+// no animation across frames, no frame script, and no mask/masked layer
+// (mask clipping is handled by _buildSceneTree/_processElementNode's own
+// mask machinery, which a naive flatten-all-layers here would bypass).
+function _isInlineableStaticSymbol(sym) {
+    if (!sym || _symbolFrameCount(sym) > 1) return false;
+    if (!sym.layers) return true;
+    for (var l = 0; l < sym.layers.length; l++) {
+        var layer = sym.layers[l];
+        if (layer.layerType === "mask" || layer.layerType === "masked") return false;
+        if (!layer.keyframes) continue;
+        for (var k = 0; k < layer.keyframes.length; k++) {
+            var kf = layer.keyframes[k];
+            if (kf.actionScript && String(kf.actionScript).replace(/^\s+|\s+$/g, '') !== "") return false;
+        }
+    }
+    return true;
+}
+
+// Replaces any "instance" element pointing at an _isInlineableStaticSymbol
+// with that symbol's OWN elements directly (recursively -- a decoration can
+// itself instance another static decoration), composing the instance's
+// matrix/colorTransform/blendMode/visible into each inlined element exactly
+// like _preprocessTweens' auto-tween expansion does. An instanced symbol
+// that ISN'T inlineable (animated, scripted, or masked) is left as a normal
+// PackedScene instance.
+// `chain` (a name -> true set of symbols currently being expanded) guards
+// against a pathological/circular instance graph: revisiting a symbol
+// already on the chain leaves it as a real instance instead of recursing
+// forever.
+function _inlineStaticInstances(elements, symbolMap, chain) {
+    var out = [];
+    for (var e = 0; e < elements.length; e++) {
+        var elem = elements[e];
+        var innerSym = (elem.elementType === "instance" && elem.symbolName) ? symbolMap[elem.symbolName] : null;
+        if (!innerSym || chain[elem.symbolName] || !_isInlineableStaticSymbol(innerSym)) {
+            out.push(elem);
+            continue;
+        }
+
+        var innerElements = [];
+        if (innerSym.layers) {
+            for (var l = 0; l < innerSym.layers.length; l++) {
+                var layer = innerSym.layers[l];
+                if (layer.layerType === "guide" || layer.layerType === "folder") continue;
+                if (!layer.keyframes) continue;
+                for (var k = 0; k < layer.keyframes.length; k++) {
+                    var kf = layer.keyframes[k];
+                    if (!kf.elements) continue;
+                    for (var ke = 0; ke < kf.elements.length; ke++) innerElements.push(kf.elements[ke]);
+                }
+            }
+        }
+        chain[elem.symbolName] = true;
+        var expandedInner = _inlineStaticInstances(_flattenGroups(innerElements), symbolMap, chain);
+        delete chain[elem.symbolName];
+
+        for (var ei = 0; ei < expandedInner.length; ei++) {
+            var innerElem = _deepClone(expandedInner[ei]);
+
+            if (elem.matrix && innerElem.matrix) {
+                innerElem.matrix = _composeMatrix(elem.matrix, innerElem.matrix);
+            } else if (elem.matrix) {
+                innerElem.matrix = _deepClone(elem.matrix);
+            }
+            delete innerElem.scaleX; delete innerElem.scaleY;
+            delete innerElem.rotation;
+            delete innerElem.skewX;  delete innerElem.skewY;
+
+            if (elem.colorTransform) {
+                if (!innerElem.colorTransform) innerElem.colorTransform = {};
+                var ct2 = _extractColorTransform(elem.colorTransform);
+                var ct1 = _extractColorTransform(innerElem.colorTransform);
+                innerElem.colorTransform.colorRedPercent   = ct1.rP * ct2.rP * 100;
+                innerElem.colorTransform.colorRedAmount    = ct1.rA * ct2.rP + ct2.rA;
+                innerElem.colorTransform.colorGreenPercent = ct1.gP * ct2.gP * 100;
+                innerElem.colorTransform.colorGreenAmount  = ct1.gA * ct2.gP + ct2.gA;
+                innerElem.colorTransform.colorBluePercent  = ct1.bP * ct2.bP * 100;
+                innerElem.colorTransform.colorBlueAmount   = ct1.bA * ct2.bP + ct2.bA;
+                innerElem.colorTransform.colorAlphaPercent = ct1.aP * ct2.aP * 100;
+                innerElem.colorTransform.colorAlphaAmount  = ct1.aA * ct2.aP + ct2.aA;
+            }
+            if (elem.blendMode && elem.blendMode !== "normal") innerElem.blendMode = elem.blendMode;
+            if (elem.visible !== undefined && innerElem.visible === undefined) {
+                innerElem.visible = elem.visible;
+            } else if (elem.visible !== undefined && innerElem.visible !== undefined) {
+                innerElem.visible = elem.visible && innerElem.visible;
+            }
+            if (elem.name) innerElem.name = elem.name;
+
+            out.push(innerElem);
+        }
+    }
+    return out;
+}
+
+// Finds, in `sym`'s layers, the content-carrying (non-guide/non-folder)
+// keyframe covering `frameIdx` for the layer named `layerName` (or null if
+// that symbol has no such layer, or nothing there at that frame).
+function _findCoveringKeyframe(sym, layerName, frameIdx) {
+    if (!sym.layers) return null;
+    for (var l = 0; l < sym.layers.length; l++) {
+        var layer = sym.layers[l];
+        if (layer.name !== layerName || layer.layerType === "guide" || layer.layerType === "folder") continue;
+        if (!layer.keyframes) return null;
+        for (var k = 0; k < layer.keyframes.length; k++) {
+            var kf = layer.keyframes[k];
+            var dur = kf.duration || 1;
+            if (frameIdx >= kf.startFrame && frameIdx < kf.startFrame + dur) return kf;
+        }
+        return null;
+    }
+    return null;
+}
+
+// Builds a SYNTHETIC symbol combining all of a variant group's orientations
+// (FRONT/BACK/LEFT/RIGHT/...) as consecutive KEYFRAMES of ONE frameIdx,
+// rather than as separate parallel subtrees -- this lets it go through
+// _buildSceneTree completely unmodified and get the exact same treatment as
+// any real Flash symbol with frame labels: shapes that occupy the same
+// "slot" across orientations are POOLED into the same node (wrapper-reuse
+// by stable occurrence index, already used for real keyframe-to-keyframe
+// animation) instead of each orientation getting its own full copy of the
+// node tree, and _processElementNode's existing value-track machinery
+// drives each pooled node's polygon/uv/texture/visible per orientation.
+// buildSceneForSymbol's normal "has frame labels" path then splits this
+// into a RESET + one named (FRONT/BACK/...) animation per orientation in
+// the AnimationLibrary -- gameplay still just calls
+// AnimationPlayer.play("FRONT") exactly as before, but the underlying tree
+// is shared instead of duplicated four times over.
+// Layers are combined by NAME (the union of every orientation's non-guide
+// layer names, in first-seen order) rather than by index, so orientations
+// with a slightly different layer count/order still combine correctly --
+// an orientation missing a given layer just contributes an empty keyframe
+// for its slot on that layer.
+function _buildOrientationSynthSymbol(group, orientNames, frameIdx, symbolMap, rootName) {
+    var layerNames = [];
+    var seen = {};
+    for (var o = 0; o < orientNames.length; o++) {
+        var part = group.parts[orientNames[o]];
+        if (!part.layers) continue;
+        for (var l = 0; l < part.layers.length; l++) {
+            var layer = part.layers[l];
+            if (layer.layerType === "guide" || layer.layerType === "folder") continue;
+            if (!seen[layer.name]) { seen[layer.name] = true; layerNames.push(layer.name); }
+        }
+    }
+
+    var combinedLayers = [];
+    for (var li = 0; li < layerNames.length; li++) {
+        var lname = layerNames[li];
+        var keyframes = [];
+        for (var o2 = 0; o2 < orientNames.length; o2++) {
+            var covering = _findCoveringKeyframe(group.parts[orientNames[o2]], lname, frameIdx);
+            // _flattenGroups first: an "instance" element can be nested
+            // inside a Flash "group" (el.members), where
+            // _inlineStaticInstances's flat top-level scan wouldn't see it.
+            var elements = (covering && covering.elements)
+                ? _inlineStaticInstances(_flattenGroups(covering.elements), symbolMap, {})
+                : [];
+            keyframes.push({
+                startFrame: o2,
+                duration: 1,
+                name: orientNames[o2], // becomes this slice's AnimationLibrary label
+                elements: elements
+            });
+        }
+        combinedLayers.push({ name: lname, layerType: "normal", index: li, keyframes: keyframes });
+    }
+
+    return { name: rootName, layers: combinedLayers };
+}
+
+// A variant part's frames can themselves instance OTHER library symbols
+// (e.g. a decorative sub-shape nested inside one hat design). Those show up
+// as "instance" elements, which _processElementNode turns into a PackedScene
+// ext_resource pointing at exportDir/symbols/<path>.tscn -- exactly like any
+// normal, full buildGodotScenes export would produce, since it's the same
+// _symbolPathInfo/RES_PREFIX logic either way. buildVariantScenes builds
+// ONLY the variant parts themselves (frame-sliced, never as their own full
+// standalone scene), so anything THEY reference must be built separately or
+// Godot fails to load the resulting .tscn ("Cannot open file ...") --
+// EXCEPT symbols eligible for inlining (_isInlineableStaticSymbol), which
+// _buildOrientationSynthSymbol draws directly instead and therefore never
+// need one.
+// Walks the "instance" elements of `rootNames`' full timelines (not just one
+// sliced frame -- different frames can reference different nested symbols)
+// and returns every non-inlineable symbol transitively reachable from them,
+// EXCLUDING the roots themselves.
+function _collectSymbolDependencies(rootNames, symbolMap) {
+    var visited = {};
+    var toVisit = rootNames.slice();
+
+    while (toVisit.length > 0) {
+        var name = toVisit.pop();
+        if (visited[name]) continue;
+        visited[name] = true;
+        var sym = symbolMap[name];
+        if (!sym || !sym.layers) continue;
+        for (var l = 0; l < sym.layers.length; l++) {
+            var layer = sym.layers[l];
+            if (!layer.keyframes) continue;
+            for (var k = 0; k < layer.keyframes.length; k++) {
+                var kf = layer.keyframes[k];
+                if (!kf.elements) continue;
+                // _flattenGroups: an "instance" element can be nested
+                // inside a Flash "group" (el.members) -- see the same note
+                // in _buildOrientationSynthSymbol.
+                var flatElements = _flattenGroups(kf.elements);
+                for (var e = 0; e < flatElements.length; e++) {
+                    var el = flatElements[e];
+                    if (el.elementType === "instance" && el.symbolName && !visited[el.symbolName]) {
+                        toVisit.push(el.symbolName);
+                    }
+                }
+            }
+        }
+    }
+
+    var deps = [];
+    var rootSet = {};
+    for (var i = 0; i < rootNames.length; i++) rootSet[rootNames[i]] = true;
+    for (var depName in visited) {
+        if (rootSet[depName]) continue;
+        if (_isInlineableStaticSymbol(symbolMap[depName])) continue; // drawn inline, no standalone scene needed
+        deps.push(depName);
+    }
+    return deps;
+}
+
+// Entry point: scans the whole library for variant groups (HAT, ITEM, ...)
+// and generates their combined per-frame scenes under
+// exportDir/variants/<prefix>/<N>.tscn.
+function buildVariantScenes(data, exportDir) {
+    var uri = exportDir;
+    if (uri.charAt(uri.length - 1) !== "/") uri += "/";
+    _computeGodotProjectRoot(uri);
+    var _bounds = _computeBoundsIndex(uri);
+    var boundsLookup = _bounds.boundsLookup;
+    var boundsIndex = _bounds.boundsIndex;
+
+    var frameRate = (data.document && data.document.frameRate) || 25;
+    var symbolMap = _buildSymbolMap(data.library.symbols);
+    var symbolContainsShader = _computeShaderNeedsAndReferences(data.library.symbols).symbolContainsShader;
+
+    var rawGroups = _findVariantGroups(data.library.symbols);
+    var validGroups = [];
+    var partNames = [];
+    for (var g = 0; g < rawGroups.length; g++) {
+        var group = rawGroups[g];
+        var orientNames = [];
+        for (var o = 0; o < _VARIANT_ORIENTATIONS.length; o++) {
+            if (group.parts[_VARIANT_ORIENTATIONS[o]]) orientNames.push(_VARIANT_ORIENTATIONS[o]);
+        }
+        if (orientNames.length < 2) continue;
+
+        var frameCount = -1;
+        for (var o = 0; o < orientNames.length; o++) {
+            var fc = _symbolFrameCount(group.parts[orientNames[o]]);
+            if (frameCount === -1 || fc < frameCount) frameCount = fc;
+        }
+        if (frameCount <= 0) continue;
+
+        for (var o = 0; o < orientNames.length; o++) partNames.push(group.parts[orientNames[o]].name);
+        validGroups.push({ prefix: group.prefix, parts: group.parts, orientNames: orientNames, frameCount: frameCount });
+    }
+
+    // Build a standalone symbols/<path>.tscn (the exact same file a normal
+    // buildGodotScenes export would produce) for every symbol the variant
+    // parts' frames instance internally, so the PackedScene ext_resource
+    // references emitted below actually resolve in Godot. See
+    // _collectSymbolDependencies.
+    var deps = _collectSymbolDependencies(partNames, symbolMap);
+    for (var d = 0; d < deps.length; d++) {
+        var depSym = symbolMap[deps[d]];
+        if (depSym) buildSceneForSymbol(depSym, frameRate, uri, boundsLookup, boundsIndex, symbolMap, symbolContainsShader, {});
+    }
+    if (typeof fl !== "undefined" && deps.length > 0) fl.trace("buildVariantScenes: built " + deps.length
+        + " nested dependency symbol(s) referenced by variant parts");
+
+    var variantsRoot = uri + "variants/";
+    if (validGroups.length > 0) FLfile.createFolder(variantsRoot);
+
+    for (var g = 0; g < validGroups.length; g++) {
+        var group = validGroups[g];
+        var orientNames = group.orientNames;
+        var frameCount = group.frameCount;
+
+        var groupFolderName = _sanitize_name(group.prefix);
+        var groupDir = variantsRoot + groupFolderName + "/";
+        FLfile.createFolder(groupDir);
+        if (typeof fl !== "undefined") fl.trace("buildVariantScenes: " + group.prefix + " -> " + frameCount
+            + " frame(s) x " + orientNames.length + " orientation(s) [" + orientNames.join(",") + "]");
+
+        for (var n = 0; n < frameCount; n++) {
+            // Orientations are combined as consecutive KEYFRAMES of one
+            // synthetic symbol (see _buildOrientationSynthSymbol), not as
+            // separate parallel subtrees: _buildSceneTree pools shapes that
+            // occupy the same "slot" across orientations into shared nodes
+            // (its existing keyframe-to-keyframe wrapper reuse) and its
+            // normal "has frame labels" path splits the result into a
+            // RESET + one named (FRONT/BACK/...) animation per orientation
+            // -- exactly the same AnimationPlayer.play("FRONT") interface
+            // as before, with a much smaller shared tree underneath.
+            var synthSym = _buildOrientationSynthSymbol(group, orientNames, n, symbolMap, groupFolderName + "_" + (n + 1));
+            // Same reasoning as v4.15's skipEnablerFor: a variant scene is
+            // always attached as equipment to a character, never placed
+            // standalone -- the character's own subtree already handles
+            // on/off-screen culling, so a VisibleOnScreenEnabler2D here
+            // would just be a redundant node repeated on every single
+            // frame of every group (thousands of instances).
+            var skipEnablerForSelf = {};
+            skipEnablerForSelf[synthSym.name] = true;
+            var built = _buildSceneTree(synthSym, frameRate, uri, boundsLookup, boundsIndex, symbolMap, symbolContainsShader, skipEnablerForSelf);
+            var tscnText = serializeTscn(built.root, built.extResources, built.subResources);
+            FLfile.write(groupDir + (n + 1) + ".tscn", tscnText);
+        }
+    }
 }
 
 function _preprocessTweens(data, symbolMap) {
