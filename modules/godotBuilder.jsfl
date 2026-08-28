@@ -1,28 +1,28 @@
 if (typeof fl !== "undefined") fl.trace(">>> godotBuilder_v4 LOADED <<<");
 
-// Historique détaillé des versions (v4.6 -> v4.15) : voir readme.md,
-// section "Historique des versions". Résumé des passes de réduction de
-// nodes actuellement actives (dans l'ordre du pipeline) :
-//   v4.6  _bridgeHoles              - Polygon2D avec trous en 1 seul node
-//   v4.7  (inline)                  - node lui-même = 1er élément (pas de wrapper dédié)
-//   v4.9  _mergeSameColorSiblings   - fusion cross-elements même couleur
-//   v4.10 _flattenSingleChildGroups - aplatissement wrappers vides à 1 enfant
-//   v4.11 _bakeStaticShaderTints    - pré-teinte shapes à couleur statique
-//   v4.13 (bbox enabler)            - rect VisibleOnScreenEnabler2D correct
-//   v4.15 (skipEnablerFor)          - un seul enabler par sous-arbre animé
-// v4.12 (promotion de racine) a été tentée puis REVERTÉE (bug de position
-// confirmé en production) : voir readme.md pour le détail.
+// Detailed version history (v4.6 -> v4.15): see readme.md, "Version
+// History" section. Summary of the node-reduction passes currently active
+// (in pipeline order):
+//   v4.6  _bridgeHoles              - Polygon2D with holes as a single node
+//   v4.7  (inline)                  - node itself = 1st element (no dedicated wrapper)
+//   v4.9  _mergeSameColorSiblings   - cross-element same-color merging
+//   v4.10 _flattenSingleChildGroups - flattening of empty single-child wrappers
+//   v4.11 _bakeStaticShaderTints    - pre-tinting statically-colored shapes
+//   v4.13 (bbox enabler)            - correct VisibleOnScreenEnabler2D rect
+//   v4.15 (skipEnablerFor)          - a single enabler per animated subtree
+// v4.12 (root promotion) was attempted then REVERTED (position bug
+// confirmed in production): see readme.md for details.
 
 
-// __log/safeNum/safeStr : définies dans inspector.jsfl, chargé avant ce
-// fichier par main.jsfl dans le même scope global JSFL (fl.runScript ne
-// crée pas de scope isolé). Les redéfinir ici les écraserait pour TOUT le
-// reste du pipeline y compris l'extraction dans inspector.jsfl elle-même
-// (les deux fichiers partagent un seul espace de noms global) -- ça a été
-// le cas jusqu'à ce nettoyage : cette copie utilisait Number()/un simple
-// check falsy au lieu de parseFloat()+arrondi 3 décimales et d'un check
-// null/undefined, avec un vrai risque de divergence silencieuse (ex:
-// safeStr(false) rendait "" au lieu de "false").
+// __log/safeNum/safeStr: defined in inspector.jsfl, loaded before this
+// file by main.jsfl in the same JSFL global scope (fl.runScript doesn't
+// create an isolated scope). Redefining them here would shadow them for
+// the ENTIRE rest of the pipeline, including inspector.jsfl's own
+// extraction (the two files share a single global namespace) -- which was
+// the case until this cleanup: this copy used Number()/a plain falsy
+// check instead of parseFloat()+3-decimal rounding and a null/undefined
+// check, with a real risk of silent divergence (e.g. safeStr(false) used
+// to return "" instead of "false").
 
 var RES_PREFIX = "res://";
 
@@ -79,28 +79,31 @@ function _colorFloats(c) {
 }
 
 /**
- * Bridge / keyhole : fusionne un contour extérieur et N trous en un seul tableau
- * de sommets, en reliant chaque trou à l'outer par une "fente" de largeur zéro.
- * Le Polygon2D résultant rend nativement les trous sans triangulation maison.
+ * Bridge / keyhole: merges an outer contour and N holes into a single
+ * vertex array, connecting each hole to the outer via a zero-width
+ * "slit". The resulting Polygon2D natively renders the holes without any
+ * custom triangulation.
  *
- * v2 - robustesse multi-trous :
- *   - check de non-croisement segment-segment (ccw strict) : on rejette tout
- *     candidat dont le bridge croiserait une arête existante de work ou du hole.
- *   - exclusion des extrémités de bridges déjà posés (flag `br`) : empêche
- *     deux trous de partager le MÊME couple de points, ce qui produisait des
- *     arêtes superposées en sens opposés (cas le plus fréquent d'invisibilité
- *     en Godot, car earcut abandonne sur self-intersection).
- *   - tri des candidats par distance + first-non-crossing : on garde des
- *     bridges courts tout en garantissant la validité topologique.
- *   - maxCheck = 500 itérations pour borner le pire cas ; fallback sur le
- *     plus proche si rien de propre n'est trouvé.
+ * v2 - multi-hole robustness:
+ *   - segment-segment non-crossing check (strict ccw): rejects any
+ *     candidate whose bridge would cross an existing edge of work or of
+ *     the hole.
+ *   - exclusion of already-placed bridge endpoints (`br` flag): prevents
+ *     two holes from sharing the SAME pair of points, which produced
+ *     overlapping edges running in opposite directions (the most common
+ *     cause of invisibility in Godot, since earcut gives up on
+ *     self-intersection).
+ *   - candidates sorted by distance + first-non-crossing: keeps bridges
+ *     short while still guaranteeing topological validity.
+ *   - maxCheck = 500 iterations to bound the worst case; falls back to
+ *     the closest candidate if nothing clean is found.
  */
 
-// Helpers géométriques purs, partagés par _bridgeHoles et _hasSelfIntersection.
-// Hissés au scope module : ils ne capturent aucune variable locale, donc les
-// recréer à chaque appel (l'ancien pattern de fonctions imbriquées) n'était
-// que de l'allocation gratuite, répétée à chaque polygone-avec-trous traité
-// par frame. Une seule définition au lieu de deux copies dupliquées.
+// Pure geometry helpers, shared by _bridgeHoles and _hasSelfIntersection.
+// Hoisted to module scope: they capture no local variable, so recreating
+// them on every call (the old nested-function pattern) was pure wasted
+// allocation, repeated for every polygon-with-holes processed per frame.
+// A single definition instead of two duplicated copies.
 function _signedAreaSum(v) {
     var s = 0;
     for (var i = 0; i < v.length; i++) {
@@ -266,8 +269,8 @@ function _bridgeHoles(outerVerts, holesArr) {
 }
 
 /**
- * Détecte et tente de corriger une self-intersection STRICTE (croisement transverse) 
- * dans un polygone via une recherche de segment sécant.
+ * Detects and tries to fix a STRICT self-intersection (transverse crossing)
+ * in a polygon via a search for a secant segment.
  */
 function _removeSelfIntersections(verts) {
     var fixed = true;
@@ -287,10 +290,10 @@ function _removeSelfIntersections(verts) {
                     var ua = ((D.x - C.x)*(A.y - C.y) - (D.y - C.y)*(A.x - C.x)) / den;
                     var ub = ((B.x - A.x)*(A.y - C.y) - (B.y - A.y)*(A.x - C.x)) / den;
                     if (ua > 0.01 && ua < 0.99 && ub > 0.01 && ub < 0.99) {
-                        // Au lieu de supprimer une partie de la forme (ce qui cause des trous),
-                        // on la "dé-vrille" en inversant l'ordre des sommets dans la boucle.
-                        // Cela transforme un 8 (croisé) en un simple polygone en unifiant
-                        // le sens de tracé, sans AUCUNE perte de points !
+                        // Instead of removing part of the shape (which causes holes),
+                        // "un-twist" it by reversing the vertex order within the loop.
+                        // This turns a crossed figure-8 into a simple polygon by
+                        // unifying the winding direction, with NO point loss at all!
                         var prefix = verts.slice(0, i + 1);
                         var loopToReverse = verts.slice(i + 1, j + 1);
                         var suffix = verts.slice(j + 1);
@@ -311,21 +314,21 @@ function _removeSelfIntersections(verts) {
 }
 
 /**
- * Détecte une self-intersection STRICTE (croisement transverse) dans un polygone
- * fermé. Utilisé en safety-net après _bridgeHoles : si vrai, on n'utilise pas
- * le résultat bridgé (cas pathologique multi-trous) pour éviter un polygone
- * invisible dans Godot (earcut échoue sur les self-intersections).
+ * Detects a STRICT self-intersection (transverse crossing) in a closed
+ * polygon. Used as a safety net after _bridgeHoles: if true, the bridged
+ * result isn't used (pathological multi-hole case) to avoid an invisible
+ * polygon in Godot (earcut fails on self-intersections).
  *
- * Optim spatiale : grid uniforme indexé sur la bbox. Pour chaque arête on ne
- * teste que les arêtes des cellules qu'elle traverse. Réduit drastiquement
- * le coût sur les polygones avec beaucoup de trous (~1000-2000 sommets).
+ * Spatial optimization: a uniform grid indexed on the bbox. For each edge
+ * we only test the edges of the cells it crosses. Drastically reduces the
+ * cost on polygons with lots of holes (~1000-2000 vertices).
  */
 function _hasSelfIntersection(verts) {
     var n = verts.length;
     if (n < 4) return false;
 
-    // _ccw / _segCross : voir les définitions module-scope au-dessus de
-    // _bridgeHoles (mêmes fonctions pures, plus de copie dupliquée ici).
+    // _ccw / _segCross: see the module-scope definitions above _bridgeHoles
+    // (same pure functions, no more duplicated copy here).
 
     var minX = verts[0].x, maxX = verts[0].x;
     var minY = verts[0].y, maxY = verts[0].y;
@@ -394,37 +397,37 @@ function _hasSelfIntersection(verts) {
 }
 
 /**
- * Réparation des T-jonctions entre polygones adjacents d'une même shape.
+ * T-junction repair between adjacent polygons of the same shape.
  *
- * Problème : inspector.jsfl subdivise les courbes Bézier indépendamment pour
- * chaque contour (fill). Deux fills adjacents partagent la même courbe comme
- * frontière, mais la subdivision de Casteljau peut produire des points
- * intermédiaires légèrement différents de chaque côté (~0.2 unité Flash).
- * Résultat : un sommet V du polygone A est à ~0.2u de l'arête PQ du polygone B,
- * créant un gap triangulaire visible entre les deux Polygon2D dans Godot.
+ * Problem: inspector.jsfl subdivides Bézier curves independently for each
+ * contour (fill). Two adjacent fills share the same curve as their
+ * boundary, but Casteljau subdivision can produce slightly different
+ * intermediate points on each side (~0.2 Flash unit). Result: a vertex V
+ * of polygon A ends up ~0.2u from edge PQ of polygon B, creating a
+ * visible triangular gap between the two Polygon2D in Godot.
  *
- * Fix : pour chaque sommet V d'un polygone A, si V est proche d'une arête PQ
- * d'un autre polygone B (distance < tolérance), on insère V dans B entre P et Q.
- * Après réparation, les deux polygones partagent exactement les mêmes sommets
- * le long de leur frontière commune → plus de gap.
+ * Fix: for each vertex V of a polygon A, if V is close to an edge PQ of
+ * another polygon B (distance < tolerance), insert V into B between P and
+ * Q. After the repair, the two polygons share the exact same vertices
+ * along their common boundary → no more gap.
  *
- * Complexité : O(V × E × P) où V = sommets totaux, E = arêtes par poly,
- * P = nombre de polys. Pour une shape typique (5-10 polys, 20-50 sommets),
- * c'est ~50K itérations — instantané.
+ * Complexity: O(V × E × P) where V = total vertices, E = edges per poly,
+ * P = number of polys. For a typical shape (5-10 polys, 20-50 vertices),
+ * that's ~50K iterations — instant.
  */
 
 
-// Nettoie un contour de sommets Flash bruts avant triangulation Godot :
-// - fusionne les points quasi-identiques consécutifs (distance² < 1e-6),
-// - élimine les allers-retours dégénérés (deux segments consécutifs qui
-//   font presque demi-tour, produit scalaire < -0.99, typique d'une pointe
-//   de subdivision Bézier qui se replie sur elle-même),
-// - retire le dernier point s'il coïncide avec le premier (contour déjà
-//   fermé explicitement),
-// - répare les auto-intersections résiduelles (uniquement sur les contours
-//   de taille raisonnable, ≤ 500 sommets : `_hasSelfIntersection` est en
-//   O(V²), inutile/coûteux au-delà).
-// Fonction pure : ne dépend que de son entrée, ne touche à aucun état de
+// Cleans up a contour of raw Flash vertices before Godot triangulation:
+// - merges consecutive near-identical points (distance² < 1e-6),
+// - eliminates degenerate back-and-forths (two consecutive segments that
+//   nearly reverse direction, dot product < -0.99, typical of a Bézier
+//   subdivision tip folding back on itself),
+// - removes the last point if it coincides with the first (contour
+//   already explicitly closed),
+// - repairs residual self-intersections (only on reasonably-sized
+//   contours, ≤ 500 vertices: `_hasSelfIntersection` is O(V²), useless/
+//   costly beyond that).
+// Pure function: depends only on its input, touches no state of
 // _processElementNode.
 function _cleanupPolygonVertices(effectiveVerts) {
     var finalVerts = [];
@@ -676,13 +679,13 @@ function _parsePngFilename(fname) {
 }
 
 function _isFullyVectorizable(elements) {
-    // Verifie recursivement que tous les elements "shape" (a travers les
-    // groupes imbriques) ont une representation vectorielle complete
-    // (polygones ou traits). Un seul membre sans fill valide signifie que
-    // exporterPNG.jsfl a exporte UN SEUL PNG composite pour le groupe entier
-    // (un groupe sans contours directs est traite comme "fill invalide" par
-    // needsPNG) -> le groupe ne doit pas etre decompose, sinon ce PNG devient
-    // introuvable et le contenu non-vectorisable disparait silencieusement.
+    // Recursively checks that all "shape" elements (through nested groups)
+    // have a complete vector representation (polygons or strokes). A
+    // single member without a valid fill means exporterPNG.jsfl exported
+    // A SINGLE composite PNG for the whole group (a group with no direct
+    // contours is treated as "invalid fill" by needsPNG) -> the group
+    // must not be decomposed, otherwise that PNG becomes unreachable and
+    // the non-vectorizable content silently disappears.
     if (!elements) return true;
     for (var i = 0; i < elements.length; i++) {
         var el = elements[i];
@@ -704,11 +707,11 @@ function _flattenGroups(elements) {
         var el = elements[i];
         if (el.elementType === "group" && el.members && el.members.length > 0) {
             if (!_isFullyVectorizable(el.members)) {
-                // Au moins un membre necessite un PNG -> on garde le groupe
-                // comme UN SEUL element "shape" opaque (sans polygones), pour
-                // que le mecanisme Sprite2D/customTex existant puisse encore
-                // le retrouver, au lieu de le decomposer et perdre tout lien
-                // avec le PNG deja exporte pour ce groupe.
+                // At least one member needs a PNG -> keep the group as A
+                // SINGLE opaque "shape" element (no polygons), so the
+                // existing Sprite2D/customTex mechanism can still find it,
+                // instead of decomposing it and losing any link to the PNG
+                // already exported for this group.
                 var asOneUnit = _shallowClone(el);
                 asOneUnit.elementType = "shape";
                 asOneUnit.isGroup = false;
@@ -815,9 +818,9 @@ function _stabilizeOccurrenceIndices(elements, lastPositions) {
         var grp = groups[oKey];
         if (grp.length <= 1) continue;
         
-        // Seules les instances bénéficient du matching par distance.
-        // Les formes géométriques (shapes) doivent conserver leur ordre Z strict,
-        // sinon les tweens de forme qui se croisent vont échanger leurs nœuds.
+        // Only instances benefit from distance-based matching.
+        // Geometric shapes must keep their strict Z order, otherwise
+        // crossing shape tweens will swap their nodes.
         if (oKey.indexOf("instance_") !== 0) continue;
         
         var prev = lastPositions[oKey];
@@ -881,9 +884,9 @@ GNode.prototype.prependChild = function(child) {
     child.parent = this;
     this._childByName["$" + child.name] = child;
 };
-// Insère l'enfant dans l'ordre de stacking voulu (rank croissant = plus
-// "devant"/dernier dessiné), sans jamais écrire de propriété z_index :
-// l'ordre de rendu Godot vient uniquement de la position dans children[].
+// Inserts the child at the desired stacking order (increasing rank = more
+// "in front"/drawn last), without ever writing a z_index property: Godot's
+// render order comes solely from position within children[].
 GNode.prototype.addChildRanked = function(child, rank) {
     if (child.parent) child.parent.removeChild(child);
     child._renderRank = rank;
@@ -939,10 +942,10 @@ GAnimation.prototype.findTrack = function(path, type) {
     var idx = this._trackIndex["$" + path + "\u0001" + type];
     return (idx === undefined) ? -1 : idx;
 };
-// Comparaison de valeurs de keyframe (nombre, Vector2-like, ExtResource-like).
-// Fonction pure, hissée au scope module : addTrackKey est appelée des
-// dizaines de milliers de fois sur un projet complexe, recréer cette
-// fermeture à chaque appel était une allocation gratuite et répétée.
+// Compares keyframe values (number, Vector2-like, ExtResource-like).
+// Pure function, hoisted to module scope: addTrackKey is called tens of
+// thousands of times on a complex project, recreating this closure on
+// every call was pure, repeated wasted allocation.
 function _eq(v1, v2) {
     if (v1 === v2) return true;
     if (typeof v1 === "number" && typeof v2 === "number") return Math.abs(v1 - v2) < 0.001;
@@ -967,14 +970,15 @@ GAnimation.prototype.optimizeTracks = function(root) {
         var propName = (colonIdx !== -1) ? tr.path.substring(colonIdx + 1) : tr.path;
         
         if (tr.type === "method") {
-            isStatic = false; // Ne jamais optimiser les method tracks
+            isStatic = false; // Never optimize method tracks
         } else if (propName.indexOf(":") !== -1 || propName.indexOf("/") !== -1) {
-            isStatic = false; // Ne pas optimiser les sous-propriétés
+            isStatic = false; // Don't optimize sub-properties
         } else if (tr.keys.times[0] > 0.0005 && (propName === "points" || propName === "polygon" || propName === "polygons" || propName === "uv")) {
-            // Seuls les tableaux de géométrie qui apparaissent tardivement DOIVENT rester dynamiques.
-            // Avant leur création, Godot utilise leur état .tscn (vide). Si on les rendait statiques,
-            // on écrirait leur forme finale dans le .tscn, les rendant visibles prématurément !
-            // On peut par contre optimiser TOUTES les autres propriétés (position, couleur...) pour regagner nos FPS.
+            // Only geometry arrays that appear late MUST stay dynamic.
+            // Before their creation, Godot uses their .tscn state (empty). If we made
+            // them static, we'd write their final shape into the .tscn, making them
+            // visible prematurely! All OTHER properties (position, color...) can
+            // however be optimized to regain FPS.
             isStatic = false;
         } else {
             for (var k = 1; k < tr.keys.values.length; k++) {
@@ -988,20 +992,23 @@ GAnimation.prototype.optimizeTracks = function(root) {
         if (!isStatic) {
             optimizedTracks.push(tr);
             
-            // Pour les pistes animées, on applique la valeur à t=0 dans le .tscn
-            // pour que la scène ait la bonne apparence dans l'éditeur avant lecture.
+            // For animated tracks, apply the value at t=0 in the .tscn so
+            // the scene looks right in the editor before playback.
             //
-            // Exception : les tableaux de géométrie (polygon, points, uv) qui
-            // N'APPARAISSENT PAS à t=0 (times[0] > 0.0005) doivent rester hors .tscn.
-            // Avant leur frame de création Godot utilise l'état .tscn (vide) ; y écrire
-            // leur valeur finale les rendrait visibles prématurément.
+            // Exception: geometry arrays (polygon, points, uv) that DON'T
+            // APPEAR at t=0 (times[0] > 0.0005) must stay out of the .tscn.
+            // Before their creation frame, Godot uses the .tscn state
+            // (empty); writing their final value there would make them
+            // visible prematurely.
             //
-            // EN REVANCHE, si le premier keyframe de géométrie EST à t=0
-            // (times[0] <= 0.0005), écrire la valeur dans le .tscn est parfaitement sûr :
-            // c'est exactement ce que l'AnimationPlayer affichera dès le départ.
-            // Sans cet écrit, les Polygon2D restent avec polygon vide dans le .tscn →
-            // ils sont transparents quand la scène est instanciée dans une scène parente
-            // sans que l'AnimationPlayer n'ait encore joué (ex: ouverture dans l'éditeur).
+            // HOWEVER, if the first geometry keyframe IS at t=0
+            // (times[0] <= 0.0005), writing the value into the .tscn is
+            // perfectly safe: it's exactly what the AnimationPlayer will
+            // show from the start. Without this write, the Polygon2D stay
+            // with an empty polygon in the .tscn → they're transparent
+            // when the scene is instanced in a parent scene before the
+            // AnimationPlayer has played yet (e.g. opening it in the
+            // editor).
             var isLateGeometry = (propName === "polygon" || propName === "polygons"
                                   || propName === "points" || propName === "uv")
                                  && tr.keys.times[0] > 0.0005;
@@ -1027,14 +1034,14 @@ GAnimation.prototype.optimizeTracks = function(root) {
                     }
             }
         } else {
-            // Piste statique : on l'efface de l'animation, MAIS on applique sa valeur dans le .tscn
+            // Static track: erase it from the animation, BUT apply its value in the .tscn
             if (root && colonIdx !== -1) {
                 var nodePath = tr.path.substring(0, colonIdx);
                 var targetNode = root.getNodeOrNull(nodePath);
                 if (targetNode) {
                     if (typeof firstVal === "boolean")          targetNode.properties[propName] = firstVal;
                     else if (typeof firstVal === "number") {
-                        if (propName === "process_mode")   targetNode.properties[propName] = firstVal; // Pas de décimales pour les enums !
+                        if (propName === "process_mode")   targetNode.properties[propName] = firstVal; // No decimals for enums!
                         else                               targetNode.properties[propName] = _f(firstVal);
                     }
                     else if (firstVal && firstVal.x !== undefined)   targetNode.properties[propName] = _vec2(firstVal.x, firstVal.y);
@@ -1049,14 +1056,14 @@ GAnimation.prototype.optimizeTracks = function(root) {
 };
 
 
-// Construit l'ensemble des chemins de nodes (relatifs à root, "." pour root
-// lui-même) directement ciblés par au moins une AnimationPlayer track de
-// valeur -- les method tracks (frame scripts, path === ".") sont ignorées
-// car elles n'impliquent aucun changement visuel du node ciblé. Utilisé par
-// `_flattenSingleChildGroups` (v4.10) et `_markBakeableShapes` (v4.9) comme
-// même critère de base ("ce node précis est-il animé ?"), avant que chacune
-// n'en fasse un usage différent (propagation au sous-arbre entier pour
-// l'une, à la lignée d'ancêtres pour l'autre).
+// Builds the set of node paths (relative to root, "." for root itself)
+// directly targeted by at least one AnimationPlayer value track -- method
+// tracks (frame scripts, path === ".") are ignored since they imply no
+// visual change to the targeted node. Used by `_flattenSingleChildGroups`
+// (v4.10) and `_markBakeableShapes` (v4.9) as the same base criterion
+// ("is this exact node animated?"), before each makes different use of it
+// (propagation to the whole subtree for one, to the ancestor chain for
+// the other).
 function _buildAnimatedPathsSet(anim) {
     var animatedPaths = {};
     if (anim && anim.tracks) {
@@ -1071,20 +1078,20 @@ function _buildAnimatedPathsSet(anim) {
     return animatedPaths;
 }
 
-// Supprime les wrappers Node2D "vides" : un container organisationnel
-// (folder/layer/masque) qui n'a QU'UN SEUL enfant, aucun transform propre
-// (position/rotation/scale/skew), aucune propriété "visible"/"material"/
-// "groups", et dont TOUT LE SOUS-ARBRE est garanti non-animé (aucune
-// AnimationPlayer track ne référence lui-même ni aucun de ses descendants).
-// Cette dernière garantie est indispensable : les sub_resources Animation
-// (RESET/labels) sont sérialisés en texte AVANT cette passe (NodePath("...")
-// déjà écrits en dur), donc supprimer un node dont un descendant serait
-// animé casserait ces chemins. En restreignant aux sous-arbres 100% statiques,
-// aucun NodePath existant ne peut jamais référencer un node qu'on retire ici.
-// L'enfant unique remonte tel quel (aucun recalcul de transform nécessaire
-// puisque le wrapper retiré est garanti en transform identité).
-// Les chaînes de wrappers vides imbriqués sont réduites en une seule passe
-// (ex: folder > layer > shape, si les deux wrappers sont éligibles).
+// Removes "empty" Node2D wrappers: a purely organizational container
+// (folder/layer/mask) that has ONLY ONE child, no transform of its own
+// (position/rotation/scale/skew), no "visible"/"material"/"groups"
+// property, and whose ENTIRE SUBTREE is guaranteed non-animated (no
+// AnimationPlayer track references it or any of its descendants). This
+// last guarantee is essential: the Animation sub_resources (RESET/labels)
+// are already serialized as text BEFORE this pass runs (NodePath("...")
+// already hardcoded), so removing a node with an animated descendant
+// would break those paths. By restricting to 100%-static subtrees, no
+// existing NodePath can ever reference a node removed here. The single
+// child moves up as-is (no transform recalculation needed, since the
+// removed wrapper is guaranteed to be identity). Chains of nested empty
+// wrappers are collapsed in a single pass (e.g. folder > layer > shape,
+// if both wrappers are eligible).
 function _flattenSingleChildGroups(root, anim) {
     var animatedPaths = _buildAnimatedPathsSet(anim);
 
@@ -1138,22 +1145,22 @@ function _flattenSingleChildGroups(root, anim) {
     processContainer(root);
 }
 
-// Pour les shapes teintées par le shader "Advanced Color Effect" de Flash
-// (color_mult/color_offset_255, voir has_shader dans _processElementNode) :
-// si la teinte ne change JAMAIS sur toute la timeline de ce node (aucune
-// vraie AnimationPlayer track, cf. optimizeTracks qui exclut TOUJOURS les
-// sous-propriétés "material:shader_parameter/..." de l'optimisation), on
-// peut appliquer la formule du shader directement aux couleurs du gradient
-// source au moment de la génération, et donner au node une texture déjà
-// teintée à la place du shader. Le node n'a alors plus besoin de matériau
-// du tout, et devient éligible au bake runtime (_markBakeableShapes).
-// Formule EXACTE reprise de flash_color_normal.gdshader :
+// For shapes tinted by Flash's "Advanced Color Effect" shader
+// (color_mult/color_offset_255, see has_shader in _processElementNode):
+// if the tint NEVER changes across this node's whole timeline (no real
+// AnimationPlayer track, cf. optimizeTracks which ALWAYS excludes
+// "material:shader_parameter/..." sub-properties from optimization), the
+// shader's formula can be applied directly to the source gradient's
+// colors at generation time, giving the node an already-tinted texture
+// instead of the shader. The node then no longer needs a material at
+// all, and becomes eligible for runtime baking (_markBakeableShapes).
+// EXACT formula taken from flash_color_normal.gdshader:
 //   COLOR = clamp(tex * color_mult + color_offset_255/255, 0, 1)
-// Limite volontaire : uniquement le blend mode "normal" (flash_color_
-// normal.gdshader, render_mode blend_mix). "add"/"multiply" dépendent du
-// contenu déjà présent dans le framebuffer au moment du dessin (blend GPU
-// en temps réel) : impossible à reproduire en pré-teintant une texture,
-// donc ces shapes gardent leur matériau et restent hors bake.
+// Deliberate limitation: only the "normal" blend mode (flash_color_
+// normal.gdshader, render_mode blend_mix). "add"/"multiply" depend on the
+// content already present in the framebuffer at draw time (real-time GPU
+// blending): impossible to reproduce by pre-tinting a texture, so those
+// shapes keep their material and stay out of baking.
 function _bakeStaticShaderTints(root, anim, subResources) {
     function findSubResource(id) {
         for (var i = 0; i < subResources.length; i++) {
@@ -1214,7 +1221,7 @@ function _bakeStaticShaderTints(root, anim, subResources) {
         var offInfo = trackInfo(nodePath, "material:shader_parameter/color_offset_255");
         var mulInfo = trackInfo(nodePath, "material:shader_parameter/color_mult");
         if (!offInfo.exists || !mulInfo.exists) return;
-        if (!offInfo.isStatic || !mulInfo.isStatic) return; // vraie animation : garder le shader
+        if (!offInfo.isStatic || !mulInfo.isStatic) return; // real animation: keep the shader
 
         var off = parseVec4(offInfo.value);
         var mul = parseVec4(mulInfo.value);
@@ -1278,17 +1285,17 @@ function _bakeStaticShaderTints(root, anim, subResources) {
     }
 }
 
-// Marque en interne (node._mergeSafe, jamais sérialisé dans le .tscn) tout
-// Polygon2D/Line2D qui n'est ciblé par AUCUNE AnimationPlayer track (ni lui,
-// ni un de ses ancêtres dans la même scène). Sert uniquement de critère de
-// sécurité à `_mergeSameColorSiblings` (v4.9) pour savoir quels nodes
-// peuvent être fusionnés sans jamais casser une animation. À appeler APRÈS
-// anim.optimizeTracks(root), pour que anim.tracks ne contienne plus que les
-// propriétés réellement dynamiques (les tracks "statiques" à une seule
-// valeur ont déjà été inlinées dans node.properties par optimizeTracks et
-// effacées de la liste).
-// Les method tracks (appels de frame scripts, path === ".") sont ignorées :
-// elles n'impliquent aucun changement visuel du node ciblé.
+// Internally marks (node._mergeSafe, never serialized into the .tscn)
+// every Polygon2D/Line2D that isn't targeted by ANY AnimationPlayer track
+// (neither itself nor any of its ancestors in the same scene). Used
+// solely as a safety criterion by `_mergeSameColorSiblings` (v4.9) to know
+// which nodes can be merged without ever breaking an animation. Must be
+// called AFTER anim.optimizeTracks(root), so anim.tracks only contains
+// truly dynamic properties (the "static" single-value tracks have already
+// been inlined into node.properties by optimizeTracks and removed from
+// the list).
+// Method tracks (frame script calls, path === ".") are ignored: they
+// imply no visual change to the targeted node.
 function _markBakeableShapes(root, anim) {
     var animatedPaths = _buildAnimatedPathsSet(anim);
 
@@ -1296,14 +1303,14 @@ function _markBakeableShapes(root, anim) {
     function walk(node, isAnimated, materialAncestor) {
         var path = (node === root) ? "." : root.getPathTo(node);
         var nodeAnimated = isAnimated || !!animatedPaths[path];
-        // Un Polygon2D/Line2D fusionné (v4.9) doit garder EXACTEMENT le
-        // rendu de ses nodes d'origine : un node avec son propre "material"
-        // (shader de teinte/color transform, voir has_shader plus haut) OU
-        // qui refuse explicitement d'hériter du matériau parent
-        // (use_parent_material=false, ex: les Line2D de contour,
-        // volontairement isolées du shader des fills) ne peut donc jamais
-        // être fusionné sans perdre/fausser son rendu. Idem pour tout
-        // descendant d'un ancêtre ayant lui-même un vrai matériau.
+        // A merged Polygon2D/Line2D (v4.9) must keep EXACTLY the rendering
+        // of its original nodes: a node with its own "material" (tint/
+        // color transform shader, see has_shader above) OR that explicitly
+        // opts out of inheriting the parent material
+        // (use_parent_material=false, e.g. outline Line2D, deliberately
+        // isolated from the fills' shader) can therefore never be merged
+        // without losing/breaking its rendering. Same for any descendant
+        // of an ancestor that itself has a real material.
         var hasOwnMaterial = !!node.properties["material"];
         var optsOut = (node.properties["use_parent_material"] === false
                     || node.properties["use_parent_material"] === "false");
@@ -1321,23 +1328,23 @@ function _markBakeableShapes(root, anim) {
     return markedAny;
 }
 
-// Fusionne, entre nodes FRÈRES (même parent direct) et CONSÉCUTIFS dans
-// l'ordre de rendu, les Polygon2D statiques (marquées _mergeSafe par
-// _markBakeableShapes) qui partagent EXACTEMENT le même texture (= même
-// SubResource, donc même couleur/gradient : gradCache déduplique déjà les
-// couleurs solides identiques vers la même GradientTexture1D). Complémentaire
-// de la fusion intra-shape déjà existante (polyGroups/sig, v4.6) qui ne
-// fusionne que les contours d'UN SEUL élément Flash ; celle-ci fusionne à
-// travers des éléments Flash différents (ex: deux instances de la même
-// feuille sur le même calque), réduisant le nombre de nodes dès le .tscn.
-// Ne touche jamais l'UV : chaque vertex garde son UV d'origine, calculé
-// correctement dès la génération initiale (peu importe la position finale
-// du node, y compris pour un vrai gradient dont la matrice diffère par
-// shape — seuls les points "polygon" doivent être ramenés dans l'espace
-// local du parent via le transform propre au node fusionné).
-// Ne fusionne QUE des nodes déjà marqués _mergeSafe (donc garantis non
-// ciblés par une AnimationPlayer track) et sans matériau propre, pour ne
-// jamais casser une animation ou un shader spécifique à un node.
+// Merges, between SIBLING nodes (same direct parent) and CONSECUTIVE in
+// render order, the static Polygon2D (marked _mergeSafe by
+// _markBakeableShapes) that share EXACTLY the same texture (= same
+// SubResource, so the same color/gradient: gradCache already deduplicates
+// identical solid colors to the same GradientTexture1D). Complementary to
+// the already-existing intra-shape merge (polyGroups/sig, v4.6), which
+// only merges the contours of A SINGLE Flash element; this one merges
+// across different Flash elements (e.g. two instances of the same leaf on
+// the same layer), reducing node count as early as the .tscn.
+// Never touches the UV: each vertex keeps its original UV, correctly
+// computed at initial generation time (regardless of the node's final
+// position, including for a real gradient whose matrix differs per shape
+// — only the "polygon" points need to be brought back into the parent's
+// local space via the merged node's own transform).
+// ONLY merges nodes already marked _mergeSafe (so guaranteed not targeted
+// by any AnimationPlayer track) and without their own material, so as to
+// never break an animation or a node-specific shader.
 function _mergeSameColorSiblings(root) {
     function _parsePackedVec2(str) {
         if (!str) return [];
@@ -1385,10 +1392,10 @@ function _mergeSameColorSiblings(root) {
             && !!n.properties["polygon"]
             && n.properties["visible"] !== false
             && !n.properties["material"]
-            // Un Polygon2D "wrapper" (v4.7) peut lui-même héberger des
-            // enfants Poly_1/Line_0 (autres groupes de couleur de la même
-            // shape) : ne jamais le fusionner, ça détruirait ces enfants
-            // sans les transférer.
+            // A Polygon2D "wrapper" (v4.7) can itself host Poly_1/Line_0
+            // children (other color groups of the same shape): never
+            // merge it, that would destroy those children without
+            // transferring them.
             && n.children.length === 0;
     }
 
@@ -1533,10 +1540,10 @@ GAnimation.prototype.addTrackKey = function(path, typeStr, time, value, transiti
 
     if (exactMatchIdx !== -1) {
         if (path.indexOf(":visible") !== -1 && tr.keys.values[exactMatchIdx] === true && value === false) {
-            // Un élément se termine exactement au moment où un autre élément de la même variante commence.
-            // On ne doit pas écraser 'true' avec 'false', sinon l'élément devient invisible !
+            // An element ends exactly when another element of the same variant starts.
+            // 'true' must not be overwritten by 'false', or the element would become invisible!
         } else if (path.indexOf(":process_mode") !== -1 && tr.keys.values[exactMatchIdx] === 0 && value === 4) {
-            // Même chose pour process_mode : on ne doit pas écraser '0' (INHERIT) avec '4' (DISABLED)
+            // Same for process_mode: '0' (INHERIT) must not be overwritten by '4' (DISABLED)
         } else {
             tr.keys.values[exactMatchIdx] = value;
             tr.keys.transitions[exactMatchIdx] = trans;
@@ -1657,9 +1664,9 @@ function _postProcessMasks(root, sym, anim, boundsLookup, exportDir, getExt, sca
         for (var c = 0; c < layerNode.children.length; c++) {
             var wrapper = layerNode.children[c];
             if (wrapper.name === "AnimationPlayer") continue;
-            // Le wrapper EST directement le node visuel (cas normal depuis que
-            // les shapes single-fill ET multi-fill n'ont plus de Node2D
-            // intermédiaire) : pas besoin de descendre dans ses enfants.
+            // The wrapper IS directly the visual node (the normal case
+            // since single-fill AND multi-fill shapes no longer have an
+            // intermediate Node2D): no need to descend into its children.
             if (wrapper.type === "Sprite2D" || wrapper.type === "Polygon2D" || wrapper.type === "PackedScene") {
                 return { sprite: wrapper, wrapper: wrapper };
             }
@@ -1680,11 +1687,11 @@ function _postProcessMasks(root, sym, anim, boundsLookup, exportDir, getExt, sca
         return null;
     }
 
-    // Desambiguisation des noms de calques dupliques, pour les VRAIS calques
-    // mask (layerType === "mask"). Les calques "guide" Flash ne publient
-    // jamais de contenu visuel et ne sont jamais traites comme des masques :
-    // confirme empiriquement qu'un calque "guide" nomme "Time" peut etre une
-    // simple reference de timing (lue par de l'AS3), pas un masque visuel.
+    // Disambiguation of duplicate layer names, for REAL mask layers
+    // (layerType === "mask"). Flash "guide" layers never publish visual
+    // content and are never treated as masks: confirmed empirically that a
+    // "guide" layer named "Time" can be a plain timing reference (read by
+    // AS3), not a visual mask.
     var maskLayerNames = {};
     for (var i = 0; i < sym.layers.length; i++) {
         var l = sym.layers[i];
@@ -1883,22 +1890,23 @@ function _postProcessMasks(root, sym, anim, boundsLookup, exportDir, getExt, sca
     }
 }
 
-// Quand une track est définie pour la première fois APRÈS le début d'un slice,
-// elle est actuellement omise du slice (pas de lastVal, pas de keys en range).
-// Mais Godot ne touche pas à la propriété au playback -> la valeur héritée d'une
-// animation précédente RESTE en place. Pour les "shape data" (polygon, points,
-// uv, width), ça fait persister visuellement des éléments d'animations précédentes
-// (ex: bouche "crying" qui reste affichée pendant "normal" sur Layer_1/shape_0/shape
-// qui est :visible=true mais sans tracks polygon dans "normal").
+// When a track is first defined AFTER a slice's start, it's currently
+// omitted from the slice (no lastVal, no keys in range). But Godot
+// doesn't touch the property during playback -> the value inherited from
+// a previous animation STAYS in place. For "shape data" (polygon, points,
+// uv, width), this makes elements from previous animations visually
+// persist (e.g. a "crying" mouth that stays displayed during "normal" on
+// Layer_1/shape_0/shape, which is :visible=true but has no polygon
+// tracks in "normal").
 //
-// Reproduit le comportement Flash : à frame 0 ("normal"), seuls les éléments du
-// keyframe sont dessinés ; les polys/lines absents sont vides.
+// Reproduces Flash's behavior: at frame 0 ("normal"), only the
+// keyframe's own elements are drawn; absent polys/lines are empty.
 //
-// Pour les transforms (position/rotation/scale/skew/modulate), la sémantique
-// "carry-over depuis la dernière anim" reste correcte parce qu'ils ne créent pas
-// d'éléments visibles supplémentaires : ils ne modifient que l'apparence d'éléments
-// déjà rendus, et leur wrapper a déjà sa propre piste :visible qui les masque
-// quand il ne devrait pas être visible.
+// For transforms (position/rotation/scale/skew/modulate), the "carry
+// over from the last animation" semantics stays correct because they
+// don't create additional visible elements: they only change the
+// appearance of already-rendered elements, and their wrapper already has
+// its own :visible track that hides them when it shouldn't be visible.
 function _shapeDataReset(path) {
     var colonIdx = path.lastIndexOf(":");
     if (colonIdx === -1) return undefined;
@@ -1915,19 +1923,21 @@ function _shapeDataReset(path) {
 }
 
 function _sliceAnimation(anim, start, end, padShapeResets) {
-    // Les keys de la big anim sont arrondies à 3 décimales par addTrackKey
-    // (`Math.round(time * 1000) / 1000`), alors que les labels sont calculés
-    // comme `kf.startFrame / frameRate` sans arrondi. Pour frame 71 à 30fps :
-    // label = 2.36666..., key = 2.367 -> écart 0.33ms.
-    // Sans alignement, la vraie key du keyframe Flash tombe à slice_t=0.0003
-    // au lieu de slice_t=0. Le test `nTimes[0] > 0.0001` déclenche alors le
-    // carry-over du `lastVal` (état de l'animation précédente), qui insère une
-    // key fantôme à t=0. Sur une piste :visible ça donne 0.3ms d'élément hérité
-    // visible au début du label (ex: bouche `crying` au début de `star`),
-    // visuellement perçu comme "le truc de l'anim précédente est resté".
+    // The big anim's keys are rounded to 3 decimals by addTrackKey
+    // (`Math.round(time * 1000) / 1000`), while labels are computed as
+    // `kf.startFrame / frameRate` with no rounding. For frame 71 at 30fps:
+    // label = 2.36666..., key = 2.367 -> a 0.33ms gap.
+    // Without alignment, the Flash keyframe's real key lands at
+    // slice_t=0.0003 instead of slice_t=0. The `nTimes[0] > 0.0001` check
+    // then triggers the `lastVal` carry-over (previous animation's state),
+    // inserting a ghost key at t=0. On a :visible track this produces 0.3ms
+    // of an inherited element visible at the start of the label (e.g. a
+    // `crying` mouth at the start of `star`), perceived visually as "the
+    // previous anim's thing stuck around".
     //
-    // En arrondissant start/end à la même précision que les keys, la vraie key
-    // du keyframe tombe exactement à slice_t=0 et le carry-over est supprimé.
+    // By rounding start/end to the same precision as the keys, the real
+    // keyframe key lands exactly at slice_t=0 and the carry-over is
+    // removed.
     start = Math.round(start * 1000) / 1000;
     end   = Math.round(end   * 1000) / 1000;
 
@@ -2034,31 +2044,31 @@ function _setupMaterials(node, isRoot) {
     return hasSprite;
 }
 
-// Fonction centrale du pipeline : convertit UN élément Flash (shape ou
-// instance) présent à UN keyframe donné en node(s) Godot + tracks
-// d'animation. Volontairement pas décomposée en sous-fonctions malgré sa
-// taille : la quasi-totalité de son état local (node/wrapperNode,
-// offsetDx/Dy, _matDec...) traverse la fonction de bout en bout, donc
-// découper obligerait à faire circuler 8-10 paramètres partout sans
-// réduire la complexité réelle -- juste la déplacer, avec un vrai risque
-// de régression géométrique (précision des sommets, matrices de gradient).
-// Repères de section (mêmes lignes à chaque appel, un par élément/keyframe) :
-//   1. Wrapper/node : lookup ou création (Polygon2D/Line2D/Sprite2D/PackedScene/Node2D)
-//   2. Démotion Line2D -> Node2D si un fill arrive sur un keyframe ultérieur
-//   3. Géométrie shape : polyGroups, triangulation/nettoyage, gradients/textures
-//   4. Sprite/bitmap (texture PNG externe)
-//   5. Traits (strokes) -> Line2D, avec démotion symétrique du point 2
-//   6. Nettoyage des slots Poly_X/Line_X excédentaires (hérités d'un keyframe précédent)
-//   7. Tracks visible/process_mode
-//   8. Transform (position/rotation/scale/skew), wrapper init + animé
-//   9. Color transform : shader (Advanced Color Effect) ou modulate simple
-// Démote un node Line2D (créé comme wrapper direct pour un trait unique,
-// v4.7) en Node2D lorsqu'un keyframe ultérieur lui donne finalement
-// plusieurs traits OU un fill (les deux appelants de cette fonction).
-// Le trait déjà présent est relocalisé en enfant "Line_0", propriétés ET
-// tracks d'animation existantes comprises (réécriture des chemins déjà
-// indexés dans anim._trackIndex). Bloc identique dans les deux cas
-// d'origine, factorisé ici.
+// Central pipeline function: converts ONE Flash element (shape or
+// instance) present at ONE given keyframe into Godot node(s) + animation
+// tracks. Deliberately not decomposed into sub-functions despite its
+// size: almost all of its local state (node/wrapperNode, offsetDx/Dy,
+// _matDec...) flows through the function from start to end, so splitting
+// it would require threading 8-10 parameters everywhere without reducing
+// the actual complexity -- just moving it around, with a real risk of a
+// geometric regression (vertex precision, gradient matrices).
+// Section markers (same lines on every call, one per element/keyframe):
+//   1. Wrapper/node: lookup or creation (Polygon2D/Line2D/Sprite2D/PackedScene/Node2D)
+//   2. Line2D -> Node2D demotion if a fill arrives on a later keyframe
+//   3. Shape geometry: polyGroups, triangulation/cleanup, gradients/textures
+//   4. Sprite/bitmap (external PNG texture)
+//   5. Strokes -> Line2D, with the symmetric demotion of point 2
+//   6. Cleanup of excess Poly_X/Line_X slots (inherited from a previous keyframe)
+//   7. visible/process_mode tracks
+//   8. Transform (position/rotation/scale/skew), wrapper init + animated
+//   9. Color transform: shader (Advanced Color Effect) or plain modulate
+// Demotes a Line2D node (created as a direct wrapper for a single stroke,
+// v4.7) back to Node2D when a later keyframe ends up giving it several
+// strokes OR a fill (this function's two callers). The existing stroke is
+// relocated to a "Line_0" child, both properties AND existing animation
+// tracks included (rewriting the paths already indexed in
+// anim._trackIndex). Identical block in both original cases, factored out
+// here.
 function _demoteLine2DToNode2D(node, variantPathStr, anim) {
     node.type = "Node2D";
     delete node.properties["joint_mode"];
@@ -2083,12 +2093,12 @@ function _demoteLine2DToNode2D(node, variantPathStr, anim) {
     }
 }
 
-// --- Section 6 de _processElementNode, extraite : les deux boucles de
-// nettoyage des slots Poly_X/Line_X excédentaires (hérités d'un keyframe
-// précédent avec plus de fills/traits qu'ici) sont identiques à un
-// paramétrage près -- unifiées ici. `useAnim` bascule entre écriture d'une
-// track d'animation (calque non-statique) et assignation directe de
-// propriété (calque statique), exactement les mêmes valeurs des deux côtés.
+// --- _processElementNode section 6, extracted: the two cleanup loops for
+// excess Poly_X/Line_X slots (inherited from a previous keyframe that had
+// more fills/strokes than this one) are identical apart from their
+// parameters -- unified here. `useAnim` switches between writing an
+// animation track (non-static layer) and directly assigning a property
+// (static layer), the exact same values on both sides.
 function _clearExcessNamedSlots(node, variantPathStr, anim, startIndex, prefix, expectedType, useAnim, startTime, resetProps) {
     var idx = startIndex;
     while (true) {
@@ -2113,13 +2123,13 @@ function _clearExcessNamedSlots(node, variantPathStr, anim, startIndex, prefix, 
     }
 }
 
-// --- Section 1 de _processElementNode, extraite : lookup ou création du
-// wrapper/node Godot pour CET élément Flash à CE keyframe. Pure sur ses
-// entrées (elem/parent/ownerRoot/wrapperName/shaderNeeds/
-// modulateNeedsCanvasGroup/layerZIndex/getExt) : ses seuls effets de bord
-// sont la création/l'attache du node lui-même (parent.addChildRanked,
-// node.owner), jamais anim.tracks ni subResources -- donc extractible sans
-// faire circuler le reste de l'état de _processElementNode.
+// --- _processElementNode section 1, extracted: lookup or creation of the
+// Godot wrapper/node for THIS Flash element at THIS keyframe. Pure over
+// its inputs (elem/parent/ownerRoot/wrapperName/shaderNeeds/
+// modulateNeedsCanvasGroup/layerZIndex/getExt): its only side effects are
+// creating/attaching the node itself (parent.addChildRanked, node.owner),
+// never anim.tracks nor subResources -- so it can be extracted without
+// threading the rest of _processElementNode's state.
 function _resolveElementNode(elem, parent, ownerRoot, wrapperName, shaderNeeds, modulateNeedsCanvasGroup, layerZIndex, getExt) {
     if (parent !== ownerRoot && !parent.parent) {
         ownerRoot.addChild(parent);
@@ -2142,13 +2152,14 @@ function _resolveElementNode(elem, parent, ownerRoot, wrapperName, shaderNeeds, 
                 node = new GNode(wrapperName, "Polygon2D");
                 node.properties["color"] = "Color(1, 1, 1, 1)";
             } else if (elem.elementType === "shape" && elem.strokes && elem.strokes.length > 0) {
-                // Shape uniquement composée de traits (pas de fill) : le wrapper
-                // devient directement le Line2D du premier trait au lieu d'un
-                // Node2D + Line_0 enfant. Économise 1 node par shape "stroke-only"
-                // (icônes, contours dessinés à la main, etc.). Si un keyframe
-                // ultérieur de cette même occurrence a besoin de plusieurs traits,
-                // le node est "démoté" en Node2D + Line_0..N enfants (voir plus
-                // bas, symétrique du mécanisme déjà en place pour Polygon2D/Poly_N).
+                // Shape made only of strokes (no fill): the wrapper becomes
+                // directly the first stroke's Line2D instead of a Node2D +
+                // Line_0 child. Saves 1 node per "stroke-only" shape
+                // (icons, hand-drawn outlines, etc.). If a later keyframe
+                // of this same occurrence needs several strokes, the node
+                // is "demoted" back to Node2D + Line_0..N children (see
+                // below, symmetric to the mechanism already in place for
+                // Polygon2D/Poly_N).
                 node = new GNode(wrapperName, "Line2D");
                 node.properties["joint_mode"] = "2";
                 node.properties["begin_cap_mode"] = "2";
@@ -2206,7 +2217,7 @@ function _processElementNode(elem, parent, ownerRoot, anim, startTime, duration,
                              wrapperName, exportDir, scaleFactor, symName, startFrameIndex,
                              maxTime, kfTransition, shaderNeeds, customTexPath, layerType,
                              getExt, subResources, isStaticLayer, modulateNeedsCanvasGroup, gradCache, layerZIndex) {
-    // --- 1. Wrapper/node : lookup ou création ---------------------------
+    // --- 1. Wrapper/node: lookup or creation -----------------------------
     var _resolved = _resolveElementNode(elem, parent, ownerRoot, wrapperName, shaderNeeds, modulateNeedsCanvasGroup, layerZIndex, getExt);
     var node = _resolved.node;
     var wrapperNode = _resolved.wrapperNode;
@@ -2216,12 +2227,12 @@ function _processElementNode(elem, parent, ownerRoot, anim, startTime, duration,
     var wrapperPathStr = ownerRoot.getPathTo(wrapperNode);
     var variantPathStr = ownerRoot.getPathTo(node);
 
-    // --- 2. Démotion Line2D -> Node2D si un fill arrive plus tard -------
-    // Cas rare : cette occurrence poolée avait été créée en Line2D direct
-    // (shape stroke-only sur son premier keyframe) mais le keyframe courant
-    // lui donne un fill (elem.polygons non vide). On démote vers Node2D et on
-    // relocalise le trait existant en Line_0 avant que la logique polygone
-    // ci-dessous ne décide du nommage de ses propres nodes.
+    // --- 2. Line2D -> Node2D demotion if a fill arrives later ------------
+    // Rare case: this pooled occurrence had been created as a direct
+    // Line2D (stroke-only shape on its first keyframe), but the current
+    // keyframe gives it a fill (non-empty elem.polygons). Demote to
+    // Node2D and relocate the existing stroke to Line_0 before the
+    // polygon logic below decides on its own nodes' naming.
     if (node.type === "Line2D" && elem.polygons && elem.polygons.length > 0) {
         _demoteLine2DToNode2D(node, variantPathStr, anim);
     }
@@ -2231,7 +2242,7 @@ function _processElementNode(elem, parent, ownerRoot, anim, startTime, duration,
     var boundsX = 0.0, boundsY = 0.0;
     var pngWidth, pngHeight;
 
-    // --- 3. Géométrie shape : polyGroups, triangulation, gradients/textures ---
+    // --- 3. Shape geometry: polyGroups, triangulation, gradients/textures ---
     if (elem.elementType === "shape" || elem._inlineSprite) {
         var polyGroups = null;
         if (elem.polygons && elem.polygons.length > 0) {
@@ -2302,15 +2313,15 @@ function _processElementNode(elem, parent, ownerRoot, anim, startTime, duration,
                 }
             }
 
-            // NOTE : on NE force plus la démotion Polygon2D -> Node2D quand
-            // polyGroups.length > 1. Le node lui-même héberge le groupe 0
-            // (comme pour le cas single-group), les groupes suivants devenant
-            // des enfants Poly_0, Poly_1... (voir l'offset -1 juste en dessous).
-            // Ça économise 1 node Node2D par shape multi-couleurs/gradients
-            // (ex: "shape_layer_X" qui n'était qu'un conteneur vide autour de
-            // Poly_0/Poly_1). Les boucles de nettoyage des slots excédentaires
-            // (excess Poly_X et anim._maxPoly) appliquent le même offset -1
-            // pour rester cohérentes avec ce nommage.
+            // NOTE: we no longer force a Polygon2D -> Node2D demotion when
+            // polyGroups.length > 1. The node itself hosts group 0 (as in
+            // the single-group case), with the following groups becoming
+            // Poly_0, Poly_1... children (see the -1 offset right below).
+            // This saves 1 Node2D per multi-color/gradient shape (e.g.
+            // "shape_layer_X", which used to be just an empty container
+            // around Poly_0/Poly_1). The excess-slot cleanup loops (excess
+            // Poly_X and anim._maxPoly) apply the same -1 offset to stay
+            // consistent with this naming.
 
             for (var gIdx = 0; gIdx < polyGroups.length; gIdx++) {
                 var group = polyGroups[gIdx];
@@ -2457,14 +2468,13 @@ function _processElementNode(elem, parent, ownerRoot, anim, startTime, duration,
                         texIdStr = gradCache[cSig];
                     } else {
                         var gradId = "Gradient_" + nextId();
-                        // _colorFloats gère déjà exactement ce parsing hex
-                        // (#RRGGBB[AA] -> "r, g, b, a" formatés), déjà utilisée
-                        // juste en dessous pour les couleurs de gradient : même
-                        // logique, pas de duplication. Seule différence
-                        // (cosmétique, sans effet Godot) : son fallback "pas de
-                        // #" renvoie "1, 1, 1, 1" au lieu de "1.0000, 1.0000,
-                        // 1.0000, 1.0000" -- même valeur flottante, littéral
-                        // différent.
+                        // _colorFloats already handles this exact hex parsing
+                        // (#RRGGBB[AA] -> formatted "r, g, b, a"), already used
+                        // just below for gradient colors: same logic, no
+                        // duplication. Only difference (cosmetic, no effect
+                        // on Godot): its "no #" fallback returns "1, 1, 1, 1"
+                        // instead of "1.0000, 1.0000, 1.0000, 1.0000" -- same
+                        // float value, different literal.
                         var colorStr = _colorFloats(group.color);
                         
                         var gradStr = '[sub_resource type="Gradient" id="' + gradId + '"]\n';
@@ -2596,14 +2606,14 @@ function _processElementNode(elem, parent, ownerRoot, anim, startTime, duration,
             }
         }
 
-        // --- 5. Traits (strokes) -> Line2D -------------------------------
+        // --- 5. Strokes -> Line2D -----------------------------------------
         var hasStrokes = elem.strokes && elem.strokes.length > 0;
         if (hasStrokes && (elem.elementType === "shape" || elem._inlineSprite)) {
-            // Démotion symétrique du cas Polygon2D/Poly_N ci-dessus : cette
-            // occurrence poolée avait été créée en Line2D direct (1 seul trait
-            // sur son premier keyframe), mais un keyframe ultérieur a besoin de
-            // plusieurs traits. On convertit le wrapper en Node2D et on déplace
-            // ses propriétés/anim tracks existantes vers un enfant Line_0.
+            // Symmetric demotion of the Polygon2D/Poly_N case above: this
+            // pooled occurrence had been created as a direct Line2D (a
+            // single stroke on its first keyframe), but a later keyframe
+            // needs several strokes. Convert the wrapper to Node2D and
+            // move its existing properties/anim tracks to a Line_0 child.
             if (elem.strokes.length > 1 && node.type === "Line2D") {
                 _demoteLine2DToNode2D(node, variantPathStr, anim);
             }
@@ -2662,23 +2672,23 @@ function _processElementNode(elem, parent, ownerRoot, anim, startTime, duration,
             
         }
 
-        // --- 6. Nettoyage des slots Poly_X/Line_X excédentaires ---------
-        // Reset INCONDITIONNEL des slots Poly_X / Line_X non utilisés par
-        // ce keyframe. Avant fix, ces deux boucles étaient imbriquées dans
-        // `if (elem.polygons.length > 0)` et `if (hasStrokes)` respectivement,
-        // donc une keyframe avec 0 polygones ne nettoyait pas les Poly_X
-        // hérités d'une keyframe précédente (idem pour 0 strokes / Line_X).
-        // Résultat dans star : shape_1 (3 polys + 0 strokes en Flash) montrait
-        // 2 lines fantômes héritées de fatig ; shape_3 (0 polys + 2 strokes)
-        // montrait 1 polygone fantôme. Ces boucles DOIVENT tourner même
-        // quand le compte courant est 0, sinon les slots gardent leur état
-        // précédent. C'est exactement le comportement Flash : à chaque
-        // keyframe, seuls les éléments présents dans ce keyframe sont
-        // dessinés ; tout le reste est vide.
-        // Les deux boucles (Poly_X/Polygon2D et Line_X/Line2D) sont
-        // identiques à un paramétrage près -- factorisées dans
-        // _clearExcessNamedSlots (mêmes valeurs de reset utilisées à
-        // l'identique côté track animée et côté propriété statique).
+        // --- 6. Cleanup of excess Poly_X/Line_X slots ---------------------
+        // UNCONDITIONAL reset of Poly_X / Line_X slots not used by this
+        // keyframe. Before the fix, these two loops were nested inside
+        // `if (elem.polygons.length > 0)` and `if (hasStrokes)`
+        // respectively, so a keyframe with 0 polygons didn't clean up the
+        // Poly_X inherited from a previous keyframe (same for 0 strokes /
+        // Line_X). Result in star: shape_1 (3 polys + 0 strokes in Flash)
+        // showed 2 ghost lines inherited from fatig; shape_3 (0 polys + 2
+        // strokes) showed 1 ghost polygon. These loops MUST run even when
+        // the current count is 0, otherwise the slots keep their previous
+        // state. This is exactly Flash's behavior: on every keyframe, only
+        // the elements present in that keyframe are drawn; everything else
+        // is empty.
+        // The two loops (Poly_X/Polygon2D and Line_X/Line2D) are identical
+        // apart from their parameters -- factored into _clearExcessNamedSlots
+        // (the exact same reset values used identically on the animated-track
+        // side and the static-property side).
         // ----------------------------------------------------------------
         var polyCount = polyGroups ? polyGroups.length : 0;
         var useAnimForSlots = !(isStaticLayer && !elem._isTweenShape);
@@ -2696,7 +2706,7 @@ function _processElementNode(elem, parent, ownerRoot, anim, startTime, duration,
         ]);
     }
 
-    // --- 7. Tracks visible/process_mode ---------------------------------
+    // --- 7. visible/process_mode tracks -----------------------------------
     var vis = elem.visible !== undefined ? elem.visible : true;
     var pathVis = variantPathStr + ":visible";
     var pathProc = variantPathStr + ":process_mode";
@@ -2714,12 +2724,12 @@ function _processElementNode(elem, parent, ownerRoot, anim, startTime, duration,
         anim.addTrackKey(pathProc, "value", startTime + duration, 4, 0.0);
     }
 
-    // --- 8. Transform (position/rotation/scale/skew) --------------------
-    // Décomposition de la matrice calculée une seule fois (au lieu de deux
-    // fois avec les mêmes arguments) : elle alimente à la fois les valeurs
-    // initiales du wrapper (bloc isNewWrapper juste en dessous) et la clé
-    // d'animation à startTime (bloc "else if (elem.matrix)" plus bas) —
-    // les deux utilisent exactement la même elem.matrix.
+    // --- 8. Transform (position/rotation/scale/skew) ----------------------
+    // Matrix decomposition computed once (instead of twice with the same
+    // arguments): it feeds both the wrapper's initial values (the
+    // isNewWrapper block right below) and the animation key at startTime
+    // (the "else if (elem.matrix)" block further down) — both use the
+    // exact same elem.matrix.
     var _matDec = elem.matrix ? _decomposeMatrix(elem.matrix, elem) : null;
 
     if (isNewWrapper && elem.matrix) {
@@ -2807,7 +2817,7 @@ function _processElementNode(elem, parent, ownerRoot, anim, startTime, duration,
         }
     }
 
-    // --- 9. Color transform : shader (Advanced Color Effect) ou modulate ---
+    // --- 9. Color transform: shader (Advanced Color Effect) or plain modulate ---
     var ctn = _extractColorTransform(elem.colorTransform);
 
     var r_pct = ctn.rP, g_pct = ctn.gP, b_pct = ctn.bP, a_pct = ctn.aP;
@@ -2863,21 +2873,20 @@ function _processElementNode(elem, parent, ownerRoot, anim, startTime, duration,
     }
 }
 
-// Parcourt récursivement l'arbre et, pour chaque node dont les enfants
-// contiennent un mélange de Polygon2D et Line2D, réordonne les enfants pour
-// que tous les Polygon2D viennent avant tous les Line2D. L'ordre relatif au
-// sein de chaque type est préservé (= ordre de création lazy à travers les
-// keyframes, identique à l'ordre des slots Poly_0..N et Line_0..M). Autres
-// types de nodes (s'il y en a) restent à leur position d'origine relative
-// avant la section Polys.
+// Recursively walks the tree and, for each node whose children mix
+// Polygon2D and Line2D, reorders the children so that all Polygon2D come
+// before all Line2D. The relative order within each type is preserved
+// (= lazy creation order across keyframes, identical to the Poly_0..N and
+// Line_0..M slot order). Other node types (if any) stay at their original
+// relative position before the Polys section.
 function _reorderShapePolysAndLines(node, isTopLevel) {
     if (!node) return;
     var children = node.children;
-    // On ne regroupe jamais les enfants directs du nœud racine passé en
-    // entrée : ce sont des formes/objets indépendants les uns des autres
-    // (chacun avec son propre ordre de z voulu), pas les slots Poly_N/Line_N
-    // d'une seule et même forme décomposée. Le regroupement n'a de sens que
-    // pour les enfants d'un wrapper de forme (cf. appel récursif plus bas).
+    // Never group the direct children of the root node passed in: these
+    // are shapes/objects independent of one another (each with its own
+    // intended z-order), not the Poly_N/Line_N slots of a single
+    // decomposed shape. Grouping only makes sense for the children of a
+    // shape wrapper (see the recursive call further down).
     if (!isTopLevel && children && children.length > 1) {
         var hasPoly = false, hasLine = false;
         for (var i = 0; i < children.length; i++) {
@@ -2908,9 +2917,9 @@ function buildSceneForSymbol(sym, frameRate, exportDir, boundsLookup, boundsInde
     var extResources = [];
     var extIdMap = {};
     var subResources = [];
-    // Cache de déduplication des ressources Gradient/GradientTexture, scopé à
-    // CE fichier .tscn (un appel = un fichier de sortie). Voir le commentaire
-    // dans _processElementNode pour le détail de l'optimisation.
+    // Deduplication cache for Gradient/GradientTexture resources, scoped to
+    // THIS .tscn file (one call = one output file). See the comment in
+    // _processElementNode for the optimization details.
     var gradCache = {};
 
     function getExt(path, type) {
@@ -2937,14 +2946,14 @@ function buildSceneForSymbol(sym, frameRate, exportDir, boundsLookup, boundsInde
         bg.properties["mouse_filter"] = 2;
         root.addChild(bg);
     } else if (skipEnablerFor && skipEnablerFor[sym.name]) {
-        // v4.15 : ce symbole n'est instancié QUE comme enfant d'autres
-        // symboles (jamais placé directement par la scène principale) --
-        // l'ancêtre animé qui l'instancie porte déjà son propre
-        // VisibleOnScreenEnabler2D, qui désactive via process_mode TOUT le
-        // sous-arbre (donc aussi l'AnimationPlayer de ce symbole) quand il
-        // sort de l'écran. Un enabler ici serait redondant : -1 node par
-        // instanciation, sans perte de culling réel. Voir le calcul de
-        // `referencedBy`/`skipEnablerFor` dans l'appelant.
+        // v4.15: this symbol is ONLY ever instanced as a child of other
+        // symbols (never placed directly by the main scene) -- the
+        // animated ancestor that instances it already carries its own
+        // VisibleOnScreenEnabler2D, which disables its ENTIRE subtree via
+        // process_mode (so also this symbol's AnimationPlayer) when it
+        // leaves the screen. An enabler here would be redundant: -1 node
+        // per instantiation, with no real loss of culling. See the
+        // `referencedBy`/`skipEnablerFor` computation in the caller.
     } else {
         var localScaleFactor = 4.166667;
         var minX = 999999, maxX = -999999, minY = 999999, maxY = -999999;
@@ -2984,15 +2993,15 @@ function buildSceneForSymbol(sym, frameRate, exportDir, boundsLookup, boundsInde
                 }
             }
         }
-        // v4.14-fix : le rect DOIT couvrir la vraie étendue du contenu (pas
-        // juste son centre dans une boîte fixe 20x20 comme avant v4.13) :
-        // sinon le node sort/rentre du champ de détection à chaque frame
-        // dès que l'animation bouge un peu, ce qui déclenche un thrashing
-        // enable/disable permanent -- pire pour les perfs (pics de
-        // "Processus") que l'absence totale d'enabler. Marge généreuse
-        // (50% de la taille de la bbox, mini 100px) pour absorber le
-        // débattement typique d'une animation (position/rotation/scale)
-        // qui n'est calculée QUE sur la frame 0 ici.
+        // v4.14-fix: the rect MUST cover the content's real extent (not
+        // just its center in a fixed 20x20 box like before v4.13):
+        // otherwise the node exits/re-enters the detection field on every
+        // frame as soon as the animation moves a bit, triggering permanent
+        // enable/disable thrashing -- worse for performance ("Process"
+        // spikes) than having no enabler at all. Generous margin (50% of
+        // the bbox size, 100px minimum) to absorb the typical movement of
+        // an animation (position/rotation/scale) that this bbox, computed
+        // ONLY from frame 0, doesn't capture.
         var enabler = new GNode("VisibilityEnabler", "VisibleOnScreenEnabler2D");
         if (hasBounds && minX <= maxX) {
             var bx0 = minX * localScaleFactor, by0 = minY * localScaleFactor;
@@ -3002,8 +3011,8 @@ function buildSceneForSymbol(sym, frameRate, exportDir, boundsLookup, boundsInde
             enabler.properties["rect"] = "Rect2(" + _f(bx0 - padX) + ", " + _f(by0 - padY) + ", "
                 + _f(bw + padX * 2) + ", " + _f(bh + padY * 2) + ")";
         } else {
-            // Pas de bounds calculables (frame 0 vide) : grand rect de
-            // secours plutôt que le minuscule 20x20 d'origine.
+            // No computable bounds (empty frame 0): a large fallback rect
+            // instead of the original tiny 20x20.
             enabler.properties["rect"] = "Rect2(-200, -200, 400, 400)";
         }
         root.addChild(enabler);
@@ -3162,7 +3171,7 @@ function buildSceneForSymbol(sym, frameRate, exportDir, boundsLookup, boundsInde
                 var conflict = false;
                 for (var j = 0; j < wrapperObj.spans.length; j++) {
                     var span = wrapperObj.spans[j];
-                    // Tolérance de 0.0001 pour les erreurs d'arrondi
+                    // 0.0001 tolerance for rounding errors
                     if (!(startF >= span.end - 0.0001 || endF <= span.start + 0.0001)) {
                         conflict = true;
                         break;
@@ -3391,9 +3400,9 @@ function buildSceneForSymbol(sym, frameRate, exportDir, boundsLookup, boundsInde
 
         if (isSingleFrame) {
             root.removeChild(animPlayer);
-            // Rien à mettre en pause hors-écran : la shape est statique, le
-            // culling de RENDU est déjà géré nativement par Godot. Voir
-            // création de l'enabler plus haut.
+            // Nothing to pause off-screen: the shape is static, RENDERING
+            // culling is already handled natively by Godot. See enabler
+            // creation further above.
             if (enabler) root.removeChild(enabler);
         } else {
             var libId = "lib_" + nextId();
@@ -3420,9 +3429,9 @@ function buildSceneForSymbol(sym, frameRate, exportDir, boundsLookup, boundsInde
                 if (sorted[0].time > 0.001) sorted.unshift({name: "default", time: 0.0});
                 firstLabel = _sanitize_name(sorted[0].name);
 
-                // "Que RESET + default" peut aussi arriver ici si le seul label
-                // Flash présent s'appelle littéralement "default" et démarre à
-                // t=0 (pas d'unshift synthétique, sorted.length === 1).
+                // "RESET + default only" can also happen here if the only
+                // Flash label present is literally called "default" and
+                // starts at t=0 (no synthetic unshift, sorted.length === 1).
                 var onlyDefaultLabel = (sorted.length === 1 && _sanitize_name(sorted[0].name) === "default");
 
                 for (var i = 0; i < sorted.length; i++) {
@@ -3442,10 +3451,10 @@ function buildSceneForSymbol(sym, frameRate, exportDir, boundsLookup, boundsInde
             } else {
                 var aId = "anim_" + nextId();
                 var slicedDefault = _sliceAnimation(anim, 0.0, maxTime, true);
-                // Bibliothèque réduite à RESET + default : rien d'autre à
-                // enchaîner, donc "default" boucle nativement au lieu de
-                // s'arrêter à la dernière frame (évite d'avoir à gérer le
-                // rebouclage à la main côté gameplay pour ce cas simple).
+                // Library reduced to RESET + default: nothing else to
+                // chain into, so "default" loops natively instead of
+                // stopping at the last frame (avoids having to handle
+                // looping by hand on the gameplay side for this simple case).
                 var isLooping = !hasStop;
                 subResources.push('[sub_resource type="Animation" id="' + aId + '"]'
                     + (isLooping ? '\nloop_mode = 1' : '')
@@ -3476,17 +3485,16 @@ function buildSceneForSymbol(sym, frameRate, exportDir, boundsLookup, boundsInde
     _mergeSameColorSiblings(root);
 
     // ----------------------------------------------------------------
-    // Réordonner les enfants des nodes `shape` pour que tous les Polygon2D
-    // précèdent tous les Line2D. Sans ça, l'ordre dans la scène Godot est
-    // l'ordre de CRÉATION lazy à travers les keyframes (ex: Line_0, Poly_0,
-    // Line_1, Poly_1, ...), ce qui place certaines lines DERRIÈRE des
-    // polygons. En Flash, les strokes sont dessinés PAR-DESSUS les fills
-    // d'une même shape ; Godot dessine les enfants dans leur ordre de
-    // déclaration (du fond vers le devant), donc placer tous les Poly_X
-    // avant tous les Line_X reproduit le comportement Flash.
-    // Ex symptôme : ayeur, `Line_1` était derrière `Poly_2` et `Poly_4`
-    // parce que `Line_1` avait été créé avant `Poly_2`/`Poly_4` lors du
-    // traitement d'une keyframe antérieure.
+    // Reorder the children of `shape` nodes so that all Polygon2D come
+    // before all Line2D. Without this, the order in the Godot scene is the
+    // lazy CREATION order across keyframes (e.g. Line_0, Poly_0, Line_1,
+    // Poly_1, ...), which places some lines BEHIND some polygons. In Flash,
+    // strokes are drawn ON TOP OF fills within the same shape; Godot draws
+    // children in their declaration order (back to front), so placing all
+    // Poly_X before all Line_X reproduces Flash's behavior.
+    // Ex symptom: in one asset, `Line_1` was behind `Poly_2` and `Poly_4`
+    // because `Line_1` had been created before `Poly_2`/`Poly_4` while
+    // processing an earlier keyframe.
     // ----------------------------------------------------------------
     _reorderShapePolysAndLines(root, true);
 
@@ -3723,9 +3731,9 @@ function buildGodotScenes(doc, data, exportDir) {
     }
     // Pre-build prefix index: group keys by their baseNoSpace prefix
     // (everything before _SHAPE_, _BOUNDS_, or _OFFSET_) for O(1) lookup.
-    // Clés préfixées par "$" : un symbole/calque dont le nom sanitisé
-    // composerait littéralement "constructor"/"toString"/etc. donnerait
-    // sinon un faux résultat via les propriétés héritées d'Object.
+    // Keys prefixed with "$": a symbol/layer whose sanitized name would
+    // literally compose "constructor"/"toString"/etc. would otherwise give
+    // a false result via Object's inherited properties.
     var boundsIndex = {};
     for (var fn in boundsLookup) {
         var sp = fn.indexOf("_SHAPE_");
@@ -3752,16 +3760,16 @@ function buildGodotScenes(doc, data, exportDir) {
         symbolMap[data.library.symbols[i].name] = data.library.symbols[i];
     }
 
-    // Propagation "ce symbole a besoin d'un shader" (couleur/blend non triviaux,
-    // ou il instancie un symbole qui en a lui-meme besoin). C'est un point fixe
-    // MONOTONE (un symbole marque le reste pour toujours) : le resultat final
-    // est unique quel que soit l'ordre/la strategie de propagation utilisee.
-    // Au lieu de rebalayer TOUTE la bibliotheque a chaque iteration jusqu'a
-    // stabilisation (couteux sur les hierarchies de symboles imbriquees), on
-    // calcule en un seul passage (a) le besoin direct de chaque symbole et
-    // (b) le graphe inverse "quels symboles instancient ce symbole", puis on
-    // propage par worklist. Resultat mathematiquement identique, complexite
-    // O(elements + symboles) au lieu de O(passes * elements).
+    // Propagation of "this symbol needs a shader" (non-trivial color/blend,
+    // or it instances a symbol that itself needs one). This is a MONOTONE
+    // fixed point (a symbol marks the rest forever): the final result is
+    // unique regardless of the order/strategy used for propagation.
+    // Instead of re-scanning the WHOLE library on every iteration until
+    // stabilization (expensive on nested symbol hierarchies), we compute in
+    // a single pass (a) each symbol's direct need and (b) the reverse graph
+    // "which symbols instance this symbol", then propagate via worklist.
+    // Mathematically identical result, O(elements + symbols) complexity
+    // instead of O(passes * elements).
     var symbolContainsShader = {};
     var directHasShader = {};
     var referencedBy = {};
@@ -3817,20 +3825,19 @@ function buildGodotScenes(doc, data, exportDir) {
         }
     }
 
-    // v4.15 : un symbole qui n'est JAMAIS placé directement par la scène
-    // principale, et qui est TOUJOURS instancié comme enfant d'au moins un
-    // autre symbole, n'a pas besoin de son propre VisibleOnScreenEnabler2D
-    // -- l'ancêtre qui l'instancie désactive déjà tout son sous-arbre via
-    // process_mode quand il sort de l'écran, donc aussi l'AnimationPlayer
-    // de ce symbole (voir la création de l'enabler dans buildSceneForSymbol).
-    // Réutilise le graphe `referencedBy` déjà calculé ci-dessus pour le
-    // worklist shader.
-    // Limite acceptée : si TOUS les parents d'un symbole s'avèrent
-    // eux-mêmes non-animés (single-frame, donc sans enabler propre), ce
-    // symbole perd son culling individuel pour rien -- cas marginal en
-    // pratique (avoir plusieurs frames d'animation interne, condition pour
-    // porter son propre enabler, implique presque toujours un parent
-    // lui-même animé).
+    // v4.15: a symbol that is NEVER placed directly by the main scene, and
+    // is ALWAYS instanced as a child of at least one other symbol, doesn't
+    // need its own VisibleOnScreenEnabler2D -- the ancestor that instances
+    // it already disables its whole subtree via process_mode when it goes
+    // off-screen, including this symbol's AnimationPlayer (see the enabler
+    // creation in buildSceneForSymbol). Reuses the `referencedBy` graph
+    // already computed above for the shader worklist.
+    // Accepted limitation: if ALL of a symbol's parents turn out to be
+    // non-animated themselves (single-frame, so without their own enabler),
+    // that symbol loses its individual culling for nothing -- a marginal
+    // case in practice (having several internal animation frames, the
+    // condition for carrying its own enabler, almost always implies a
+    // parent that is itself animated).
     var mainSceneUsesSymbol = {};
     var _mainScene = data.scenes[0];
     if (_mainScene && _mainScene.layers) {

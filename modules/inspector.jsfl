@@ -1,71 +1,75 @@
 /**
- * SWF/FLA Inspector -> Export JSON (version étendue)
- * Script JSFL pour Adobe Animate / Flash Professional
+ * SWF/FLA Inspector -> JSON Export (extended version)
+ * JSFL script for Adobe Animate / Flash Professional
  *
- * v4.1 - Grouping trous restreint aux cas où ça compte vraiment :
- *   - Filtre winding opposé : un VRAI trou Flash a un signed area de signe
- *     opposé à son outer (convention even-odd). Sans ce check on groupait
- *     des fills superposés du même fillKey comme s'ils étaient des trous.
- *   - Filtre opacité : pour les fills opaques (alpha=255, pas de gradient),
- *     outer + hole superposés donnent visuellement la même chose que l'outer
- *     seul, donc le bridge n'apporte rien et n'introduit que du risque earcut
- *     côté Godot. On laisse les sous-contours en polys séparés -> rendu
- *     identique, zéro risque. Le bridge n'est appliqué QUE sur fills
- *     transparents (où le compositing alpha rendrait le bridge nécessaire
- *     pour ne pas doubler l'opacité dans la zone du trou).
- *   - Filtre dégénérescence : aire < 1 u² rejetée (ghosts Flash 3-sommets
- *     quasi-colinéaires qui polluaient le bridge avec dizaines de faux trous).
+ * v4.1 - Hole grouping restricted to cases where it actually matters:
+ *   - Opposite-winding filter: a REAL Flash hole has a signed area of
+ *     opposite sign to its outer (even-odd convention). Without this check
+ *     we were grouping overlapping fills of the same fillKey as if they
+ *     were holes.
+ *   - Opacity filter: for opaque fills (alpha=255, no gradient), an
+ *     overlapping outer + hole look visually the same as the outer alone,
+ *     so the bridge adds nothing and only introduces earcut risk on the
+ *     Godot side. We leave the sub-contours as separate polys -> identical
+ *     rendering, zero risk. The bridge is applied ONLY to transparent
+ *     fills (where alpha compositing would make the bridge necessary to
+ *     avoid doubling the opacity in the hole area).
+ *   - Degeneracy filter: area < 1 u² rejected (near-collinear 3-vertex
+ *     Flash ghosts that were polluting the bridge with dozens of fake
+ *     holes).
  *
- * v4 - Détection des trous (holes) :
- *   - Nouveau post-traitement `_groupPolygonsWithHoles` après collecte des contours.
- *     Les polygones d'un même fill (couleur ou gradient identique) sont regroupés
- *     en relations outer -> holes via :
- *       1. tri par aire décroissante (le plus grand = outer candidat),
- *       2. test de bbox containment (cheap prefilter),
- *       3. test point-in-polygon sur centroïde + premier sommet du candidat hole.
- *     Sortie : `{ vertices: <outer>, holes: [[...], ...], color, gradient }`.
- *     Désactivé pour les shape tweens (topologie qui peut changer entre frames).
- *   - Le builder Godot exploite `holes` via la technique du bridge / keyhole pour
- *     produire UN SEUL Polygon2D au lieu de N nodes empilés.
+ * v4 - Hole detection:
+ *   - New `_groupPolygonsWithHoles` post-processing step after collecting
+ *     contours. Polygons sharing the same fill (identical color or
+ *     gradient) are grouped into outer -> holes relationships via:
+ *       1. sort by descending area (the biggest = candidate outer),
+ *       2. bbox containment test (cheap prefilter),
+ *       3. point-in-polygon test on the candidate hole's centroid + first
+ *          vertex.
+ *     Output: `{ vertices: <outer>, holes: [[...], ...], color, gradient }`.
+ *     Disabled for shape tweens (topology can change between frames).
+ *   - The Godot builder uses `holes` via the bridge/keyhole technique to
+ *     produce A SINGLE Polygon2D instead of N stacked nodes.
  *
- * v3 - Suppression du fragmentage des polygones :
- *   - PLUS de _splitPolys : un contour Flash = un polygone, point.
- *     Le splitter recursif découpait à la moindre auto-intersection
- *     détectée (souvent fausse, due aux erreurs de discrétisation),
- *     ce qui produisait des centaines de fragments par scène et,
- *     pire, des morceaux toujours auto-intersectants quand le split
- *     échouait (limite de profondeur, seuil de 0.5 px ignoré sur les
- *     intersections quasi-tangentes). On laisse maintenant chaque
- *     contour intact -> Polygon2D fidèle à la forme Flash.
- *   - Helpers _ccw, _intersect, _getIntersection, _splitPolys retirés.
+ * v3 - Removed polygon fragmentation:
+ *   - NO MORE _splitPolys: one Flash contour = one polygon, period. The
+ *     recursive splitter would cut at the slightest detected
+ *     self-intersection (often a false positive from discretization
+ *     error), producing hundreds of fragments per scene and, worse,
+ *     pieces that were STILL self-intersecting when the split failed
+ *     (depth limit, 0.5px threshold ignored on near-tangent
+ *     intersections). Every contour is now kept intact -> a Polygon2D
+ *     faithful to the Flash shape.
+ *   - Removed the _ccw, _intersect, _getIntersection, _splitPolys
+ *     helpers.
  *
- * v2 - Correction des polygones :
- *   - Remplace l'échantillonnage linéaire des courbes Bézier (pas fixe ~5 px,
- *     plafond 100 étapes) par une SUBDIVISION ADAPTATIVE DE CASTELJAU basée
- *     sur la planéité (perpendiculaire du point de contrôle à la corde).
- *     Tolérance de 0.05 px, profondeur max 18 -> les polygones suivent
- *     exactement les courbes Flash.
- *   - Détection de direction de la courbe simplifiée et fiable
- *     (comparaison directe des extrémités au sommet de début).
- *   - Suppression de _getT (recherche numérique imprécise) et nettoyage
- *     du code mort qui en dépendait.
- *   - Seuil de déduplication des sommets resserré (0.0001 au carré ≈ 0.01 px)
- *     pour ne supprimer que les vrais doublons.
- *   - MAX_EDGES porté à 10000 pour les contours très complexes.
+ * v2 - Polygon fixes:
+ *   - Replaces linear sampling of Bézier curves (fixed ~5px step,
+ *     100-step cap) with ADAPTIVE CASTELJAU SUBDIVISION based on
+ *     flatness (perpendicular distance from the control point to the
+ *     chord). 0.05px tolerance, 18 max depth -> polygons follow Flash
+ *     curves exactly.
+ *   - Simplified and reliable curve-direction detection (direct
+ *     comparison of the endpoints to the starting vertex).
+ *   - Removed _getT (imprecise numeric search) and cleaned up the dead
+ *     code that depended on it.
+ *   - Tightened the vertex deduplication threshold (0.0001 squared ≈
+ *     0.01px) to only remove true duplicates.
+ *   - MAX_EDGES raised to 10000 for very complex contours.
  *
- * Ajouts par rapport à la version initiale (rappel) :
- *  - Tweens (motion, shape, motion object) + easing custom
- *  - Frame scripts (actionScript) et label type
- *  - Sons sur image
- *  - Transformation de couleur (RGB + alpha + brightness + tint)
+ * Additions relative to the initial version (reminder):
+ *  - Tweens (motion, shape, motion object) + custom easing
+ *  - Frame scripts (actionScript) and label type
+ *  - Frame sounds
+ *  - Color transform (RGB + alpha + brightness + tint)
  *  - blendMode, cacheAsBitmap, 3D, instanceType, symbolType, loop graphic
- *  - text.textRuns + props avancé (lineType, anti-alias, etc.)
- *  - Shape elements (primitives rect/oval, drawing object, contour count)
- *  - Layer : locked/visible/outline/color/heightMultiplier/parentLayer
- *  - Library : bitmap (hPixels/vPixels/compression), sound (bits/sampleRate),
+ *  - text.textRuns + advanced props (lineType, anti-alias, etc.)
+ *  - Shape elements (rect/oval primitives, drawing object, contour count)
+ *  - Layer: locked/visible/outline/color/heightMultiplier/parentLayer
+ *  - Library: bitmap (hPixels/vPixels/compression), sound (bits/sampleRate),
  *    video (fps/frameCount), symbol (scalingGrid/sourceFilePath)
- *  - Document : backgroundColor, asVersion, docClass
- *  - Accessibilité, transformX/transformY, locked sur element
+ *  - Document: backgroundColor, asVersion, docClass
+ *  - Accessibility, transformX/transformY, locked on element
  */
 
 
@@ -193,10 +197,10 @@ function getColorTransform(el) {
 }
 
 // -----------------------------------------------------------------------------
-// SUBDIVISION ADAPTATIVE DE CASTELJAU POUR COURBES BEZIER QUADRATIQUES
-// Subdivise une Bézier quadratique avec un pas fixe pour garantir une symétrie parfaite
-// des cercles. L'approche adaptative de Casteljau générait des polygones légèrement
-// asymétriques à cause des arrondis flottants.
+// ADAPTIVE CASTELJAU SUBDIVISION FOR QUADRATIC BEZIER CURVES
+// Subdivides a quadratic Bézier with a fixed step to guarantee perfectly
+// symmetric circles. The adaptive Casteljau approach produced slightly
+// asymmetric polygons because of floating-point rounding.
 function _subdivideQuadratic(p1, p2, p3, outPoints, depth) {
     var dx1 = p2.x - p1.x;
     var dy1 = p2.y - p1.y;
@@ -204,12 +208,12 @@ function _subdivideQuadratic(p1, p2, p3, outPoints, depth) {
     var dy2 = p3.y - p2.y;
     var len = Math.sqrt(dx1*dx1 + dy1*dy1) + Math.sqrt(dx2*dx2 + dy2*dy2);
     // =========================================================
-    // RÉGLAGE DE LA QUALITÉ DES COURBES (Nombre de sommets)
-    // Changez cette valeur pour ajuster les performances/visuels.
-    // "High"   : Très rond, beaucoup de sommets (1 pt / 1.5 px)
-    // "Medium" : Équilibre performance/visuel (1 pt / 3 px)
-    // "Low"    : Optimisé, formes légèrement polygonales (1 pt / 10 px)
-    // "VeryLow": Ultra optimisé pour mobile/web (1 pt / 30 px)
+    // CURVE QUALITY SETTING (vertex count)
+    // Change this value to tune performance/visuals.
+    // "High"   : Very round, lots of vertices (1 pt / 1.5 px)
+    // "Medium" : Performance/visual balance (1 pt / 3 px)
+    // "Low"    : Optimized, slightly polygonal shapes (1 pt / 10 px)
+    // "VeryLow": Ultra-optimized for mobile/web (1 pt / 30 px)
     // =========================================================
     var CURVE_QUALITY = "Medium"; 
     
@@ -225,8 +229,8 @@ function _subdivideQuadratic(p1, p2, p3, outPoints, depth) {
     if (!isFinite(steps) || isNaN(steps)) steps = 3;
     if (steps > 100) steps = 100; // Limit max subdivision per curve to prevent memory/cpu freeze
     
-    // Minimum vital pour qu'une courbe existe (3 pas = 1 point au milieu).
-    // Si on descend en dessous de 3, les courbes deviennent des lignes droites.
+    // Vital minimum for a curve to exist (3 steps = 1 point in the middle).
+    // Going below 3 turns curves into straight lines.
     if (steps < 3) steps = 3;
     
     for (var i = 1; i <= steps; i++) {
@@ -346,13 +350,13 @@ function parseXML(xmlStr) {
         if (src.charAt(i) === ">") i++;
 
         var children = [];
-        // Accumulation en tableau + un seul join() final, plutôt que
-        // `text += ...` caractère par caractère : ExtendScript (contrairement
-        // aux moteurs JS modernes qui optimisent la concaténation via des
-        // structures en corde) copie la string entière à chaque `+=`, donc
-        // O(n²) sur un texte de n caractères accumulé un par un. Le run de
-        // texte "plat" (hors balises) est en plus extrait en UN SEUL
-        // substring() par run plutôt qu'un charAt()+push() par caractère.
+        // Array accumulation + a single final join(), rather than
+        // `text += ...` character by character: ExtendScript (unlike
+        // modern JS engines that optimize concatenation via rope
+        // structures) copies the whole string on every `+=`, so O(n²) for
+        // n characters of text accumulated one at a time. Each "flat" text
+        // run (outside tags) is also extracted with a SINGLE substring()
+        // call per run instead of a charAt()+push() per character.
         var textParts = [];
 
         while (i < n) {
@@ -394,33 +398,35 @@ function parseXML(xmlStr) {
 }
 
 
-// Détecte les paires de polygones qui sont LE MÊME contour exporté deux fois
-// (mêmes vertices) mais avec des windings OPPOSÉS, et garde seulement celui
-// en CCW (signedArea > 0).
+// Detects pairs of polygons that are THE SAME contour exported twice (same
+// vertices) but with OPPOSITE windings, and keeps only the CCW one
+// (signedArea > 0).
 //
-// Origine : en Flash, un edge a fillStyle1 d'un côté et fillStyle2 de l'autre.
-// Quand les deux côtés ont des fills différents (ex: noir d'un côté, blanc de
-// l'autre), Flash extrait UN seul edge en DEUX contours superposés parcourus
-// en sens opposé. Le CCW porte la fill du côté "intérieur" (= la couleur
-// réellement visible au-dessus de cet edge), le CW porte la fill du côté
-// "extérieur" (= la couleur déjà fournie par le shape englobant : sclera
-// blanche, iris noir, etc).
+// Origin: in Flash, an edge has fillStyle1 on one side and fillStyle2 on
+// the other. When the two sides have different fills (e.g. black on one
+// side, white on the other), Flash extracts a SINGLE edge as TWO
+// overlapping contours traversed in opposite directions. The CCW one
+// carries the fill of the "inner" side (= the color actually visible on
+// top of that edge), the CW one carries the fill of the "outer" side (=
+// the color already provided by the enclosing shape: white sclera, black
+// iris, etc).
 //
-// Sans ce fix, on exporte les deux comme polygones distincts à exactement la
-// même position. Le poly du dessus écrase l'autre selon l'ordre des children
-// dans la scene Godot — d'où des symptômes "le mauvais côté est visible"
-// (ex: vener Layer_4/shape_0 où le contour blanc Poly_6 du côté extérieur
-// de l'iris recouvrait l'iris noir Poly_5 et donnait un iris blanc).
+// Without this fix, both get exported as distinct polygons at the exact
+// same position. The poly on top overwrites the other depending on the
+// children order in the Godot scene — hence "wrong side is visible"
+// symptoms (e.g. vener Layer_4/shape_0, where the white Poly_6 contour on
+// the iris's outer side covered the black iris Poly_5, resulting in a
+// white iris).
 //
-// Le CCW est gardé car il représente la fill "in-place" de ce edge. Le CW est
-// redondant : son contenu sera dessiné par le polygone englobant qui partage
-// déjà cet edge sur son périmètre.
+// The CCW one is kept because it represents the "in-place" fill of that
+// edge. The CW one is redundant: its content will be drawn by the
+// enclosing polygon, which already shares that edge on its perimeter.
 function _removeOppositeWindingDuplicates(polys) {
     if (polys.length < 2) return polys;
 
-    // Index par "clé géométrique" = vertices triés + arrondis. Permet de
-    // matcher deux polygones qui ont les MÊMES vertices mais éventuellement
-    // énumérés à partir d'un point de départ différent et/ou en sens opposé.
+    // Index by "geometric key" = sorted + rounded vertices. Allows matching
+    // two polygons that have the SAME vertices but possibly enumerated
+    // starting from a different point and/or in the opposite direction.
     function _geomKey(verts) {
         var pts = [];
         for (var i = 0; i < verts.length; i++) {
@@ -453,9 +459,9 @@ function _removeOppositeWindingDuplicates(polys) {
         if (!byKey.hasOwnProperty(k)) continue;
         var group = byKey[k];
         if (group.length < 2) continue;
-        // Cherche une paire CCW (sa > 0) + CW (sa < 0). Si trouvée, on droppe
-        // les CW. On ne touche RIEN si toutes les entrées sont du même sens
-        // (cas dégénéré ou doublon non-Flash qu'on préfère préserver).
+        // Look for a CCW (sa > 0) + CW (sa < 0) pair. If found, drop the CW
+        // ones. Touch NOTHING if all entries have the same sign (degenerate
+        // case or non-Flash duplicate we'd rather preserve).
         var hasCCW = false, hasCW = false;
         for (var g = 0; g < group.length; g++) {
             if (group[g].sa > 0.001) hasCCW = true;
@@ -502,9 +508,9 @@ function _groupPolygonsWithHoles(polys) {
         return { minX: minX, minY: minY, maxX: maxX, maxY: maxY };
     }
     /**
-     * Les vrais trous doivent toujours être "bridgés" pour devenir un Polygon2D
-     * unique dans Godot (qui n'a pas de règle even-odd native pour le remplissage
-     * de multiples polygones).
+     * Real holes must always be "bridged" to become a single Polygon2D in
+     * Godot (which has no native even-odd rule for filling multiple
+     * polygons).
      */
     function _pip(pt, verts) {
         var x = pt.x, y = pt.y;
@@ -534,17 +540,17 @@ function _groupPolygonsWithHoles(polys) {
         }
         return "C:" + (p.color || "");
     }
-    // Luminance perceptuelle d'un hex #RRGGBB (formule Rec. 601). Sert de
-    // tie-breaker quand plusieurs polygones ont la MÊME aire (typique des
-    // formes œil/iris/highlight où une zone blanche se superpose à une
-    // zone noire de même taille). Sans tie-breaker, l'ordre dépend de
-    // `el.contours[]` de Flash, qui n'est pas l'ordre de dessin et varie
-    // d'une keyframe à l'autre même pour des shapes visuellement identiques.
-    // Avec ce tie-breaker, le plus sombre est dessiné EN PREMIER (dessous),
-    // le plus clair PAR-DESSUS — convention Flash courante (highlights
-    // par-dessus). Vu sur FACES : symptôme "noir cache blanc" sur mijot
-    // shape_3 (3 polys [black, white, black]) et vener Layer_4 shape_0
-    // (paires (white, black) à même bbox).
+    // Perceptual luminance of a #RRGGBB hex color (Rec. 601 formula). Used
+    // as a tie-breaker when several polygons have the SAME area (typical of
+    // eye/iris/highlight shapes where a white area overlaps a black one of
+    // the same size). Without a tie-breaker, the order depends on Flash's
+    // `el.contours[]`, which is not the draw order and varies from one
+    // keyframe to the next even for visually identical shapes. With this
+    // tie-breaker, the darker one is drawn FIRST (underneath), the lighter
+    // one ON TOP — a common Flash convention (highlights on top). Seen on
+    // FACES: "black hides white" symptom on mijot shape_3 (3 polys [black,
+    // white, black]) and vener Layer_4 shape_0 (white/black pairs sharing a
+    // bbox).
     function _hexLightness(hex) {
         if (!hex || typeof hex !== "string" || hex.charAt(0) !== '#') return 0;
         var r = parseInt(hex.substring(1, 3), 16) / 255.0;
@@ -583,10 +589,10 @@ function _groupPolygonsWithHoles(polys) {
     var order = meta.slice();
     order.sort(function(a, b) {
         var d = b.area - a.area;
-        // Aires distinctes (à 0.01 près) : tri par aire DESC inchangé.
-        // Aires égales (cas œil/highlight) : le plus sombre passe en
-        // premier dans `order` donc dans `result` final -> dessiné dessous.
-        // Le plus clair finit en queue -> dessiné par-dessus.
+        // Distinct areas (within 0.01): sort by area DESC, unchanged.
+        // Equal areas (eye/highlight case): the darker one goes first in
+        // `order`, so first in the final `result` -> drawn underneath.
+        // The lighter one ends up last -> drawn on top.
         if (Math.abs(d) > 0.01) return d;
         return a.lightness - b.lightness;
     });
@@ -608,33 +614,34 @@ function _groupPolygonsWithHoles(polys) {
         var ob = oM.bbox;
         var holesVerts = [];
 
-        // Pour les fills opaques on saute la recherche de trous : aucune
-        // valeur ajoutée visuellement (superposition opaque = même rendu), et
-        // ça évite le risque earcut sur les bridges complexes. Cf. _isOpaque.
-        // MAIS on marque quand même les contours "trou" comme assigned pour
-        // éviter qu'ils apparaissent comme polygones redondants (ex: Poly_5 lotus).
+        // For opaque fills we skip hole detection entirely: no visual
+        // value added (opaque overlap = identical rendering), and it
+        // avoids earcut risk on complex bridges. Cf. _isOpaque. BUT we
+        // still mark "hole" contours as assigned to keep them from showing
+        // up as redundant polygons (e.g. Poly_5 lotus).
         for (var hi = 0; hi < order.length; hi++) {
             var hM = order[hi];
             if (assigned[hM.idx]) continue;
             if (hM.idx === oM.idx) continue;
             if (!hM.valid) continue;
-            // Skip ghosts dégénérés : Flash exporte souvent des contours
-            // 3-sommets quasi-colinéaires (area ~ 0) qui ne sont pas de vrais
-            // trous. Sans ce filtre on les fait bridger -> 80+ "trous" pour le
-            // moindre fill, le bridge multi-trous chie, et le safety-net jette
-            // tout. Seuil = 1 unité² couvre les artefacts sans risquer de
-            // virer un petit vrai trou (les vrais font typiquement >> 5 u²).
+            // Skip degenerate ghosts: Flash often exports near-collinear
+            // 3-vertex contours (area ~ 0) that aren't real holes. Without
+            // this filter we'd bridge them -> 80+ "holes" for the tiniest
+            // fill, the multi-hole bridge chokes, and the safety net drops
+            // everything. Threshold = 1 unit² covers the artifacts without
+            // risking dropping a small real hole (real ones are typically
+            // >> 5 u²).
             if (hM.area < 1.0) continue;
             if (hM.area >= oM.area) continue;
             if (hM.fillKey !== oM.fillKey) continue;
-            // Un VRAI trou Flash a un winding OPPOSÉ à son outer (convention
-            // even-odd : outer CCW, trou CW, ou vice-versa). Deux contours du
-            // même fillKey avec le MÊME signe d'aire sont des fills qui se
-            // superposent (effet de couches dans Flash), pas des trous. Sans
-            // ce check on bridge des polys qui ne devraient pas l'être, le
-            // résultat self-touch confuse earcut côté Godot et le polygone
-            // devient invisible. Cas typique : Rock1 où toutes les couches de
-            // shading ont sign='-' (même winding).
+            // A REAL Flash hole has a winding OPPOSITE to its outer
+            // (even-odd convention: outer CCW, hole CW, or vice versa). Two
+            // contours of the same fillKey with the SAME area sign are
+            // overlapping fills (a layering effect in Flash), not holes.
+            // Without this check we'd bridge polys that shouldn't be, the
+            // self-touching result confuses earcut on the Godot side, and
+            // the polygon becomes invisible. Typical case: Rock1, where
+            // every shading layer has sign='-' (same winding).
             if (hM.signedArea * oM.signedArea > 0) continue;
 
             var hb = hM.bbox;
@@ -664,18 +671,18 @@ function _groupPolygonsWithHoles(polys) {
             }
             if (insideExistingHole) continue;
 
-            // Vérifier si le trou est recouvert par une ou plusieurs autres formes.
+            // Check whether the hole is covered by one or more other shapes.
             var isCovered = false;
-            
-            // Si on a plus de 50 polygones au total dans le symbole, on zappe
-            // completement la verification de recouvrement (isCovered).
-            // Le calcul O(N^3) prendrait des milliards d'iterations.
+
+            // If there are more than 50 polygons in total in the symbol,
+            // skip the coverage check (isCovered) entirely. The O(N^3)
+            // computation would take billions of iterations.
             if (order.length <= 50) {
                 var cCandidates = [];
                 for (var ci = 0; ci < order.length; ci++) {
                     var cM = order[ci];
                     if (!cM.valid || cM.idx === hM.idx || cM.idx === oM.idx) continue;
-                    if (cM.signedArea * oM.signedArea > 0) { // contour plein
+                    if (cM.signedArea * oM.signedArea > 0) { // solid contour
                         if (hb.maxX >= cM.bbox.minX && hb.minX <= cM.bbox.maxX &&
                             hb.maxY >= cM.bbox.minY && hb.minY <= cM.bbox.maxY) {
                             cCandidates.push(cM);
@@ -723,9 +730,9 @@ function _groupPolygonsWithHoles(polys) {
                 continue;
             }
 
-            // C'est un vrai trou. On le passe en bridge.
-            // On a besoin du bridge même pour les formes opaques, sinon on ne verrait pas
-            // le fond à travers le trou (Godot triangulera le cercle plein).
+            // It's a real hole. Pass it to the bridge.
+            // We need the bridge even for opaque shapes, otherwise we wouldn't
+            // see the background through the hole (Godot would triangulate a solid circle).
             holesVerts.push(hVerts);
             assigned[hM.idx] = 1;
         }
@@ -743,7 +750,7 @@ function _groupPolygonsWithHoles(polys) {
     return result;
 }
 
-// Cloner un gradient sans utiliser JSON.parse (incompatible avec certaines versions de Flash)
+// Clone a gradient without using JSON.parse (incompatible with some Flash versions)
 function _cloneGradient(grad) {
     if (!grad) return undefined;
     var g = { style: grad.style, colors: [], pos: [] };
@@ -758,14 +765,14 @@ function _cloneGradient(grad) {
     return g;
 }
 
-// Extraction des sous-boucles (trous connectés par ponts zéro-largeur)
+// Extract sub-loops (holes connected by zero-width bridges)
 function _extractSubLoops(p) {
     var finalPolys = [];
     var current = [];
-    
+
     var len = p.vertices.length;
     var grid = {};
-    var cellSize = 10.0; // Cellule assez grande pour capturer 0.001
+    var cellSize = 10.0; // Cell large enough to catch 0.001
     function getCell(x, y) { return Math.floor(x/cellSize) + "_" + Math.floor(y/cellSize); }
 
     for (var i = 0; i < len; i++) {
@@ -775,17 +782,17 @@ function _extractSubLoops(p) {
         var cx = Math.floor(v.x/cellSize);
         var cy = Math.floor(v.y/cellSize);
         
-        // Chercher dans les 9 cellules adjacentes
+        // Search the 9 adjacent cells
         var found = false;
         for(var ox = -1; ox <= 1 && !found; ox++) {
             for(var oy = -1; oy <= 1 && !found; oy++) {
                 var cellKey = (cx+ox) + "_" + (cy+oy);
                 var cell = grid[cellKey];
                 if (cell) {
-                    // Parcourir à l'envers pour trouver le plus récent (bien que normalement un seul chevauche)
+                    // Walk backwards to find the most recent one (though normally only one overlaps)
                     for (var cIdx = cell.length - 1; cIdx >= 0; cIdx--) {
                         var j = cell[cIdx];
-                        if (j >= current.length - 2) continue; // Pas les 2 derniers
+                        if (j >= current.length - 2) continue; // Not the last 2
                         var cand = current[j];
                         var dx = cand.x - v.x;
                         var dy = cand.y - v.y;
@@ -804,7 +811,7 @@ function _extractSubLoops(p) {
             if (p.gradient) loopPoly.gradient = _cloneGradient(p.gradient);
             finalPolys.push(loopPoly);
             
-            // Nettoyer la grille des points qui sont retirés de 'current'
+            // Clean the grid of points being removed from 'current'
             for(var k = matchedIdx; k < current.length; k++) {
                 var kv = current[k];
                 var kKey = getCell(kv.x, kv.y);
@@ -917,7 +924,7 @@ function inspectShape(el, isShapeTween, forceExtract) {
                     var MAX_EDGES = 10000;
                     var edgeCount = 0;
                     
-                    // PASS 1: Collecter toutes les arêtes géométriques brutes
+                    // PASS 1: Collect all raw geometric edges
                     do {
                         var v = he.getVertex();
                         var edge = he.getEdge();
@@ -965,8 +972,8 @@ function inspectShape(el, isShapeTween, forceExtract) {
                         edgeCount++;
                     } while (he && he.id !== startHe.id && edgeCount < MAX_EDGES);
 
-                    // PASS 2: Assemblage parfait (Flash donne les arêtes dans le sens inverse de la géométrie)
-                    // On inverse simplement le tableau pour les avoir dans le bon ordre continu !
+                    // PASS 2: Perfect assembly (Flash gives edges in the reverse of geometric order)
+                    // Simply reverse the array to get them in the correct continuous order!
                     rawEdges.reverse();
 
 
@@ -1019,14 +1026,14 @@ function inspectShape(el, isShapeTween, forceExtract) {
                     }
                 }
 
-                // v4 - Détection des trous : on regroupe les contours d'un même fill
-                // en relations outer -> holes. Désactivé pour les shape tweens
-                // (topologie qui peut changer entre frames -> casserait l'interpolation).
+                // v4 - Hole detection: group contours of the same fill into
+                // outer -> holes relationships. Disabled for shape tweens
+                // (topology can change between frames -> would break interpolation).
                 if (s.polygons.length > 1 && !isShapeTween) {
-                    // Avant le hole-grouping : éliminer les paires CCW/CW
-                    // superposées (deux fillStyles de chaque côté d'un edge
-                    // partagé exportés comme 2 polys distincts à même position).
-                    // Sans ça, le CW redondant cache le CCW visible.
+                    // Before hole-grouping: eliminate overlapping CCW/CW
+                    // pairs (two fillStyles on each side of a shared edge
+                    // exported as 2 distinct polys at the same position).
+                    // Without this, the redundant CW hides the visible CCW.
                     s.polygons = _removeOppositeWindingDuplicates(s.polygons);
                     s.polygons = _groupPolygonsWithHoles(s.polygons);
                 }
@@ -1314,9 +1321,9 @@ function inspectElement(el, depth, isShapeTween, forceExtract) {
                     if (member) obj.members.push(member);
                 } catch(e) {}
             }
-            // Un groupe peut aussi avoir des raw fills dessinés directement en son sein
-            // (accessibles via el.contours sur le groupe lui-même, pas via el.members).
-            // On les extrait séparément et on les stocke dans obj.shapes.
+            // A group can also have raw fills drawn directly within it
+            // (accessible via el.contours on the group itself, not via
+            // el.members). Extract them separately and store them in obj.shapes.
             try {
                 if (el.contours && el.contours.length > 0) {
                     var grpSh = inspectShape(el, isShapeTween, true);
@@ -1564,18 +1571,18 @@ function inspectSymbolItem(item, base) {
         
         if (hasShapeTween && doc) {
             __log("        [DEBUG] Baking Shape Tweens for symbol: " + item.name);
-            // Flash mange les '/' dans Item.name setter : si on assigne
-            // "folder/item" à .name, Flash traite ça comme le NOM DE BASE
-            // seulement (l'item reste dans son dossier courant), et remplace
-            // les '/' invalides par '-'. Symptôme observé : pour
-            // "_GFX/_Moods/oeil mouillé" on se retrouvait avec un orphelin
+            // Flash eats '/' in the Item.name setter: assigning
+            // "folder/item" to .name makes Flash treat it as the BASE NAME
+            // only (the item stays in its current folder), and replaces the
+            // invalid '/' with '-'. Symptom observed: for
+            // "_GFX/_Moods/oeil mouillé" we ended up with an orphan
             // "_GFX/_Moods/_GFX-_Moods-oeil mouillé_tempGodotExportShapeTween"
-            // dans la library, puis itemExists()/deleteItem() rataient le
-            // cleanup (ils cherchaient le chemin attendu, pas le mangled),
-            // et le symbol original restait vide dans le JSON.
-            // Fix : on splitte path/base, on assigne SEULEMENT le base name
-            // (sans slash) à Item.name, et on garde le full path pour les
-            // opérations library (itemExists / editItem / deleteItem).
+            // in the library, and then itemExists()/deleteItem() missed the
+            // cleanup (they looked for the expected path, not the mangled
+            // one), leaving the original symbol empty in the JSON.
+            // Fix: split path/base, assign ONLY the base name (no slash) to
+            // Item.name, and keep the full path for library operations
+            // (itemExists / editItem / deleteItem).
             var _slashIdx = item.name.lastIndexOf("/");
             var _folderPath = _slashIdx !== -1 ? item.name.substring(0, _slashIdx + 1) : "";
             var _baseName = _slashIdx !== -1 ? item.name.substring(_slashIdx + 1) : item.name;
@@ -1588,8 +1595,8 @@ function inspectSymbolItem(item, base) {
             doc.library.duplicateItem();
             var selItems = doc.library.getSelectedItems();
             if (selItems && selItems.length > 0) {
-                selItems[0].name = _tempBaseName;   // BASE NAME ONLY (pas de slash)
-                doc.library.editItem(tempName);     // full path pour le lookup
+                selItems[0].name = _tempBaseName;   // BASE NAME ONLY (no slash)
+                doc.library.editItem(tempName);     // full path for lookup
                 tl = doc.getTimeline();
                 wasEdited = true;
                 
@@ -1694,10 +1701,10 @@ function inspectLibrary(lib) {
 
             if (type === "folder") continue;
 
-            // Skip orphan temp symbols laissés par d'anciens runs ratés du
-            // baker de shape tween (cf. fix dans inspectSymbolItem). Sans
-            // ce skip, ces orphelins (souvent vides) polluent le JSON et
-            // peuvent en plus déclencher un nouveau cycle de baking récursif.
+            // Skip orphan temp symbols left behind by earlier failed shape
+            // tween baker runs (cf. the fix in inspectSymbolItem). Without
+            // this skip, these (often empty) orphans pollute the JSON and
+            // can even trigger a new recursive baking cycle.
             if (baseName.indexOf("_tempGodotExportShapeTween") !== -1) {
                 __log("[DEBUG]      Skip orphan temp symbol: " + baseName);
                 continue;
@@ -1783,7 +1790,7 @@ function inspectDocumentMeta(doc) {
 
 // =============================================================================
 // =============================================================================
-// POINT D'ENTREE DU MODULE
+// MODULE ENTRY POINT
 // =============================================================================
 
 function _flattenLabeledAnimations(library, scenes) {
@@ -1818,12 +1825,12 @@ function _flattenLabeledAnimations(library, scenes) {
         return copy;
     }
 
-    // Compose M2 (matrice de l'instance retirée, ex: ev.originalEl.matrix) avec
-    // M1 (matrice locale de l'élément enfant) : le point est d'abord transformé
-    // par M1 (espace local du symbole enfant), puis par M2 (placement de
-    // l'instance dans le parent). Sans cette composition, les éléments injectés
-    // dans les SharedLayer_N gardent leurs coordonnées locales au symbole
-    // enfant et se retrouvent mal placés sur le calque parent.
+    // Compose M2 (the removed instance's matrix, e.g. ev.originalEl.matrix)
+    // with M1 (the child element's local matrix): the point is first
+    // transformed by M1 (the child symbol's local space), then by M2 (the
+    // instance's placement in the parent). Without this composition,
+    // elements injected into SharedLayer_N keep their coordinates local to
+    // the child symbol and end up misplaced on the parent layer.
     function _composeMatrix(M2, M1) {
         M2 = M2 || { a: 1, b: 0, c: 0, d: 1, tx: 0, ty: 0 };
         M1 = M1 || { a: 1, b: 0, c: 0, d: 1, tx: 0, ty: 0 };
@@ -1956,13 +1963,13 @@ function _flattenLabeledAnimations(library, scenes) {
         
         if (maxSharedLayers === 0) return;
 
-        // getShift(frame) est appelée plusieurs fois par keyframe/événement ;
-        // au lieu de rescanner tout `expansions` a chaque appel (O(n) par
-        // appel), on trie une fois et on precalcule une somme cumulative,
-        // puis on fait une recherche binaire (O(log n) par appel). Resultat
-        // identique : la somme des expandBy pour frame < f ne depend pas de
-        // l'ordre de sommation (addition commutative), donc trier avant de
-        // sommer ne change rien au total.
+        // getShift(frame) is called several times per keyframe/event;
+        // instead of rescanning all of `expansions` on every call (O(n) per
+        // call), sort once and precompute a cumulative sum, then do a
+        // binary search (O(log n) per call). Identical result: the sum of
+        // expandBy for frame < f doesn't depend on summation order
+        // (addition is commutative), so sorting before summing doesn't
+        // change the total.
         var sortedExpansions = expansions.slice().sort(function(a, b) { return a.frame - b.frame; });
         var expansionFrames = [];
         var expansionCumShift = [0];
@@ -2185,7 +2192,7 @@ function _flattenLabeledAnimations(library, scenes) {
 function buildInspectorData(doc) {
     if (!doc) return null;
 
-    __log("[DEBUG]  -> Inspection de la structure du FLA...");
+    __log("[DEBUG]  -> Inspecting the FLA structure...");
 
     __log("[DEBUG]    -> inspectDocumentMeta...");
     var meta = inspectDocumentMeta(doc);

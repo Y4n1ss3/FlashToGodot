@@ -1,66 +1,66 @@
 // =============================================================================
-// FLASH TO GODOT - PIPELINE COMPLET
+// FLASH TO GODOT - FULL PIPELINE
 // =============================================================================
 
 (function() {
     var doc = fl.getDocumentDOM();
     if (!doc) {
-        alert("Aucun document ouvert !");
+        alert("No document open!");
         return;
     }
 
     fl.outputPanel.clear();
     fl.suppressAlerts = true;
     fl.showIdleMessage(false);
-    fl.trace("=== DEMARRAGE DE L'EXPORT FLASH VERS GODOT ===");
+    fl.trace("=== STARTING FLASH TO GODOT EXPORT ===");
 
-    // Détermination des chemins
+    // Determine paths
     var scriptURI = fl.scriptURI;
     var scriptDir = scriptURI.substring(0, scriptURI.lastIndexOf("/") + 1);
     var modulesDir = scriptDir + "modules/";
     var logURI = scriptDir + "debug_log.txt";
 
-    FLfile.write(logURI, "=== DEBUT DU SCRIPT ===\n");
+    FLfile.write(logURI, "=== SCRIPT START ===\n");
     function fileLog(msg) {
         FLfile.write(logURI, msg + "\n", "append");
         fl.trace(msg);
     }
 
-    // Chargement des modules
+    // Load modules
     fileLog("Loading inspector.jsfl...");
     fl.runScript(modulesDir + "inspector.jsfl");
     fileLog("Loading godotBuilder.jsfl...");
     fl.runScript(modulesDir + "godotBuilder.jsfl");
     fileLog("Modules loaded.");
 
-    // Sélection du dossier d'export
-    var exportFolder = fl.browseForFolderURL("Sélectionnez le dossier racine du projet Godot");
+    // Select the export folder
+    var exportFolder = fl.browseForFolderURL("Select the root folder of the Godot project");
     if (!exportFolder) {
-        fileLog("Annulé.");
+        fileLog("Cancelled.");
         return;
     }
     if (exportFolder.charAt(exportFolder.length - 1) !== '/') exportFolder += '/';
 
-    // 1. Inspection (Extraction de la donnée)
-    fileLog("[DEBUG] ETAPE 1: buildInspectorData (Extraction)");
+    // 1. Inspection (data extraction)
+    fileLog("[DEBUG] STEP 1: buildInspectorData (Extraction)");
     var fullData = buildInspectorData(doc);
-    fileLog("[DEBUG] buildInspectorData termine avec succes !");
+    fileLog("[DEBUG] buildInspectorData completed successfully!");
 
     if (!fullData) {
-        alert("Erreur lors de l'inspection du document.");
+        alert("Error while inspecting the document.");
         return;
     }
 
     // Write fullData to a JSON file for debugging using custom stringify for JSFL compatibility
     //
-    // jsonEscapeString : échappe une string pour qu'elle soit un littéral JSON
-    // VALIDE au sens strict de la spec (RFC 8259) -- pas seulement lisible.
-    // Le JSON généré ici embarque parfois du code ActionScript collé tel quel
-    // (ex: `actionScript`), qui peut contenir de vraies tabulations ou
-    // d'autres caractères de contrôle (0x00-0x1F). Un parseur JSON standard
-    // (JSON.parse, Python json.load...) REJETTE tout caractère de contrôle
-    // non échappé dans une string, même si le fichier "a l'air" correct à
-    // l'oeil -- \n et \r seuls ne suffisent pas.
+    // jsonEscapeString: escapes a string so it becomes a JSON literal that
+    // is VALID per the strict spec (RFC 8259) -- not just readable. The
+    // JSON generated here sometimes embeds ActionScript code pasted as-is
+    // (e.g. `actionScript`), which can contain real tabs or other control
+    // characters (0x00-0x1F). A standard JSON parser (JSON.parse, Python
+    // json.load...) REJECTS any unescaped control character inside a
+    // string, even if the file "looks" fine to the eye -- \n and \r alone
+    // are not enough.
     function jsonEscapeString(s) {
         return s.replace(/\\/g, '\\\\')
                 .replace(/"/g, '\\"')
@@ -101,12 +101,12 @@
     var jsonDebugPath = exportFolder + "debug_data.json";
     FLfile.write(jsonDebugPath, jsflStringify(fullData));
 
-    // 2. Génération des fichiers .tscn et shaders
-    fileLog("[DEBUG] ETAPE 2: buildGodotScenes");
+    // 2. Generate the .tscn files and shaders
+    fileLog("[DEBUG] STEP 2: buildGodotScenes");
     buildGodotScenes(doc, fullData, exportFolder);
 
-    fl.trace("=== EXPORT TERMINE AVEC SUCCES ===");
-    alert("Exportation Flash vers Godot terminée !\nDossier : " + exportFolder);
+    fl.trace("=== EXPORT COMPLETED SUCCESSFULLY ===");
+    alert("Flash to Godot export complete!\nFolder: " + exportFolder);
     fl.suppressAlerts = false;
     fl.showIdleMessage(true);
 })();
