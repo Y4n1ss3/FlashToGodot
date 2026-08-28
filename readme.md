@@ -73,7 +73,37 @@ Once the pipeline has finished, the following files will be generated inside you
 
 ---
 
-## 📜 Historique des versions (`godotBuilder.jsfl`)
+## 🧪 Tests hors Adobe Animate
+
+Le dossier [`tools/`](tools/) contient des scripts Node.js pour tester le
+pipeline (`inspector.jsfl` + `godotBuilder.jsfl`) sans ouvrir Adobe Animate,
+à partir d'un `debug_data.json` déjà extrait d'un vrai `.fla`. Utile avant
+tout changement dans `modules/` pour détecter une régression par simple
+`diff` plutôt qu'en rouvrant Godot à chaque essai. Voir
+[`tools/README.md`](tools/README.md) pour l'utilisation.
+
+---
+
+## 📜 Historique des versions
+
+### main.jsfl — Échappement JSON invalide dans `jsflStringify`
+- **Bug** : `debug_data.json` (généré à chaque export pour le debug) n'était
+  pas du JSON strictement valide au sens de la spec (RFC 8259). La fonction
+  maison `jsflStringify` échappait `\`, `"`, `\n` et `\r`, mais aucun autre
+  caractère de contrôle (0x00-0x1F). Le champ `actionScript` embarque
+  parfois du code AS3 collé tel quel, qui peut contenir de vraies
+  tabulations ou d'autres caractères de contrôle — un parseur JSON standard
+  (`JSON.parse`, Python `json.load`...) rejette le fichier entier dès le
+  premier caractère non échappé rencontré, même si le fichier "a l'air"
+  correct à l'oeil.
+- **Corrigé** : nouvelle fonction `jsonEscapeString` (échappe tous les
+  caractères 0x00-0x1F, dont `\t`, en `\uXXXX` sauf les formes courtes
+  `\n`/`\r`/`\t`), utilisée aux deux endroits qui dupliquaient l'ancien
+  échappement partiel.
+- Pour réparer un `debug_data.json` déjà généré par l'ancienne version :
+  `node tools/repair_debug_json.js chemin/vers/debug_data.json`.
+
+### godotBuilder.jsfl
 
 *(Notes de développement en français, conservées telles quelles depuis le code source.)*
 

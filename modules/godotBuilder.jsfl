@@ -414,6 +414,70 @@ function _hasSelfIntersection(verts) {
  */
 
 
+// Nettoie un contour de sommets Flash bruts avant triangulation Godot :
+// - fusionne les points quasi-identiques consécutifs (distance² < 1e-6),
+// - élimine les allers-retours dégénérés (deux segments consécutifs qui
+//   font presque demi-tour, produit scalaire < -0.99, typique d'une pointe
+//   de subdivision Bézier qui se replie sur elle-même),
+// - retire le dernier point s'il coïncide avec le premier (contour déjà
+//   fermé explicitement),
+// - répare les auto-intersections résiduelles (uniquement sur les contours
+//   de taille raisonnable, ≤ 500 sommets : `_hasSelfIntersection` est en
+//   O(V²), inutile/coûteux au-delà).
+// Fonction pure : ne dépend que de son entrée, ne touche à aucun état de
+// _processElementNode.
+function _cleanupPolygonVertices(effectiveVerts) {
+    var finalVerts = [];
+    for (var v = 0; v < effectiveVerts.length; v++) {
+        var px = effectiveVerts[v].x;
+        var py = effectiveVerts[v].y;
+        if (finalVerts.length > 0) {
+            var lastV = finalVerts[finalVerts.length - 1];
+            var dx = px - lastV.x;
+            var dy = py - lastV.y;
+            if (dx*dx + dy*dy < 0.000001) continue;
+        }
+        finalVerts.push(effectiveVerts[v]);
+
+        while (finalVerts.length >= 3) {
+            var len = finalVerts.length;
+            var A = finalVerts[len - 3];
+            var B = finalVerts[len - 2];
+            var C = finalVerts[len - 1];
+            var v1x = B.x - A.x;
+            var v1y = B.y - A.y;
+            var v2x = C.x - B.x;
+            var v2y = C.y - B.y;
+            var l1 = Math.sqrt(v1x*v1x + v1y*v1y);
+            var l2 = Math.sqrt(v2x*v2x + v2y*v2y);
+            if (l1 > 0.001 && l2 > 0.001) {
+                var dot = (v1x*v2x + v1y*v2y) / (l1*l2);
+                if (dot < -0.99) {
+                    finalVerts.splice(len - 2, 1);
+                    continue;
+                }
+            }
+            break;
+        }
+    }
+
+    if (finalVerts.length > 2) {
+        var firstV = finalVerts[0];
+        var lastV = finalVerts[finalVerts.length - 1];
+        var dx = firstV.x - lastV.x;
+        var dy = firstV.y - lastV.y;
+        if (dx*dx + dy*dy < 0.000001) {
+            finalVerts.pop();
+        }
+    }
+
+    if (finalVerts.length > 3 && finalVerts.length <= 500 && _hasSelfIntersection(finalVerts)) {
+        finalVerts = _removeSelfIntersections(finalVerts);
+    }
+
+    return finalVerts;
+}
+
 function _deepClone(v) {
     if (v === null || v === undefined) return v;
     var t = typeof v;
@@ -1966,10 +2030,93 @@ function _setupMaterials(node, isRoot) {
     return hasSprite;
 }
 
-function _processElementNode(elem, parent, ownerRoot, anim, startTime, duration, frameRate,
-                             wrapperName, exportDir, scaleFactor, symName, startFrameIndex,
-                             maxTime, kfTransition, shaderNeeds, customTexPath, layerType,
-                             getExt, subResources, isStaticLayer, modulateNeedsCanvasGroup, gradCache, layerZIndex) {
+// Fonction centrale du pipeline : convertit UN élément Flash (shape ou
+// instance) présent à UN keyframe donné en node(s) Godot + tracks
+// d'animation. Volontairement pas décomposée en sous-fonctions malgré sa
+// taille : la quasi-totalité de son état local (node/wrapperNode,
+// offsetDx/Dy, _matDec...) traverse la fonction de bout en bout, donc
+// découper obligerait à faire circuler 8-10 paramètres partout sans
+// réduire la complexité réelle -- juste la déplacer, avec un vrai risque
+// de régression géométrique (précision des sommets, matrices de gradient).
+// Repères de section (mêmes lignes à chaque appel, un par élément/keyframe) :
+//   1. Wrapper/node : lookup ou création (Polygon2D/Line2D/Sprite2D/PackedScene/Node2D)
+//   2. Démotion Line2D -> Node2D si un fill arrive sur un keyframe ultérieur
+//   3. Géométrie shape : polyGroups, triangulation/nettoyage, gradients/textures
+//   4. Sprite/bitmap (texture PNG externe)
+//   5. Traits (strokes) -> Line2D, avec démotion symétrique du point 2
+//   6. Nettoyage des slots Poly_X/Line_X excédentaires (hérités d'un keyframe précédent)
+//   7. Tracks visible/process_mode
+//   8. Transform (position/rotation/scale/skew), wrapper init + animé
+//   9. Color transform : shader (Advanced Color Effect) ou modulate simple
+// Démote un node Line2D (créé comme wrapper direct pour un trait unique,
+// v4.7) en Node2D lorsqu'un keyframe ultérieur lui donne finalement
+// plusieurs traits OU un fill (les deux appelants de cette fonction).
+// Le trait déjà présent est relocalisé en enfant "Line_0", propriétés ET
+// tracks d'animation existantes comprises (réécriture des chemins déjà
+// indexés dans anim._trackIndex). Bloc identique dans les deux cas
+// d'origine, factorisé ici.
+function _demoteLine2DToNode2D(node, variantPathStr, anim) {
+    node.type = "Node2D";
+    delete node.properties["joint_mode"];
+    delete node.properties["begin_cap_mode"];
+    delete node.properties["end_cap_mode"];
+    delete node.properties["use_parent_material"];
+    delete node.properties["points"];
+    delete node.properties["width"];
+    delete node.properties["default_color"];
+    if (typeof anim !== 'undefined' && anim && anim.tracks) {
+        var fixProps = [":points", ":width", ":default_color"];
+        for (var t = 0; t < anim.tracks.length; t++) {
+            var tr = anim.tracks[t];
+            for (var f = 0; f < fixProps.length; f++) {
+                if (tr.path === variantPathStr + fixProps[f]) {
+                    delete anim._trackIndex["$" + tr.path + "" + tr.type];
+                    tr.path = variantPathStr + "/Line_0" + fixProps[f];
+                    anim._trackIndex["$" + tr.path + "" + tr.type] = t;
+                }
+            }
+        }
+    }
+}
+
+// --- Section 6 de _processElementNode, extraite : les deux boucles de
+// nettoyage des slots Poly_X/Line_X excédentaires (hérités d'un keyframe
+// précédent avec plus de fills/traits qu'ici) sont identiques à un
+// paramétrage près -- unifiées ici. `useAnim` bascule entre écriture d'une
+// track d'animation (calque non-statique) et assignation directe de
+// propriété (calque statique), exactement les mêmes valeurs des deux côtés.
+function _clearExcessNamedSlots(node, variantPathStr, anim, startIndex, prefix, expectedType, useAnim, startTime, resetProps) {
+    var idx = startIndex;
+    while (true) {
+        var excessName = (idx === 0 && node.type === expectedType) ? "" : prefix + ((idx > 0 && node.type === expectedType) ? (idx - 1) : idx);
+        var excessNode = (excessName === "") ? node : node.getNodeOrNull(excessName);
+        if (!excessNode) break;
+
+        if (excessName === "" && excessNode.type !== expectedType) {
+            idx++;
+            continue;
+        }
+
+        var excessPath = excessName === "" ? variantPathStr : variantPathStr + "/" + excessName;
+        for (var p = 0; p < resetProps.length; p++) {
+            if (useAnim) {
+                anim.addTrackKey(excessPath + ":" + resetProps[p].name, "value", startTime, resetProps[p].value, 0.0);
+            } else {
+                excessNode.properties[resetProps[p].name] = resetProps[p].value;
+            }
+        }
+        idx++;
+    }
+}
+
+// --- Section 1 de _processElementNode, extraite : lookup ou création du
+// wrapper/node Godot pour CET élément Flash à CE keyframe. Pure sur ses
+// entrées (elem/parent/ownerRoot/wrapperName/shaderNeeds/
+// modulateNeedsCanvasGroup/layerZIndex/getExt) : ses seuls effets de bord
+// sont la création/l'attache du node lui-même (parent.addChildRanked,
+// node.owner), jamais anim.tracks ni subResources -- donc extractible sans
+// faire circuler le reste de l'état de _processElementNode.
+function _resolveElementNode(elem, parent, ownerRoot, wrapperName, shaderNeeds, modulateNeedsCanvasGroup, layerZIndex, getExt) {
     if (parent !== ownerRoot && !parent.parent) {
         ownerRoot.addChild(parent);
     }
@@ -1978,7 +2125,7 @@ function _processElementNode(elem, parent, ownerRoot, anim, startTime, duration,
     if (elem.elementType === "instance" && !shaderNeeds && modulateNeedsCanvasGroup) {
         skipWrapper = false; // We MUST use a wrapper if we need to change the node type to CanvasGroup
     }
-    
+
     var wrapperNode, node;
     var isNewWrapper = false, isNewNode = false;
 
@@ -2048,36 +2195,31 @@ function _processElementNode(elem, parent, ownerRoot, anim, startTime, duration,
         }
     }
 
+    return { node: node, wrapperNode: wrapperNode, isNewNode: isNewNode, isNewWrapper: isNewWrapper };
+}
+
+function _processElementNode(elem, parent, ownerRoot, anim, startTime, duration, frameRate,
+                             wrapperName, exportDir, scaleFactor, symName, startFrameIndex,
+                             maxTime, kfTransition, shaderNeeds, customTexPath, layerType,
+                             getExt, subResources, isStaticLayer, modulateNeedsCanvasGroup, gradCache, layerZIndex) {
+    // --- 1. Wrapper/node : lookup ou création ---------------------------
+    var _resolved = _resolveElementNode(elem, parent, ownerRoot, wrapperName, shaderNeeds, modulateNeedsCanvasGroup, layerZIndex, getExt);
+    var node = _resolved.node;
+    var wrapperNode = _resolved.wrapperNode;
+    var isNewNode = _resolved.isNewNode;
+    var isNewWrapper = _resolved.isNewWrapper;
+
     var wrapperPathStr = ownerRoot.getPathTo(wrapperNode);
     var variantPathStr = ownerRoot.getPathTo(node);
 
+    // --- 2. Démotion Line2D -> Node2D si un fill arrive plus tard -------
     // Cas rare : cette occurrence poolée avait été créée en Line2D direct
     // (shape stroke-only sur son premier keyframe) mais le keyframe courant
     // lui donne un fill (elem.polygons non vide). On démote vers Node2D et on
     // relocalise le trait existant en Line_0 avant que la logique polygone
     // ci-dessous ne décide du nommage de ses propres nodes.
     if (node.type === "Line2D" && elem.polygons && elem.polygons.length > 0) {
-        node.type = "Node2D";
-        delete node.properties["joint_mode"];
-        delete node.properties["begin_cap_mode"];
-        delete node.properties["end_cap_mode"];
-        delete node.properties["use_parent_material"];
-        delete node.properties["points"];
-        delete node.properties["width"];
-        delete node.properties["default_color"];
-        if (typeof anim !== 'undefined' && anim && anim.tracks) {
-            var fixLineProps = [":points", ":width", ":default_color"];
-            for (var t = 0; t < anim.tracks.length; t++) {
-                var tr = anim.tracks[t];
-                for (var f = 0; f < fixLineProps.length; f++) {
-                    if (tr.path === variantPathStr + fixLineProps[f]) {
-                        delete anim._trackIndex["$" + tr.path + "\u0001" + tr.type];
-                        tr.path = variantPathStr + "/Line_0" + fixLineProps[f];
-                        anim._trackIndex["$" + tr.path + "\u0001" + tr.type] = t;
-                    }
-                }
-            }
-        }
+        _demoteLine2DToNode2D(node, variantPathStr, anim);
     }
 
     var offsetDx = 0.0, offsetDy = 0.0;
@@ -2085,6 +2227,7 @@ function _processElementNode(elem, parent, ownerRoot, anim, startTime, duration,
     var boundsX = 0.0, boundsY = 0.0;
     var pngWidth, pngHeight;
 
+    // --- 3. Géométrie shape : polyGroups, triangulation, gradients/textures ---
     if (elem.elementType === "shape" || elem._inlineSprite) {
         var polyGroups = null;
         if (elem.polygons && elem.polygons.length > 0) {
@@ -2225,53 +2368,7 @@ function _processElementNode(elem, parent, ownerRoot, anim, startTime, duration,
                         }
                     }
 
-                    var finalVerts = [];
-                    for (var v = 0; v < effectiveVerts.length; v++) {
-                        var px = effectiveVerts[v].x;
-                        var py = effectiveVerts[v].y;
-                        if (finalVerts.length > 0) {
-                            var lastV = finalVerts[finalVerts.length - 1];
-                            var dx = px - lastV.x;
-                            var dy = py - lastV.y;
-                            if (dx*dx + dy*dy < 0.000001) continue; 
-                        }
-                        finalVerts.push(effectiveVerts[v]);
-                        
-                        while (finalVerts.length >= 3) {
-                            var len = finalVerts.length;
-                            var A = finalVerts[len - 3];
-                            var B = finalVerts[len - 2];
-                            var C = finalVerts[len - 1];
-                            var v1x = B.x - A.x;
-                            var v1y = B.y - A.y;
-                            var v2x = C.x - B.x;
-                            var v2y = C.y - B.y;
-                            var l1 = Math.sqrt(v1x*v1x + v1y*v1y);
-                            var l2 = Math.sqrt(v2x*v2x + v2y*v2y);
-                            if (l1 > 0.001 && l2 > 0.001) {
-                                var dot = (v1x*v2x + v1y*v2y) / (l1*l2);
-                                if (dot < -0.99) {
-                                    finalVerts.splice(len - 2, 1);
-                                    continue;
-                                }
-                            }
-                            break;
-                        }
-                    }
-                    
-                    if (finalVerts.length > 2) {
-                        var firstV = finalVerts[0];
-                        var lastV = finalVerts[finalVerts.length - 1];
-                        var dx = firstV.x - lastV.x;
-                        var dy = firstV.y - lastV.y;
-                        if (dx*dx + dy*dy < 0.000001) {
-                            finalVerts.pop();
-                        }
-                    }
-                    
-                    if (finalVerts.length > 3 && finalVerts.length <= 500 && _hasSelfIntersection(finalVerts)) {
-                        finalVerts = _removeSelfIntersections(finalVerts);
-                    }
+                    var finalVerts = _cleanupPolygonVertices(effectiveVerts);
 
                     var indices = [];
                     for (var v = 0; v < finalVerts.length; v++) {
@@ -2356,15 +2453,15 @@ function _processElementNode(elem, parent, ownerRoot, anim, startTime, duration,
                         texIdStr = gradCache[cSig];
                     } else {
                         var gradId = "Gradient_" + nextId();
-                        var hex = group.color;
-                        var r = 1, g = 1, b = 1, a = 1;
-                        if (hex && hex.charAt(0) === '#') {
-                            r = parseInt(hex.substring(1,3), 16) / 255.0;
-                            g = parseInt(hex.substring(3,5), 16) / 255.0;
-                            b = parseInt(hex.substring(5,7), 16) / 255.0;
-                            if (hex.length === 9) a = parseInt(hex.substring(7,9), 16) / 255.0;
-                        }
-                        var colorStr = _f(r) + ", " + _f(g) + ", " + _f(b) + ", " + _f(a);
+                        // _colorFloats gère déjà exactement ce parsing hex
+                        // (#RRGGBB[AA] -> "r, g, b, a" formatés), déjà utilisée
+                        // juste en dessous pour les couleurs de gradient : même
+                        // logique, pas de duplication. Seule différence
+                        // (cosmétique, sans effet Godot) : son fallback "pas de
+                        // #" renvoie "1, 1, 1, 1" au lieu de "1.0000, 1.0000,
+                        // 1.0000, 1.0000" -- même valeur flottante, littéral
+                        // différent.
+                        var colorStr = _colorFloats(group.color);
                         
                         var gradStr = '[sub_resource type="Gradient" id="' + gradId + '"]\n';
                         gradStr += 'offsets = PackedFloat32Array(0, 1)\n';
@@ -2432,6 +2529,7 @@ function _processElementNode(elem, parent, ownerRoot, anim, startTime, duration,
                 anim._maxPoly[variantPathStr] = Math.max(prevMax, curLen);
             }
             
+        // --- 4. Sprite/bitmap (texture PNG externe) ---------------------
         } else if (!elem.strokes || elem.strokes.length === 0) {
             if (!elem._isTweenShape && customTexPath) {
                 var fileName = customTexPath.substring(customTexPath.lastIndexOf("/") + 1);
@@ -2494,6 +2592,7 @@ function _processElementNode(elem, parent, ownerRoot, anim, startTime, duration,
             }
         }
 
+        // --- 5. Traits (strokes) -> Line2D -------------------------------
         var hasStrokes = elem.strokes && elem.strokes.length > 0;
         if (hasStrokes && (elem.elementType === "shape" || elem._inlineSprite)) {
             // Démotion symétrique du cas Polygon2D/Poly_N ci-dessus : cette
@@ -2502,27 +2601,7 @@ function _processElementNode(elem, parent, ownerRoot, anim, startTime, duration,
             // plusieurs traits. On convertit le wrapper en Node2D et on déplace
             // ses propriétés/anim tracks existantes vers un enfant Line_0.
             if (elem.strokes.length > 1 && node.type === "Line2D") {
-                node.type = "Node2D";
-                delete node.properties["joint_mode"];
-                delete node.properties["begin_cap_mode"];
-                delete node.properties["end_cap_mode"];
-                delete node.properties["use_parent_material"];
-                delete node.properties["points"];
-                delete node.properties["width"];
-                delete node.properties["default_color"];
-                if (typeof anim !== 'undefined' && anim && anim.tracks) {
-                    var fixProps = [":points", ":width", ":default_color"];
-                    for (var t = 0; t < anim.tracks.length; t++) {
-                        var tr = anim.tracks[t];
-                        for (var f = 0; f < fixProps.length; f++) {
-                            if (tr.path === variantPathStr + fixProps[f]) {
-                                delete anim._trackIndex["$" + tr.path + "\u0001" + tr.type];
-                                tr.path = variantPathStr + "/Line_0" + fixProps[f];
-                                anim._trackIndex["$" + tr.path + "\u0001" + tr.type] = t;
-                            }
-                        }
-                    }
-                }
+                _demoteLine2DToNode2D(node, variantPathStr, anim);
             }
             var strokeParent = node;
             for (var s = 0; s < elem.strokes.length; s++) {
@@ -2580,7 +2659,7 @@ function _processElementNode(elem, parent, ownerRoot, anim, startTime, duration,
             
         }
 
-        // ----------------------------------------------------------------
+        // --- 6. Nettoyage des slots Poly_X/Line_X excédentaires ---------
         // Reset INCONDITIONNEL des slots Poly_X / Line_X non utilisés par
         // ce keyframe. Avant fix, ces deux boucles étaient imbriquées dans
         // `if (elem.polygons.length > 0)` et `if (hasStrokes)` respectivement,
@@ -2593,58 +2672,28 @@ function _processElementNode(elem, parent, ownerRoot, anim, startTime, duration,
         // précédent. C'est exactement le comportement Flash : à chaque
         // keyframe, seuls les éléments présents dans ce keyframe sont
         // dessinés ; tout le reste est vide.
+        // Les deux boucles (Poly_X/Polygon2D et Line_X/Line2D) sont
+        // identiques à un paramétrage près -- factorisées dans
+        // _clearExcessNamedSlots (mêmes valeurs de reset utilisées à
+        // l'identique côté track animée et côté propriété statique).
         // ----------------------------------------------------------------
         var polyCount = polyGroups ? polyGroups.length : 0;
-        var pIndex = polyCount;
-        while (true) {
-            var excessName = (pIndex === 0 && node.type === "Polygon2D") ? "" : "Poly_" + ((pIndex > 0 && node.type === "Polygon2D") ? (pIndex - 1) : pIndex);
-            var excessNode = (excessName === "") ? node : node.getNodeOrNull(excessName);
-            if (!excessNode) break;
-            
-            if (excessName === "" && excessNode.type !== "Polygon2D") {
-                pIndex++;
-                continue;
-            }
-            
-            var excessPath = excessName === "" ? variantPathStr : variantPathStr + "/" + excessName;
-            if (!(isStaticLayer && !elem._isTweenShape)) {
-                anim.addTrackKey(excessPath + ":polygon", "value", startTime, "PackedVector2Array()", 0.0);
-                anim.addTrackKey(excessPath + ":polygons", "value", startTime, "[]", 0.0);
-                anim.addTrackKey(excessPath + ":uv", "value", startTime, "PackedVector2Array()", 0.0);
-                anim.addTrackKey(excessPath + ":visible", "value", startTime, false, 0.0);
-            } else {
-                excessNode.properties["polygon"] = "PackedVector2Array()";
-                excessNode.properties["polygons"] = "[]";
-                excessNode.properties["uv"] = "PackedVector2Array()";
-                excessNode.properties["visible"] = false;
-            }
-            pIndex++;
-        }
+        var useAnimForSlots = !(isStaticLayer && !elem._isTweenShape);
+        _clearExcessNamedSlots(node, variantPathStr, anim, polyCount, "Poly_", "Polygon2D", useAnimForSlots, startTime, [
+            { name: "polygon", value: "PackedVector2Array()" },
+            { name: "polygons", value: "[]" },
+            { name: "uv", value: "PackedVector2Array()" },
+            { name: "visible", value: false }
+        ]);
 
         var strokeCount = (elem.strokes && elem.strokes.length) || 0;
-        var sIndex = strokeCount;
-        while (true) {
-            var excessName = (sIndex === 0 && node.type === "Line2D") ? "" : "Line_" + sIndex;
-            var excessNode = (excessName === "") ? node : node.getNodeOrNull(excessName);
-            if (!excessNode) break;
-            
-            if (excessName === "" && excessNode.type !== "Line2D") {
-                sIndex++;
-                continue;
-            }
-            
-            var excessPath = (excessName === "") ? variantPathStr : variantPathStr + "/" + excessName;
-            if (!(isStaticLayer && !elem._isTweenShape)) {
-                anim.addTrackKey(excessPath + ":points", "value", startTime, "PackedVector2Array()", 0.0);
-                anim.addTrackKey(excessPath + ":visible", "value", startTime, false, 0.0);
-            } else {
-                excessNode.properties["points"] = "PackedVector2Array()";
-                excessNode.properties["visible"] = false;
-            }
-            sIndex++;
-        }
+        _clearExcessNamedSlots(node, variantPathStr, anim, strokeCount, "Line_", "Line2D", useAnimForSlots, startTime, [
+            { name: "points", value: "PackedVector2Array()" },
+            { name: "visible", value: false }
+        ]);
     }
 
+    // --- 7. Tracks visible/process_mode ---------------------------------
     var vis = elem.visible !== undefined ? elem.visible : true;
     var pathVis = variantPathStr + ":visible";
     var pathProc = variantPathStr + ":process_mode";
@@ -2662,6 +2711,7 @@ function _processElementNode(elem, parent, ownerRoot, anim, startTime, duration,
         anim.addTrackKey(pathProc, "value", startTime + duration, 4, 0.0);
     }
 
+    // --- 8. Transform (position/rotation/scale/skew) --------------------
     // Décomposition de la matrice calculée une seule fois (au lieu de deux
     // fois avec les mêmes arguments) : elle alimente à la fois les valeurs
     // initiales du wrapper (bloc isNewWrapper juste en dessous) et la clé
@@ -2754,9 +2804,8 @@ function _processElementNode(elem, parent, ownerRoot, anim, startTime, duration,
         }
     }
 
+    // --- 9. Color transform : shader (Advanced Color Effect) ou modulate ---
     var ctn = _extractColorTransform(elem.colorTransform);
-    
-
 
     var r_pct = ctn.rP, g_pct = ctn.gP, b_pct = ctn.bP, a_pct = ctn.aP;
     var r_amt = ctn.rA, g_amt = ctn.gA, b_amt = ctn.bA, a_amt = ctn.aA;
