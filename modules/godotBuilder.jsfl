@@ -1049,6 +1049,28 @@ GAnimation.prototype.optimizeTracks = function(root) {
 };
 
 
+// Construit l'ensemble des chemins de nodes (relatifs à root, "." pour root
+// lui-même) directement ciblés par au moins une AnimationPlayer track de
+// valeur -- les method tracks (frame scripts, path === ".") sont ignorées
+// car elles n'impliquent aucun changement visuel du node ciblé. Utilisé par
+// `_flattenSingleChildGroups` (v4.10) et `_markBakeableShapes` (v4.9) comme
+// même critère de base ("ce node précis est-il animé ?"), avant que chacune
+// n'en fasse un usage différent (propagation au sous-arbre entier pour
+// l'une, à la lignée d'ancêtres pour l'autre).
+function _buildAnimatedPathsSet(anim) {
+    var animatedPaths = {};
+    if (anim && anim.tracks) {
+        for (var i = 0; i < anim.tracks.length; i++) {
+            var tr = anim.tracks[i];
+            if (tr.type === "method") continue;
+            var colonIdx = tr.path.indexOf(":");
+            var nodePath = (colonIdx !== -1) ? tr.path.substring(0, colonIdx) : tr.path;
+            animatedPaths[nodePath] = true;
+        }
+    }
+    return animatedPaths;
+}
+
 // Supprime les wrappers Node2D "vides" : un container organisationnel
 // (folder/layer/masque) qui n'a QU'UN SEUL enfant, aucun transform propre
 // (position/rotation/scale/skew), aucune propriété "visible"/"material"/
@@ -1064,16 +1086,7 @@ GAnimation.prototype.optimizeTracks = function(root) {
 // Les chaînes de wrappers vides imbriqués sont réduites en une seule passe
 // (ex: folder > layer > shape, si les deux wrappers sont éligibles).
 function _flattenSingleChildGroups(root, anim) {
-    var animatedPaths = {};
-    if (anim && anim.tracks) {
-        for (var i = 0; i < anim.tracks.length; i++) {
-            var tr = anim.tracks[i];
-            if (tr.type === "method") continue;
-            var colonIdx = tr.path.indexOf(":");
-            var nodePath = (colonIdx !== -1) ? tr.path.substring(0, colonIdx) : tr.path;
-            animatedPaths[nodePath] = true;
-        }
-    }
+    var animatedPaths = _buildAnimatedPathsSet(anim);
 
     function markSubtreeAnimated(node) {
         var path = (node === root) ? "." : root.getPathTo(node);
@@ -1277,16 +1290,7 @@ function _bakeStaticShaderTints(root, anim, subResources) {
 // Les method tracks (appels de frame scripts, path === ".") sont ignorées :
 // elles n'impliquent aucun changement visuel du node ciblé.
 function _markBakeableShapes(root, anim) {
-    var animatedPaths = {};
-    if (anim && anim.tracks) {
-        for (var i = 0; i < anim.tracks.length; i++) {
-            var tr = anim.tracks[i];
-            if (tr.type === "method") continue;
-            var colonIdx = tr.path.indexOf(":");
-            var nodePath = (colonIdx !== -1) ? tr.path.substring(0, colonIdx) : tr.path;
-            animatedPaths[nodePath] = true;
-        }
-    }
+    var animatedPaths = _buildAnimatedPathsSet(anim);
 
     var markedAny = false;
     function walk(node, isAnimated, materialAncestor) {
@@ -2623,13 +2627,12 @@ function _processElementNode(elem, parent, ownerRoot, anim, startTime, duration,
                     }
                 }
                 
-                var ptsStr = "PackedVector2Array(";
                 var pts = strokeData.pts || strokeData.path || [];
+                var ptsParts = [];
                 for (var v = 0; v < pts.length; v++) {
-                    ptsStr += _f(pts[v].x * scaleFactor) + ", " + _f(pts[v].y * scaleFactor);
-                    if (v < pts.length - 1) ptsStr += ", ";
+                    ptsParts.push(_f(pts[v].x * scaleFactor) + ", " + _f(pts[v].y * scaleFactor));
                 }
-                ptsStr += ")";
+                var ptsStr = "PackedVector2Array(" + ptsParts.join(", ") + ")";
                 
                 var wStr = _f(strokeData.thickness * scaleFactor);
                 var cStr = "Color(1, 1, 1, 1)";

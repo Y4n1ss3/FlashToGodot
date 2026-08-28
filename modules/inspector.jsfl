@@ -346,7 +346,14 @@ function parseXML(xmlStr) {
         if (src.charAt(i) === ">") i++;
 
         var children = [];
-        var text = "";
+        // Accumulation en tableau + un seul join() final, plutôt que
+        // `text += ...` caractère par caractère : ExtendScript (contrairement
+        // aux moteurs JS modernes qui optimisent la concaténation via des
+        // structures en corde) copie la string entière à chaque `+=`, donc
+        // O(n²) sur un texte de n caractères accumulé un par un. Le run de
+        // texte "plat" (hors balises) est en plus extrait en UN SEUL
+        // substring() par run plutôt qu'un charAt()+push() par caractère.
+        var textParts = [];
 
         while (i < n) {
             if (src.charAt(i) === "<") {
@@ -362,20 +369,21 @@ function parseXML(xmlStr) {
                 } else if (src.substr(i, 9) === "<![CDATA[") {
                     var ec3 = src.indexOf("]]>", i);
                     if (ec3 < 0) { i = n; break; }
-                    text += src.substring(i + 9, ec3);
+                    textParts.push(src.substring(i + 9, ec3));
                     i = ec3 + 3;
                 } else {
                     var child = parseElement();
                     if (child) children.push(child);
                 }
             } else {
-                text += src.charAt(i);
-                i++;
+                var textRunStart = i;
+                while (i < n && src.charAt(i) !== "<") i++;
+                textParts.push(src.substring(textRunStart, i));
             }
         }
 
         if (children.length > 0) node.children = children;
-        var trimmed = text.replace(/^\s+|\s+$/g, "");
+        var trimmed = textParts.join("").replace(/^\s+|\s+$/g, "");
         if (trimmed && children.length === 0) node.text = decodeEntities(trimmed);
 
         return node;
