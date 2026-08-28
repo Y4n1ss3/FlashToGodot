@@ -38,23 +38,28 @@ if (typeof fl !== "undefined") fl.trace(">>> godotBuilder_v4 LOADED <<<");
  *     en continu tous les AnimationPlayer même hors écran (FPS moyen en
  *     baisse sur une salle avec plusieurs instances) — d'où le choix final
  *     de corriger le rect plutôt que de retirer le mécanisme.
- * godotBuilder v4.12 - Promotion de la racine de scène en shape unique
- *   - `_promoteRootSingleShapeChild` : quand la racine d'une scène symbole
- *     n'a, en dehors d'AnimationPlayer/VisibleOnScreenEnabler2D, qu'UN SEUL enfant de contenu
- *     (éventuellement au bout d'une chaîne de
- *     wrappers Node2D purement organisationnels sans transform/visible/
- *     material/groups propres), et que ce contenu est un Polygon2D/
- *     Line2D, root ADOPTE directement le type et les propriétés de ce
- *     shape (même principe que le "node = 1er élément" de v4.7, appliqué
- *     au root lui-même). Très fréquent sur les petits symboles à une
- *     seule forme (accessoires, icônes...) : -1 node par scène concernée,
- *     multiplié par chaque instanciation du symbole au runtime.
- *   - Tourne AVANT `anim.optimizeTracks`/toute génération de texte
- *     d'animation (contrairement à v4.10, restreinte aux sous-arbres 100%
- *     statiques car elle tourne APRÈS que les NodePath soient figées en
- *     texte) : peut donc promouvoir un shape directement animé, en
- *     réécrivant en amont, dans anim.tracks, le préfixe de chemin du node
- *     supprimé pour qu'il pointe vers root une fois le wrapper disparu.
+ * godotBuilder v4.12 - REVERTÉ - Promotion de la racine de scène en shape unique
+ *   - Tentative : `_promoteRootSingleShapeChild` faisait adopter par la
+ *     racine d'une scène symbole le type et les propriétés de son unique
+ *     enfant Polygon2D/Line2D (même principe que le "node = 1er élément"
+ *     de v4.7, appliqué au root lui-même) pour économiser un node.
+ *   - BUG CONFIRMÉ EN PRODUCTION : quand ce shape avait son propre
+ *     position/rotation/scale (cas quasi systématique — les sommets d'un
+ *     symbole Flash sont presque toujours définis loin de son point
+ *     d'origine), cet offset se retrouvait sur la RACINE de la scène. Or
+ *     toute scène instanciée ailleurs (ex: torche_3.tscn instanciant
+ *     torchemanche.tscn) déclare son propre `position` sur le node
+ *     d'instance, qui REMPLACE entièrement celle de la racine instanciée
+ *     (Godot ne les additionne pas). L'offset interne du shape disparaissait
+ *     donc purement et simplement, décalant l'élément à l'écran.
+ *   - Contrairement à v4.9 (`_mergeSameColorSiblings`), qui cuit le
+ *     transform des nodes fusionnés directement dans les sommets (donc
+ *     jamais exposé à un override externe), v4.12 laissait le transform
+ *     en propriété de node sur la racine — la seule position exposée à un
+ *     override par l'instancieur. Un correctif correct existe (cuire le
+ *     transform du shape dans son polygon/uv avant promotion, comme le
+ *     fait déjà v4.9) mais n'a pas été implémenté ; la fonction a été
+ *     retirée entièrement en attendant.
  * godotBuilder v4.11 - Pré-teinte des shapes à couleur statique (color transform)
  *   - `_bakeStaticShaderTints` : pour toute shape utilisant le shader
  *     "Advanced Color Effect" de Flash (color_mult/color_offset_255) dont
@@ -1134,102 +1139,6 @@ GAnimation.prototype.optimizeTracks = function(root) {
     }
     this.tracks = optimizedTracks;
 };
-
-
-// Promeut la racine de scène elle-même en shape unique (même principe que
-// le "node lui-même = 1er élément" de v4.7, mais appliqué au ROOT de la
-// scène) : quand root n'a, en dehors d'AnimationPlayer/VisibleOnScreenEnabler2D, qu'UN SEUL enfant
-// de contenu, et que cet enfant (ou une
-// chaîne de wrappers Node2D "passe-plat" purement organisationnels sans
-// transform/visible/material/groups propres qui mène à lui) est un
-// Polygon2D/Line2D, root ADOPTE le type et les propriétés de ce shape :
-// le wrapper disparaît, root DEVIENT directement le Polygon2D/Line2D, et
-// les éventuels petits-enfants (Poly_1/Line_0... autres groupes de couleur
-// de la même shape, v4.7) remontent en enfants directs de root.
-// Cas très fréquent sur les petits symboles à une seule forme (accessoires,
-// icônes...) : leur scène entière n'était jusqu'ici composée que d'un
-// Node2D racine "vide" enveloppant ce shape unique.
-// Contrairement à `_flattenSingleChildGroups` (v4.10, restreint aux sous-
-// arbres 100% statiques car les NodePath des animations sont déjà
-// sérialisées en texte au moment où elle tourne), cette passe s'exécute
-// AVANT `anim.optimizeTracks`/toute génération de texte d'animation (voir
-// site d'appel), donc AVANT qu'aucun NodePath("...") ne soit figé : elle
-// peut donc aussi promouvoir un shape directement animé (position/
-// rotation/couleur/polygon...), en réécrivant simplement en amont, dans
-// anim.tracks, le préfixe de chemin du node supprimé ("Wrap/shape:prop"
-// -> ".:prop", "Wrap/shape/enfant:prop" -> "enfant:prop") pour qu'il
-// pointe vers root une fois le wrapper disparu.
-function _promoteRootSingleShapeChild(root, anim) {
-    var HELPER_TYPES = { "AnimationPlayer": true, "VisibleOnScreenEnabler2D": true };
-    function contentChildrenOf(node) {
-        var out = [];
-        for (var i = 0; i < node.children.length; i++) {
-            if (!HELPER_TYPES[node.children[i].type]) out.push(node.children[i]);
-        }
-        return out;
-    }
-    var TRANSFORM_PROPS = ["position", "rotation", "scale", "skew"];
-    function isPassThroughWrapper(n) {
-        if (n.type !== "Node2D") return false;
-        for (var i = 0; i < TRANSFORM_PROPS.length; i++) {
-            if (n.properties[TRANSFORM_PROPS[i]] !== undefined) return false;
-        }
-        // "modulate" : un Node2D wrapper d'instance peut porter une vraie
-        // teinte "Advanced Color Effect" sans passer par un shader/material
-        // (cf. le "else" de la gestion du color effect, qui écrit
-        // modulate/self_modulate directement sur le wrapper) — jamais
-        // silencieusement perdue en traversant le wrapper.
-        return n.properties["visible"] === undefined
-            && n.properties["material"] === undefined
-            && n.properties["groups"] === undefined
-            && n.properties["modulate"] === undefined
-            && n.properties["self_modulate"] === undefined;
-    }
-
-    // Descend depuis root tant qu'on ne croise que des wrappers "passe-
-    // plat" à un seul enfant, jusqu'à trouver le shape terminal (ou
-    // abandonner si la structure ne correspond pas au patron attendu).
-    var wrappers = [];
-    var cursor = root;
-    var shape = null;
-    while (true) {
-        var kids = contentChildrenOf(cursor);
-        if (kids.length !== 1) return;
-        var only = kids[0];
-        if (only.type === "Polygon2D" || only.type === "Line2D") { shape = only; break; }
-        if (!isPassThroughWrapper(only)) return;
-        wrappers.push(only);
-        cursor = only;
-    }
-
-    var oldPrefix = root.getPathTo(shape);
-    if (anim && anim.tracks) {
-        for (var t = 0; t < anim.tracks.length; t++) {
-            var tr = anim.tracks[t];
-            if (tr.type === "method") continue;
-            var colonIdx = tr.path.indexOf(":");
-            var nodePath = (colonIdx !== -1) ? tr.path.substring(0, colonIdx) : tr.path;
-            var propSuffix = (colonIdx !== -1) ? tr.path.substring(colonIdx) : "";
-            if (nodePath === oldPrefix) {
-                tr.path = "." + propSuffix;
-            } else if (nodePath.indexOf(oldPrefix + "/") === 0) {
-                tr.path = nodePath.substring(oldPrefix.length + 1) + propSuffix;
-            }
-        }
-    }
-
-    root.type = shape.type;
-    for (var key in shape.properties) {
-        if (shape.properties.hasOwnProperty(key)) root.properties[key] = shape.properties[key];
-    }
-
-    var grandchildren = shape.children.slice();
-    shape.parent.removeChild(shape);
-    for (var g = 0; g < grandchildren.length; g++) root.addChild(grandchildren[g]);
-    for (var w = 0; w < wrappers.length; w++) {
-        if (wrappers[w].parent) wrappers[w].parent.removeChild(wrappers[w]);
-    }
-}
 
 
 // Supprime les wrappers Node2D "vides" : un container organisationnel
@@ -3569,13 +3478,6 @@ function buildSceneForSymbol(sym, frameRate, exportDir, boundsLookup, boundsInde
         }
     }
 
-    // v4.12 : DOIT tourner avant toute génération de texte d'animation
-    // (RESET/labels ci-dessous, et même avant optimizeTracks) : elle
-    // réécrit les chemins dans anim.tracks, donc tout ce qui lit ces
-    // chemins après coup (optimizeTracks compris) doit voir la version
-    // déjà corrigée.
-    _promoteRootSingleShapeChild(root, anim);
-
     if (hasAnimation) {
         anim.optimizeTracks(root);
         
@@ -4024,9 +3926,9 @@ function buildGodotScenes(doc, data, exportDir) {
     // autre symbole, n'a pas besoin de son propre VisibleOnScreenEnabler2D
     // -- l'ancêtre qui l'instancie désactive déjà tout son sous-arbre via
     // process_mode quand il sort de l'écran, donc aussi l'AnimationPlayer
-    // de ce symbole (voir _promoteRootSingleShapeChild... non, voir plutôt
-    // la création de l'enabler dans buildSceneForSymbol). Réutilise le
-    // graphe `referencedBy` déjà calculé ci-dessus pour le worklist shader.
+    // de ce symbole (voir la création de l'enabler dans buildSceneForSymbol).
+    // Réutilise le graphe `referencedBy` déjà calculé ci-dessus pour le
+    // worklist shader.
     // Limite acceptée : si TOUS les parents d'un symbole s'avèrent
     // eux-mêmes non-animés (single-frame, donc sans enabler propre), ce
     // symbole perd son culling individuel pour rien -- cas marginal en
