@@ -1,4 +1,4 @@
-if (typeof fl !== "undefined") fl.trace(">>> godotBuilder_v4 LOADED <<<");
+﻿if (typeof fl !== "undefined") fl.trace(">>> godotBuilder_v4 LOADED <<<");
 
 // Detailed version history (v4.6 -> v4.15): see readme.md, "Version
 // History" section. Summary of the node-reduction passes currently active
@@ -250,12 +250,37 @@ function _bridgeHoles(outerVerts, holesArr) {
         // candidate and, if ITS full result self-intersected, gave up on
         // the hole entirely (leaving it completely uncut) instead of
         // falling through to the next-closest candidate.
-        var eps = 0.05;
+        // eps of 0.05 passed our OWN self-intersection check (strict
+        // crossing only) but left the two "return" points of every bridge
+        // only ~0.05 units apart -- a near-coincident pinch that a
+        // topology-valid-but-degenerate-tolerant library (earcut) handles
+        // fine, but that Godot's own Polygon2D triangulator can apparently
+        // fail on SILENTLY (no error, just nothing drawn): confirmed on a
+        // real multi-hole shape (13 holes) where every hole's bridge seam
+        // sat at exactly this distance. 0.5 gives ear-clipping meaningfully
+        // more room while staying visually negligible against shapes drawn
+        // at Flash's native scale (thousands of units).
+        var eps = 0.5;
         var maxCheck = candidates.length;
         var bridgeApplied = false;
         for (var c = 0; c < maxCheck; c++) {
             var ci = candidates[c].i;
             var cj = candidates[c].j;
+            // A hole vertex already sitting (near-)exactly on top of an
+            // outer-contour vertex is always the closest possible
+            // candidate (distance ~0), so the loop would otherwise always
+            // pick it first -- but that makes work[ci] and hole[cj] the
+            // SAME point, duplicated in the bridged output at two
+            // non-adjacent indices: a genuine zero-width pinch (distinct
+            // from the eps-offset "return" points below, which stay a
+            // real, non-zero distance apart). Confirmed on a real 13-hole
+            // shape where every hole contributed exactly one such exact-
+            // duplicate pair. _hasSelfIntersection's strict crossing-only
+            // test doesn't flag a touch like this, but it's a classic
+            // ear-clipping killer for Godot's own triangulator (silently
+            // renders nothing, no error). Skip it and let the retry loop
+            // fall through to the next-closest DISTINCT candidate instead.
+            if (candidates[c].d < 1.0) continue;
             if (_bridgeBlocked(work[ci], hole[cj], work, ci, hole, cj)) continue;
 
             var dx = work[ci].x - hole[cj].x;
@@ -288,8 +313,339 @@ function _bridgeHoles(outerVerts, holesArr) {
         if (!bridgeApplied) continue;
     }
 
-    return work;
+    return _nudgeCoincidentVertices(work);
 }
+
+// Standard ray-casting point-in-polygon test (odd-crossing rule).
+function _pointInPolygon(pt, poly) {
+    var inside = false;
+    var n = poly.length;
+    for (var i = 0, j = n - 1; i < n; j = i++) {
+        var xi = poly[i].x, yi = poly[i].y, xj = poly[j].x, yj = poly[j].y;
+        var intersect = ((yi > pt.y) !== (yj > pt.y)) && (pt.x < (xj - xi) * (pt.y - yi) / (yj - yi) + xi);
+        if (intersect) inside = !inside;
+    }
+    return inside;
+}
+
+// Splits an outer polygon containing `holesArr` holes into an array of
+// SIMPLE, hole-free polygon vertex-loops whose union reconstructs the
+// original polygon-with-holes -- an alternative to _bridgeHoles's "merge
+// everything into one contour via a near-zero-width channel" technique.
+// Each hole is "vented" out via TWO real, well-separated cuts (not one
+// near-zero-width one), splitting whichever current piece contains it
+// into two honest simple polygons: no thin channels, no near-duplicate
+// points, nothing for Godot's own Polygon2D triangulation to choke on
+// (see _bridgeHoles's header for the failure this sidesteps). Preferred
+// over bridging+precomputed-mesh: every resulting piece is a plain
+// Polygon2D "polygons" entry, so shapes stay fully native (visible/
+// editable like any other Polygon2D, no MeshInstance2D/custom script).
+//
+// Falls back to _bridgeHoles (merging into the SAME piece, single-cut)
+// for any hole a clean 2-cut split can't be found for -- confirmed
+// necessary on real shapes: a few holes are thin enough (near-degenerate
+// slivers) that no valid non-self-intersecting 2-cut split exists at all,
+// while a single thin bridge still works fine for them (its failure mode
+// is different -- see _bridgeHoles's own extensive hardening). Never
+// leaves a hole completely unaddressed as a last resort: if even that
+// fails, the hole is returned in `unvented` and the CALLER decides
+// whether to accept the shape uncut there or reject the whole polygon.
+function _splitHoles(outerVerts, holesArr) {
+    var pieces = [outerVerts.slice()];
+    if (!holesArr || holesArr.length === 0) return { pieces: pieces, unvented: [] };
+
+    var holes = holesArr.slice();
+    holes.sort(function (a, b) { return _polyBBoxArea(b) - _polyBBoxArea(a); });
+
+    var unvented = [];
+    for (var h = 0; h < holes.length; h++) {
+        var hole = holes[h];
+        var pieceIdx = _findPieceContaining(pieces, hole);
+        if (pieceIdx === -1) { unvented.push(hole); continue; }
+        var split = _splitPieceByHole(pieces[pieceIdx], hole);
+        if (split) {
+            pieces.splice(pieceIdx, 1, split.pieceA, split.pieceB);
+            continue;
+        }
+        var bridged = _bridgeHoles(pieces[pieceIdx], [hole]);
+        if (bridged && !_hasSelfIntersection(bridged)) {
+            pieces[pieceIdx] = bridged;
+        } else {
+            unvented.push(hole);
+        }
+    }
+    return { pieces: pieces, unvented: unvented };
+}
+
+// How far the split pieces' total area is from the polygon-with-holes'
+// own true area (outer minus every hole) -- the caller's signal for
+// whether to trust this split or fall back to the old single-bridge
+// technique for this one sub-polygon. Complements _splitHoles's own
+// "unvented"/self-intersection safeguards: those catch outright failures,
+// this catches a MECHANICALLY valid-looking split (every piece simple, no
+// hole left unaddressed) that still ends up geometrically wrong -- e.g. a
+// hole "vented" against the wrong piece, or into a piece with too little
+// candidate density to find the truly nearest cut points (confirmed on
+// real shapes with many holes close together).
+function _splitAreaDeviation(polyData, pieces) {
+    var outerArea = Math.abs(_signedAreaSum(polyData.vertices)) / 2;
+    if (outerArea < 1e-6) return 0;
+    var holeAreaSum = 0;
+    for (var i = 0; i < polyData.holes.length; i++) {
+        holeAreaSum += Math.abs(_signedAreaSum(polyData.holes[i])) / 2;
+    }
+    var expected = outerArea - holeAreaSum;
+    if (expected < 1e-6) return 0;
+    var totalArea = 0;
+    for (var i = 0; i < pieces.length; i++) {
+        totalArea += Math.abs(_signedAreaSum(pieces[i])) / 2;
+    }
+    return Math.abs(expected - totalArea) / expected;
+}
+
+function _polyBBoxArea(verts) {
+    var minX = verts[0].x, maxX = verts[0].x, minY = verts[0].y, maxY = verts[0].y;
+    for (var i = 1; i < verts.length; i++) {
+        if (verts[i].x < minX) minX = verts[i].x; if (verts[i].x > maxX) maxX = verts[i].x;
+        if (verts[i].y < minY) minY = verts[i].y; if (verts[i].y > maxY) maxY = verts[i].y;
+    }
+    return (maxX - minX) * (maxY - minY);
+}
+
+// Which of the current pieces geometrically contains this hole. Usually a
+// plain point-in-polygon test on the hole's own first vertex; falls back
+// to "piece with the nearest vertex" for a hole thin/degenerate enough
+// (e.g. a hairline crack in the artwork) to fail strict containment
+// against every piece -- confirmed on a real shape where a ~1-unit-tall
+// sliver hole tested as outside its own outer polygon by every variant of
+// point-in-polygon tried (ray-casting both axes, winding number) despite
+// visibly belonging there.
+function _findPieceContaining(pieces, hole) {
+    for (var i = 0; i < pieces.length; i++) {
+        if (_pointInPolygon(hole[0], pieces[i])) return i;
+    }
+    var best = -1, bestD = Infinity;
+    for (var i = 0; i < pieces.length; i++) {
+        for (var v = 0; v < pieces[i].length; v++) {
+            var dx = pieces[i][v].x - hole[0].x, dy = pieces[i][v].y - hole[0].y;
+            var d = dx * dx + dy * dy;
+            if (d < bestD) { bestD = d; best = i; }
+        }
+    }
+    return best;
+}
+
+// Splits ONE piece around ONE hole into two simple polygons via two
+// cuts. Returns { pieceA, pieceB } or null if no valid split was found.
+//
+// A "cut1 doesn't cross anything, cut2 doesn't cross anything, cut1
+// doesn't cross cut2" candidate pair is NECESSARY but not SUFFICIENT: if
+// the hole-side endpoints end up paired with the "wrong" piece-side
+// endpoints (Pa should connect to whichever hole point makes the walk
+// non-crossing, not just whichever is nearest), neither cut crosses the
+// other yet the ASSEMBLED piece still self-intersects (confirmed on a
+// real single-hole shape). Verify the actual constructed pieces, not
+// just the two candidate segments in isolation, and keep trying
+// candidate pairs until both halves come out simple.
+function _splitPieceByHole(piece, hole) {
+    var m = piece.length, k = hole.length;
+    var outerSign = _signedAreaSum(piece) > 0 ? 1 : -1;
+    var holeSign = _signedAreaSum(hole) > 0 ? 1 : -1;
+    var h = hole.slice();
+    if (holeSign === outerSign) h.reverse();
+
+    var candidates = [];
+    var maxCand = 250;
+    function addCandidate(pi, hi, d) {
+        if (candidates.length < maxCand) {
+            candidates.push({ pi: pi, hi: hi, d: d });
+        } else {
+            var worst = 0;
+            for (var c = 1; c < candidates.length; c++) if (candidates[c].d > candidates[worst].d) worst = c;
+            if (d < candidates[worst].d) candidates[worst] = { pi: pi, hi: hi, d: d };
+        }
+    }
+    // A fixed "1 sample per ~60 vertices" step (the original version of
+    // this line) is catastrophically coarse for a SMALL hole against a
+    // LARGE piece: confirmed on a real 13-vertex hole against a
+    // 1967-vertex piece, where only every 32nd piece vertex ever got
+    // sampled -- the algorithm never even SAW the true nearest piece
+    // point, picked a much farther one from the sparse sample instead,
+    // and produced a valid-but-wrong split (204 piece vertices pulled
+    // into a small hole's piece, overlapping a sibling piece with neither
+    // half technically self-intersecting on its own). Match
+    // _bridgeHoles's own candidate-density formula instead: full density
+    // (step 1) unless work*hole exceeds 20000 comparisons, in which case
+    // step scales with sqrt(ratio) -- keeps candidates dense whenever the
+    // problem size allows it, at all.
+    var totalLoops = m * k;
+    var stepP = 1, stepH = 1;
+    if (totalLoops > 20000) {
+        var ratio = Math.sqrt(totalLoops / 20000);
+        stepP = Math.ceil(ratio);
+        stepH = Math.ceil(ratio);
+    }
+    for (var pi = 0; pi < m; pi += stepP) {
+        for (var hi = 0; hi < k; hi += stepH) {
+            var dx = piece[pi].x - h[hi].x, dy = piece[pi].y - h[hi].y;
+            addCandidate(pi, hi, dx * dx + dy * dy);
+        }
+    }
+    candidates.sort(function (a, b) { return a.d - b.d; });
+
+    function segOk(A, B) {
+        for (var i = 0; i < m; i++) {
+            var ni = (i + 1) % m;
+            if (_segCross(A, B, piece[i], piece[ni])) return false;
+        }
+        for (var i = 0; i < k; i++) {
+            var ni = (i + 1) % k;
+            if (_segCross(A, B, h[i], h[ni])) return false;
+        }
+        return true;
+    }
+
+    function walk(arr, from, to) {
+        var out = [];
+        var n = arr.length;
+        var i = from;
+        while (true) {
+            out.push(arr[i]);
+            if (i === to) break;
+            i = (i + 1) % n;
+        }
+        return out;
+    }
+
+    var minSep = Math.max(1, Math.floor(k / 4));
+    var validA = [];
+    for (var c = 0; c < candidates.length; c++) {
+        if (segOk(piece[candidates[c].pi], h[candidates[c].hi])) validA.push(candidates[c]);
+        if (validA.length >= 12) break;
+    }
+
+    // Full self-intersection is O(n) here (grid-accelerated, see
+    // _hasSelfIntersection) but still real work per attempt -- capped,
+    // same rationale as _bridgeHoles's own candidate cap.
+    var fullChecks = 0, maxFullChecks = 60;
+    for (var ai = 0; ai < validA.length; ai++) {
+        var candA = validA[ai];
+        var triedB = 0;
+        for (var c = 0; c < candidates.length && triedB < 12; c++) {
+            var candB = candidates[c];
+            var sep = Math.abs(candB.hi - candA.hi);
+            sep = Math.min(sep, k - sep);
+            if (sep < minSep) continue;
+            if (candB.pi === candA.pi) continue;
+            if (!segOk(piece[candB.pi], h[candB.hi])) continue;
+            if (_segCross(piece[candA.pi], h[candA.hi], piece[candB.pi], h[candB.hi])) continue;
+            triedB++;
+
+            var Pa = candA.pi, Ha = candA.hi, Pb = candB.pi, Hb = candB.hi;
+            var piece1 = walk(piece, Pa, Pb).concat(walk(h, Hb, Ha));
+            var piece2 = walk(piece, Pb, Pa).concat(walk(h, Ha, Hb));
+            fullChecks++;
+            if (_hasSelfIntersection(piece1) || _hasSelfIntersection(piece2)) {
+                if (fullChecks >= maxFullChecks) return null;
+                continue;
+            }
+
+            return { pieceA: piece1, pieceB: piece2 };
+        }
+    }
+    return null;
+}
+
+// A hole's own contour, as extracted from Flash, can already contain an
+// exact (or near-exact) duplicate of one of its own vertices, or happen to
+// touch the outer contour at a point other than wherever its bridge was
+// connected -- independent of which candidate _bridgeHoles picked (see the
+// candidates[c].d < 1.0 skip above, which only guards the CONNECTION point
+// itself). Confirmed on a real 13-hole shape: skipping degenerate
+// connection candidates alone left several such pairs behind. Either case
+// leaves two NON-ADJACENT indices at the exact same position -- a
+// zero-width pinch that Godot's own Polygon2D triangulator can silently
+// fail on (no error, nothing drawn) even though it isn't a true
+// self-intersection (_hasSelfIntersection's strict crossing-only test
+// doesn't flag a touch). Nudge the later of each such pair a hair off its
+// own local edge direction to break the exact coincidence -- but a naive
+// nudge can just as easily push that point INTO a genuine crossing with a
+// nearby edge on a dense contour (found on this exact real shape: the
+// first, non-verifying version of this function introduced a real
+// self-intersection where there had only been a touch before). Verify
+// every attempted nudge against the whole array and only keep it if it
+// doesn't create one; leave the pair untouched (accepting the lesser-risk
+// touch) if none of the tried offsets work.
+function _nudgeCoincidentVertices(verts) {
+    var n = verts.length;
+    if (n < 4) return verts;
+    var threshold = 0.05; // linear distance; tight enough to only catch genuine coincidences, not legitimately dense/close artwork
+    var cellSize = threshold * 8;
+    var grid = {};
+    function cellKey(x, y) { return Math.floor(x / cellSize) + "_" + Math.floor(y / cellSize); }
+    for (var i = 0; i < n; i++) {
+        var k = cellKey(verts[i].x, verts[i].y);
+        if (!grid[k]) grid[k] = [];
+        grid[k].push(i);
+    }
+    var pairs = [];
+    for (var i = 0; i < n; i++) {
+        var cx = Math.floor(verts[i].x / cellSize), cy = Math.floor(verts[i].y / cellSize);
+        for (var dxp = -1; dxp <= 1; dxp++) {
+            for (var dyp = -1; dyp <= 1; dyp++) {
+                var arr = grid[(cx + dxp) + "_" + (cy + dyp)];
+                if (!arr) continue;
+                for (var a = 0; a < arr.length; a++) {
+                    var j = arr[a];
+                    if (j <= i) continue;
+                    var dIdx = Math.min(Math.abs(j - i), n - Math.abs(j - i));
+                    if (dIdx <= 1) continue;
+                    var ddx = verts[i].x - verts[j].x, ddy = verts[i].y - verts[j].y;
+                    if (ddx * ddx + ddy * ddy >= threshold * threshold) continue;
+                    pairs.push(j);
+                }
+            }
+        }
+    }
+
+    for (var p = 0; p < pairs.length; p++) {
+        var j = pairs[p];
+        var prev = verts[(j - 1 + n) % n], next = verts[(j + 1) % n];
+        var ex = next.x - prev.x, ey = next.y - prev.y;
+        var elen = Math.sqrt(ex * ex + ey * ey);
+        if (elen > 0.0001) { ex /= elen; ey /= elen; } else { ex = 1; ey = 0; }
+        var original = verts[j];
+        // Perpendicular-to-local-tangent offsets are the least likely to
+        // cross a neighboring edge on a dense contour, so tried first; a
+        // fuller ring of directions (8 angles x 3 radii) is tried after in
+        // case the local geometry near this particular point rules those
+        // out too -- confirmed necessary on this real shape (a few pairs
+        // needed the wider search).
+        var candidates = [
+            { x: original.x - ey * 0.5, y: original.y + ex * 0.5 },
+            { x: original.x + ey * 0.5, y: original.y - ex * 0.5 },
+            { x: original.x - ey * 1.5, y: original.y + ex * 1.5 },
+            { x: original.x + ey * 1.5, y: original.y - ex * 1.5 }
+        ];
+        var radii = [0.5, 1.5, 3.0];
+        for (var ri = 0; ri < radii.length; ri++) {
+            for (var ang = 0; ang < 8; ang++) {
+                var theta = (ang / 8) * Math.PI * 2;
+                candidates.push({
+                    x: original.x + Math.cos(theta) * radii[ri],
+                    y: original.y + Math.sin(theta) * radii[ri]
+                });
+            }
+        }
+        for (var c = 0; c < candidates.length; c++) {
+            verts[j] = { x: candidates[c].x, y: candidates[c].y, br: original.br };
+            if (!_hasSelfIntersection(verts)) break;
+            verts[j] = original;
+        }
+    }
+    return verts;
+}
+
 
 /**
  * Detects and tries to fix a STRICT self-intersection (transverse crossing)
@@ -437,7 +793,7 @@ function _hasSelfIntersection(verts) {
 /**
  * T-junction repair between adjacent polygons of the same shape.
  *
- * Problem: inspector.jsfl subdivides Bézier curves independently for each
+ * Problem: inspector.jsfl subdivides BÃ©zier curves independently for each
  * contour (fill). Two adjacent fills share the same curve as their
  * boundary, but Casteljau subdivision can produce slightly different
  * intermediate points on each side (~0.2 Flash unit). Result: a vertex V
@@ -447,23 +803,23 @@ function _hasSelfIntersection(verts) {
  * Fix: for each vertex V of a polygon A, if V is close to an edge PQ of
  * another polygon B (distance < tolerance), insert V into B between P and
  * Q. After the repair, the two polygons share the exact same vertices
- * along their common boundary → no more gap.
+ * along their common boundary â†’ no more gap.
  *
- * Complexity: O(V × E × P) where V = total vertices, E = edges per poly,
+ * Complexity: O(V Ã— E Ã— P) where V = total vertices, E = edges per poly,
  * P = number of polys. For a typical shape (5-10 polys, 20-50 vertices),
- * that's ~50K iterations — instant.
+ * that's ~50K iterations â€” instant.
  */
 
 
 // Cleans up a contour of raw Flash vertices before Godot triangulation:
-// - merges consecutive near-identical points (distance² < 1e-6),
+// - merges consecutive near-identical points (distanceÂ² < 1e-6),
 // - eliminates degenerate back-and-forths (two consecutive segments that
-//   nearly reverse direction, dot product < -0.99, typical of a Bézier
+//   nearly reverse direction, dot product < -0.99, typical of a BÃ©zier
 //   subdivision tip folding back on itself),
 // - removes the last point if it coincides with the first (contour
 //   already explicitly closed),
 // - repairs residual self-intersections (only on reasonably-sized
-//   contours, ≤ 500 vertices: `_hasSelfIntersection` is O(V²), useless/
+//   contours, â‰¤ 500 vertices: `_hasSelfIntersection` is O(VÂ²), useless/
 //   costly beyond that).
 // Pure function: depends only on its input, touches no state of
 // _processElementNode.
@@ -1016,7 +1372,7 @@ GAnimation.prototype.optimizeTracks = function(root) {
             // (times[0] <= 0.0005), writing the value into the .tscn is
             // perfectly safe: it's exactly what the AnimationPlayer will
             // show from the start. Without this write, the Polygon2D stay
-            // with an empty polygon in the .tscn → they're transparent
+            // with an empty polygon in the .tscn â†’ they're transparent
             // when the scene is instanced in a parent scene before the
             // AnimationPlayer has played yet (e.g. opening it in the
             // editor).
@@ -1351,7 +1707,7 @@ function _markBakeableShapes(root, anim) {
 // Never touches the UV: each vertex keeps its original UV, correctly
 // computed at initial generation time (regardless of the node's final
 // position, including for a real gradient whose matrix differs per shape
-// — only the "polygon" points need to be brought back into the parent's
+// â€” only the "polygon" points need to be brought back into the parent's
 // local space via the merged node's own transform).
 // ONLY merges nodes already marked _mergeSafe (so guaranteed not targeted
 // by any AnimationPlayer track) and without their own material, so as to
@@ -2544,9 +2900,19 @@ function _processElementNode(elem, parent, ownerRoot, anim, startTime, duration,
             // Poly_X and anim._maxPoly) apply the same -1 offset to stay
             // consistent with this naming.
 
+            // Captured once, BEFORE the loop, and reused for every gIdx:
+            // the Poly_N naming offset must stay based on what `node` WAS
+            // when this element started, not be re-derived from
+            // node.type mid-loop -- a past version of this code mutated
+            // node.type for gIdx===0 partway through (an experiment since
+            // reverted), which silently shifted gIdx===1's (and beyond)
+            // names by one the moment gIdx===0 switched away from
+            // Polygon2D (confirmed with a real 54-polygon shape: the
+            // second group ended up "Poly_1" instead of "Poly_0").
+            var rootIsPolygon2D = (node.type === "Polygon2D");
             for (var gIdx = 0; gIdx < polyGroups.length; gIdx++) {
                 var group = polyGroups[gIdx];
-                var polyNodeName = (gIdx === 0 && node.type === "Polygon2D") ? "" : "Poly_" + ((gIdx > 0 && node.type === "Polygon2D") ? (gIdx - 1) : gIdx);
+                var polyNodeName = (gIdx === 0 && rootIsPolygon2D) ? "" : "Poly_" + ((gIdx > 0 && rootIsPolygon2D) ? (gIdx - 1) : gIdx);
                 var polyNode;
                 
                 if (polyNodeName === "") {
@@ -2567,7 +2933,7 @@ function _processElementNode(elem, parent, ownerRoot, anim, startTime, duration,
                 var vertexOffset = 0;
                 var hasUv = false;
                 var invA, invB, invC, invD, invTx, invTy;
-                
+
                 if (!group) {
                     __log("ERROR: group is undefined! gIdx=" + gIdx + " length=" + polyGroups.length + " in elem=" + elem.name);
                     for (var dbg = 0; dbg < polyGroups.length; dbg++) {
@@ -2592,50 +2958,77 @@ function _processElementNode(elem, parent, ownerRoot, anim, startTime, duration,
 
                 for (var p = 0; p < group.polygons.length; p++) {
                     var polyData = group.polygons[p];
-                    var effectiveVerts = polyData.vertices;
-                    var isBridged = false;
+                    var piecesToEmit;
+
                     if (polyData.holes && polyData.holes.length > 0) {
-                        var bridged = _bridgeHoles(polyData.vertices, polyData.holes);
-                        if (bridged && (bridged.length > 500 || !_hasSelfIntersection(bridged))) {
-                            effectiveVerts = bridged;
-                            isBridged = true;
+                        // Split into simple, hole-free pieces (real cuts,
+                        // no thin channels) instead of bridging into one
+                        // contour -- keeps every resulting shape a plain
+                        // Polygon2D "polygons" entry, native/visible/
+                        // editable like any other, with no dependency on
+                        // Godot's own triangulation being able to handle a
+                        // hole-bridged contour (see _splitHoles's header:
+                        // that triangulation can silently produce ZERO
+                        // triangles -- no error, nothing drawn -- on a
+                        // real, valid, non-self-intersecting bridged
+                        // polygon once it's complex enough).
+                        var splitResult = _splitHoles(polyData.vertices, polyData.holes);
+                        if (splitResult.unvented.length === 0 && _splitAreaDeviation(polyData, splitResult.pieces) <= 0.01) {
+                            piecesToEmit = splitResult.pieces;
                         } else {
-                            effectiveVerts = polyData.vertices;
+                            // Splitting couldn't cleanly account for every
+                            // hole on this particular shape (rare -- a
+                            // handful of real cases needed this out of the
+                            // whole library) -- fall back to the OLD
+                            // single-bridge technique for this ONE
+                            // sub-polygon, exactly as this codebase did
+                            // before _splitHoles existed. Whatever Godot's
+                            // own Polygon2D triangulation makes of that is
+                            // no worse than the pre-existing behavior this
+                            // session started from -- never a NEW
+                            // regression, only unfixed for this one case.
+                            var bridged = _bridgeHoles(polyData.vertices, polyData.holes);
+                            var effectiveVerts = (bridged && !_hasSelfIntersection(bridged)) ? bridged : polyData.vertices;
+                            piecesToEmit = [effectiveVerts];
                         }
+                    } else {
+                        piecesToEmit = [polyData.vertices];
                     }
 
-                    var finalVerts = _cleanupPolygonVertices(effectiveVerts);
+                    for (var pe = 0; pe < piecesToEmit.length; pe++) {
+                        var finalVerts = _cleanupPolygonVertices(piecesToEmit[pe]);
 
-                    var indices = [];
-                    for (var v = 0; v < finalVerts.length; v++) {
-                        var px = finalVerts[v].x;
-                        var py = finalVerts[v].y;
-                        pointsParts.push(_f(px * scaleFactor) + ", " + _f(py * scaleFactor));
-                        indices.push(vertexOffset + v);
-                        
-                        if (hasUv) {
-                            if (group.gradient) {
-                                var gx = px * invA + py * invC + invTx;
-                                var gy = px * invB + py * invD + invTy;
-                                var u = (gx + 819.2) / 1638.4;
-                                var v_uv = (gy + 819.2) / 1638.4;
-                                if (group.gradient.style === "linearGradient") {
-                                    u *= 256.0;
-                                    v_uv = 0.5;
+                        var indices = [];
+                        for (var v = 0; v < finalVerts.length; v++) {
+                            var px = finalVerts[v].x;
+                            var py = finalVerts[v].y;
+                            pointsParts.push(_f(px * scaleFactor) + ", " + _f(py * scaleFactor));
+                            indices.push(vertexOffset + v);
+
+                            if (hasUv) {
+                                if (group.gradient) {
+                                    var gx = px * invA + py * invC + invTx;
+                                    var gy = px * invB + py * invD + invTy;
+                                    var u = (gx + 819.2) / 1638.4;
+                                    var v_uv = (gy + 819.2) / 1638.4;
+                                    if (group.gradient.style === "linearGradient") {
+                                        u *= 256.0;
+                                        v_uv = 0.5;
+                                    } else {
+                                        u *= 64.0;
+                                        v_uv *= 64.0;
+                                    }
+                                    uvParts.push(_f(u) + ", " + _f(v_uv));
                                 } else {
-                                    u *= 64.0;
-                                    v_uv *= 64.0;
+                                    uvParts.push(_f(px / 1000.0) + ", " + _f(py / 1000.0));
                                 }
-                                uvParts.push(_f(u) + ", " + _f(v_uv));
                             } else {
-                                uvParts.push(_f(px / 1000.0) + ", " + _f(py / 1000.0));
+                                uvParts.push("0, 0");
                             }
-                        } else {
-                            uvParts.push("0, 0");
                         }
+                        polygonsParts.push("PackedInt32Array(" + indices.join(", ") + ")");
+                        vertexOffset += finalVerts.length;
                     }
-                    polygonsParts.push("PackedInt32Array(" + indices.join(", ") + ")");
-                    vertexOffset += finalVerts.length;
                 }
                 
                 var pointsStr = "PackedVector2Array(" + pointsParts.join(", ") + ")";
@@ -2714,9 +3107,14 @@ function _processElementNode(elem, parent, ownerRoot, anim, startTime, duration,
                 }
                 
                 var polyPath = variantPathStr + (polyNodeName ? "/" + polyNodeName : "");
+                // NOTE: polygonsParts.length, not group.polygons.length --
+                // splitting a hole-bridged sub-polygon can turn ONE
+                // group.polygons entry into SEVERAL accumulated
+                // pointsParts/polygonsParts pieces (see _splitHoles
+                // above), so the two can now legitimately disagree.
                 if (isStaticLayer && !elem._isTweenShape) {
                     polyNode.properties["polygon"] = pointsStr;
-                    if (group.polygons.length > 1) {
+                    if (polygonsParts.length > 1) {
                         polyNode.properties["polygons"] = polygonsStr;
                     } else {
                         delete polyNode.properties["polygons"];
@@ -2732,7 +3130,7 @@ function _processElementNode(elem, parent, ownerRoot, anim, startTime, duration,
                     }
                 } else {
                     anim.addTrackKey(polyPath + ":polygon", "value", startTime, pointsStr, 0.0);
-                    if (group.polygons.length > 1) {
+                    if (polygonsParts.length > 1) {
                         anim.addTrackKey(polyPath + ":polygons", "value", startTime, polygonsStr, 0.0);
                     } else {
                         anim.addTrackKey(polyPath + ":polygons", "value", startTime, "[]", 0.0);
@@ -2888,7 +3286,7 @@ function _processElementNode(elem, parent, ownerRoot, anim, startTime, duration,
     // Matrix decomposition computed once (instead of twice with the same
     // arguments): it feeds both the wrapper's initial values (the
     // isNewWrapper block right below) and the animation key at startTime
-    // (the "else if (elem.matrix)" block further down) — both use the
+    // (the "else if (elem.matrix)" block further down) â€” both use the
     // exact same elem.matrix.
     var _matDec = elem.matrix ? _decomposeMatrix(elem.matrix, elem) : null;
 
