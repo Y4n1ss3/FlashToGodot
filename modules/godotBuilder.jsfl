@@ -2722,7 +2722,7 @@ function _resolveElementNode(elem, parent, ownerRoot, wrapperName, shaderNeeds, 
             if (elem.polygons && elem.polygons.length > 0) {
                 node = new GNode(wrapperName, "Polygon2D");
                 node.properties["color"] = "Color(1, 1, 1, 1)";
-                if (!isStaticLayer || elem._isTweenShape) {
+                if ((!isStaticLayer || elem._isTweenShape) && !elem._isOrientationVariant) {
                     // A genuine multi-keyframe shape tween: TweenShapeMeshConverter.gd
                     // (written unconditionally alongside FlashMovieClip.gd) swaps this
                     // Polygon2D for a pre-triangulated MeshInstance2D the first time this
@@ -2731,6 +2731,14 @@ function _resolveElementNode(elem, parent, ownerRoot, wrapperName, shaderNeeds, 
                     // export time. The ":polygon"/":uv"/":polygons"/":texture"/":color"/
                     // ":visible" tracks below are emitted exactly as for any other
                     // animated shape; nothing else about this node changes.
+                    // elem._isOrientationVariant excludes the OTHER thing
+                    // that also produces a 4-keyframe layer here: a
+                    // variant scene's synthesized orientation "keyframes"
+                    // (FRONT/BACK/LEFT/RIGHT), which are 4 unrelated
+                    // snapshots, never a real polygon tween -- attaching
+                    // this script there was pointless work every scene
+                    // load (see _buildOrientationSynthSymbol, where the
+                    // flag is set).
                     node.properties["script"] = "ExtResource(\"" + getExt("res://scripts/TweenShapeMeshConverter.gd", "Script") + "\")";
                 }
             } else if (elem.elementType === "shape" && elem.strokes && elem.strokes.length > 0) {
@@ -4873,7 +4881,20 @@ function _inlineStaticInstances(elements, symbolMap, chain) {
 
         var innerElements = [];
         if (innerSym.layers) {
-            for (var l = 0; l < innerSym.layers.length; l++) {
+            // Reverse layer order: the rest of this pipeline treats layer
+            // index 0 as the TOPMOST (frontmost) Flash layer -- see
+            // layerZIndex = (sym.layers.length - 1 - i) * 1000 + e in the
+            // main element loop, which gives layer 0 the HIGHEST z. A flat
+            // array's own index doubles as ITS z-order (higher index =
+            // more front, same convention), so layer 0's elements need to
+            // end up LAST here, not first -- walking layers 0..N forward
+            // (the original code) put the frontmost layer's content
+            // FIRST, silently reversing the stacking of every multi-layer
+            // instance this function inlines. Confirmed on a real 17-layer
+            // symbol instanced inside a variant orientation (OUTFIT): its
+            // inlined content rendered in exactly the wrong front-to-back
+            // order.
+            for (var l = innerSym.layers.length - 1; l >= 0; l--) {
                 var layer = innerSym.layers[l];
                 if (layer.layerType === "guide" || layer.layerType === "folder") continue;
                 if (!layer.keyframes) continue;
@@ -5006,16 +5027,29 @@ function _buildOrientationSynthSymbol(group, orientNames, frameIdx, symbolMap, r
         // parallel artwork (LEFT/RIGHT mirrors, a real tween's matching
         // shape across frames) -- but some variant groups flatten (via
         // _inlineStaticInstances) to structurally unrelated content per
-        // orientation (e.g. FRONT=28 raw shapes vs. BACK=1 merged shape),
-        // where "shape rank 6" in FRONT (a stroke-only outline) and "shape
-        // rank 6" in LEFT (a plain fill) are unrelated shapes that happen
-        // to share a rank -- pooling them mixes their fill/stroke state
-        // (one orientation's :visible reset stomping another's).
+        // orientation (e.g. FRONT=23 raw shapes vs. BACK=2 merged shapes),
+        // where "shape rank 6" in FRONT and "shape rank 6" in LEFT are
+        // unrelated shapes that happen to share a rank -- pooling them
+        // mixes their state: not just fill/stroke composition (one
+        // orientation's :visible reset stomping another's), but also
+        // Z-ORDER, since the pooled node's sibling position (hence paint
+        // order) is decided once, by whichever orientation creates it
+        // first, and then imposed on every other orientation reusing that
+        // slot -- confirmed on a real 23-vs-2-vs-17-vs-17 case where two
+        // DIFFERENT-colored fills at the same rank (both "poly-only", so
+        // type-compatible) ended up pooled together, silently importing
+        // FRONT's paint order into LEFT/RIGHT's rendering of an unrelated
+        // piece.
         // Guard against that WITHOUT giving up pooling wholesale: only
         // split a given shape rank into separate per-orientation nodes when
-        // the orientations that reach it actually disagree on whether it
-        // has fill/stroke content -- ranks every orientation agrees on
-        // (the common case) stay pooled exactly as before.
+        // the orientations that reach it actually disagree on a cheap
+        // content signature (fill/stroke composition, count, and color/
+        // gradient style of the first fill and first stroke) -- ranks
+        // every orientation agrees on (the common case) stay pooled
+        // exactly as before. Not airtight (two genuinely different shapes
+        // could coincidentally share this signature at the same rank and
+        // still get wrongly pooled), but a large, cheap improvement over
+        // type-only matching.
         var shapeRankIdx = []; // per orientation: [indexIntoPerOrientElements, ...] for its "shape" elements, in order
         for (var o3 = 0; o3 < perOrientElements.length; o3++) {
             var ranks = [];
@@ -5028,12 +5062,25 @@ function _buildOrientationSynthSymbol(group, orientNames, frameIdx, symbolMap, r
         for (var o3b = 0; o3b < shapeRankIdx.length; o3b++) {
             if (shapeRankIdx[o3b].length > maxRank) maxRank = shapeRankIdx[o3b].length;
         }
+        function _orientShapeSig(sEl) {
+            var hasPolys = sEl.polygons && sEl.polygons.length > 0;
+            var hasStrokes = sEl.strokes && sEl.strokes.length > 0;
+            var sig = (hasPolys ? "p" : "") + (hasStrokes ? "s" : "");
+            if (hasPolys) {
+                var p0 = sEl.polygons[0];
+                sig += "|" + sEl.polygons.length + "|" + (p0.gradient ? ("G:" + p0.gradient.style) : ("C:" + p0.color));
+            }
+            if (hasStrokes) {
+                sig += "|" + sEl.strokes.length + "|" + (sEl.strokes[0].color || "");
+            }
+            return sig;
+        }
         for (var r = 0; r < maxRank; r++) {
             var sig = null, mismatch = false;
             for (var o4 = 0; o4 < shapeRankIdx.length; o4++) {
                 if (r >= shapeRankIdx[o4].length) continue;
                 var sEl = perOrientElements[o4][shapeRankIdx[o4][r]];
-                var thisSig = (sEl.polygons && sEl.polygons.length > 0 ? "p" : "") + (sEl.strokes && sEl.strokes.length > 0 ? "s" : "");
+                var thisSig = _orientShapeSig(sEl);
                 if (sig === null) sig = thisSig;
                 else if (sig !== thisSig) mismatch = true;
             }
@@ -5046,6 +5093,29 @@ function _buildOrientationSynthSymbol(group, orientNames, frameIdx, symbolMap, r
                 var clone = _shallowClone(sEl2);
                 clone.name = "_orient_" + orientNames[o5] + "_" + r;
                 perOrientElements[o5][idx5] = clone;
+            }
+        }
+
+        // These synthetic "keyframes" are 4 unrelated orientations, never a
+        // real Flash shape tween -- but _resolveElementNode can't tell the
+        // difference from isStaticLayer alone: a variant layer always has
+        // keyframes.length===4 (one per orientation slice), the same shape
+        // as a genuine 4-keyframe tween, so it was attaching
+        // TweenShapeMeshConverter.gd to every shape here (confirmed:
+        // pointless work on real variant scenes, since orientation
+        // switching is a hard swap, never a smooth polygon interpolation).
+        // Tag every element so _resolveElementNode can recognize and skip
+        // that case specifically. Shallow-cloned first: elements that
+        // didn't need cloning above (the common case) are still the SAME
+        // object _inlineStaticInstances/_flattenGroups returned, which can
+        // be a shared reference (e.g. straight from symbolMap) reused by
+        // an unrelated, later processing path outside this function --
+        // mutating it in place would leak the flag there too.
+        for (var ot = 0; ot < perOrientElements.length; ot++) {
+            for (var et = 0; et < perOrientElements[ot].length; et++) {
+                var cloneT = _shallowClone(perOrientElements[ot][et]);
+                cloneT._isOrientationVariant = true;
+                perOrientElements[ot][et] = cloneT;
             }
         }
 
