@@ -141,6 +141,17 @@ function _bridgeHoles(outerVerts, holesArr) {
     for (var i = 0; i < outerVerts.length; i++) {
         work.push({ x: outerVerts[i].x, y: outerVerts[i].y, br: false });
     }
+    // The raw outer contour can itself already be self-intersecting
+    // (independent of any hole -- e.g. a dense/complex Flash shape).
+    // _cleanupPolygonVertices's own repair pass never reaches this data
+    // (it only sees whatever _bridgeHoles returns, and skips its own
+    // repair above 500 vertices anyway): every candidate bridge built on
+    // top of an already-self-intersecting outer necessarily also self-
+    // intersects, so every hole silently ends up uncut. Repair the outer
+    // FIRST, before it's ever used as a bridge base.
+    if (work.length > 3 && _hasSelfIntersection(work)) {
+        work = _removeSelfIntersections(work);
+    }
     if (!holesArr || holesArr.length === 0) return work;
 
     var outerSign = _signedAreaSum(outerVerts) > 0 ? 1 : -1;
@@ -164,7 +175,12 @@ function _bridgeHoles(outerVerts, holesArr) {
         if (holeSign === outerSign) hole.reverse();
 
         var topCandidates = [];
-        var maxCand = 50; // Reduce max candidates to speed up insertion sort
+        // v4.21 found candidates[0] alone wasn't enough (see the retry loop
+        // below); on dense multi-hole shapes even 50 nearest candidates can
+        // ALL fail the full check, leaving that hole uncut. 200 clears
+        // every remaining case found in a real project's library while
+        // staying a bounded, cheap candidate pool (insertion-sort capped).
+        var maxCand = 200;
 
         function addCandidate(ci, cj, cd) {
             if (topCandidates.length < maxCand) {
@@ -223,46 +239,53 @@ function _bridgeHoles(outerVerts, holesArr) {
         }
         var candidates = topCandidates;
 
-        var bestI = candidates[0].i;
-        var bestJ = candidates[0].j;
+        // Try candidates in order of proximity until one produces a fully
+        // valid bridge -- not just the FIRST one that passes _bridgeBlocked
+        // (which only checks the connecting segment itself against existing
+        // edges). The comprehensive self-intersection check below also
+        // covers the two eps-offset "return" points, which _bridgeBlocked
+        // never sees; a candidate can pass _bridgeBlocked and still produce
+        // a self-intersecting result once those are added. The BUG this
+        // fixes: the old code picked only that first _bridgeBlocked-passing
+        // candidate and, if ITS full result self-intersected, gave up on
+        // the hole entirely (leaving it completely uncut) instead of
+        // falling through to the next-closest candidate.
+        var eps = 0.05;
         var maxCheck = candidates.length;
+        var bridgeApplied = false;
         for (var c = 0; c < maxCheck; c++) {
             var ci = candidates[c].i;
             var cj = candidates[c].j;
-            if (!_bridgeBlocked(work[ci], hole[cj], work, ci, hole, cj)) {
-                bestI = ci;
-                bestJ = cj;
-                break;
+            if (_bridgeBlocked(work[ci], hole[cj], work, ci, hole, cj)) continue;
+
+            var dx = work[ci].x - hole[cj].x;
+            var dy = work[ci].y - hole[cj].y;
+            var len = Math.sqrt(dx*dx + dy*dy);
+            var nx = 0, ny = 0;
+            if (len > 0.0001) {
+                nx = -(dy / len) * eps;
+                ny = (dx / len) * eps;
             }
-        }
 
-        var eps = 0.05;
-        var dx = work[bestI].x - hole[bestJ].x;
-        var dy = work[bestI].y - hole[bestJ].y;
-        var len = Math.sqrt(dx*dx + dy*dy);
-        var nx = 0, ny = 0;
-        if (len > 0.0001) {
-            nx = -(dy / len) * eps;
-            ny = (dx / len) * eps;
-        }
+            var candidateWork = [];
+            for (var k = 0; k <= ci; k++) candidateWork.push(work[k]);
+            for (var k = 0; k < hole.length; k++) {
+                var idx = (cj + k) % hole.length;
+                var atBridgeStart = (k === 0);
+                candidateWork.push({ x: hole[idx].x, y: hole[idx].y, br: atBridgeStart });
+            }
+            candidateWork.push({ x: hole[cj].x + nx, y: hole[cj].y + ny, br: true });
+            candidateWork.push({ x: work[ci].x + nx, y: work[ci].y + ny, br: true });
+            for (var k = ci + 1; k < work.length; k++) candidateWork.push(work[k]);
 
-        var newWork = [];
-        for (var k = 0; k <= bestI; k++) newWork.push(work[k]);
-        for (var k = 0; k < hole.length; k++) {
-            var idx = (bestJ + k) % hole.length;
-            var atBridgeStart = (k === 0);
-            newWork.push({ x: hole[idx].x, y: hole[idx].y, br: atBridgeStart });
-        }
-        newWork.push({ x: hole[bestJ].x + nx, y: hole[bestJ].y + ny, br: true });
-        newWork.push({ x: work[bestI].x + nx, y: work[bestI].y + ny, br: true });
-        for (var k = bestI + 1; k < work.length; k++) newWork.push(work[k]);
+            if (_hasSelfIntersection(candidateWork)) continue;
 
-        if (_hasSelfIntersection(newWork)) {
-            continue;
+            work[ci].br = true;
+            work = candidateWork;
+            bridgeApplied = true;
+            break;
         }
-
-        work[bestI].br = true;
-        work = newWork;
+        if (!bridgeApplied) continue;
     }
 
     return work;
@@ -4373,9 +4396,9 @@ function _symbolFrameCount(sym) {
 // A symbol is safe to INLINE (draw its content directly into whatever
 // instances it, instead of a PackedScene sub-scene reference) only if
 // there's nothing about it a flat list of composed elements could lose:
-// no animation across frames, no frame script, and no mask/masked layer
-// (mask clipping is handled by _buildSceneTree/_processElementNode's own
-// mask machinery, which a naive flatten-all-layers here would bypass).
+// no animation across frames, no frame script, no mask/masked layer (mask
+// clipping is handled by _buildSceneTree/_processElementNode's own mask
+// machinery, which a naive flatten-all-layers here would bypass).
 function _isInlineableStaticSymbol(sym) {
     if (!sym || _symbolFrameCount(sym) > 1) return false;
     if (!sym.layers) return true;
@@ -4421,7 +4444,9 @@ function _inlineStaticInstances(elements, symbolMap, chain) {
                 for (var k = 0; k < layer.keyframes.length; k++) {
                     var kf = layer.keyframes[k];
                     if (!kf.elements) continue;
-                    for (var ke = 0; ke < kf.elements.length; ke++) innerElements.push(kf.elements[ke]);
+                    for (var ke = 0; ke < kf.elements.length; ke++) {
+                        innerElements.push(kf.elements[ke]);
+                    }
                 }
             }
         }
