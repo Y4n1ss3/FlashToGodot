@@ -2904,8 +2904,17 @@ function _processElementNode(elem, parent, ownerRoot, anim, startTime, duration,
     }
 
     if (elem.elementType === "shape" && !elem._isTweenShape && (!elem.polygons || elem.polygons.length === 0) && (!elem.strokes || elem.strokes.length === 0)) {
-        var animPosX = elem.left || 0;
-        var animPosY = elem.top  || 0;
+        // A truly empty shape (no contours at all) can report left/top as
+        // Flash's "no bounds" sentinel (observed: -107374182.4, i.e.
+        // INT32_MIN twips / 20) instead of 0/undefined -- treat anything
+        // wildly outside plausible stage coordinates as "no position data"
+        // rather than propagate it. Normally harmless (an empty shape has
+        // nothing to render), but this position can end up inherited by
+        // real content pooled into the same node slot on another keyframe
+        // (e.g. buildVariantScenes' cross-orientation pooling), displacing
+        // it off-screen.
+        var animPosX = (elem.left && Math.abs(elem.left) < 1e6) ? elem.left : 0;
+        var animPosY = (elem.top  && Math.abs(elem.top)  < 1e6) ? elem.top  : 0;
 
         var rot = 0.0;
         var scX = 1.0;
@@ -4577,7 +4586,7 @@ function _buildOrientationSynthSymbol(group, orientNames, frameIdx, symbolMap, r
     var combinedLayers = [];
     for (var li = 0; li < layerNames.length; li++) {
         var lname = layerNames[li];
-        var keyframes = [];
+        var perOrientElements = [];
         for (var o2 = 0; o2 < orientNames.length; o2++) {
             var covering = _findCoveringKeyframe(group.parts[orientNames[o2]], lname, frameIdx);
             // _flattenGroups first: an "instance" element can be nested
@@ -4586,11 +4595,69 @@ function _buildOrientationSynthSymbol(group, orientNames, frameIdx, symbolMap, r
             var elements = (covering && covering.elements)
                 ? _inlineStaticInstances(_flattenGroups(covering.elements), symbolMap, {})
                 : [];
+            perOrientElements.push(elements);
+        }
+
+        // The rest of this pipeline treats these per-orientation element
+        // lists as if they were consecutive keyframes of one real Flash
+        // tween: raw shapes all share the same generic occKey ("shape"),
+        // so the pooled node a shape lands on is picked by its RANK among
+        // only-the-shapes of its own orientation (see allocateOrExtendWrapper
+        // + _getOccKey) -- the Nth shape of one orientation reuses the same
+        // node as the Nth shape of another. That's correct for genuinely
+        // parallel artwork (LEFT/RIGHT mirrors, a real tween's matching
+        // shape across frames) -- but some variant groups flatten (via
+        // _inlineStaticInstances) to structurally unrelated content per
+        // orientation (e.g. FRONT=28 raw shapes vs. BACK=1 merged shape),
+        // where "shape rank 6" in FRONT (a stroke-only outline) and "shape
+        // rank 6" in LEFT (a plain fill) are unrelated shapes that happen
+        // to share a rank -- pooling them mixes their fill/stroke state
+        // (one orientation's :visible reset stomping another's).
+        // Guard against that WITHOUT giving up pooling wholesale: only
+        // split a given shape rank into separate per-orientation nodes when
+        // the orientations that reach it actually disagree on whether it
+        // has fill/stroke content -- ranks every orientation agrees on
+        // (the common case) stay pooled exactly as before.
+        var shapeRankIdx = []; // per orientation: [indexIntoPerOrientElements, ...] for its "shape" elements, in order
+        for (var o3 = 0; o3 < perOrientElements.length; o3++) {
+            var ranks = [];
+            for (var e3 = 0; e3 < perOrientElements[o3].length; e3++) {
+                if (perOrientElements[o3][e3].elementType === "shape") ranks.push(e3);
+            }
+            shapeRankIdx.push(ranks);
+        }
+        var maxRank = 0;
+        for (var o3b = 0; o3b < shapeRankIdx.length; o3b++) {
+            if (shapeRankIdx[o3b].length > maxRank) maxRank = shapeRankIdx[o3b].length;
+        }
+        for (var r = 0; r < maxRank; r++) {
+            var sig = null, mismatch = false;
+            for (var o4 = 0; o4 < shapeRankIdx.length; o4++) {
+                if (r >= shapeRankIdx[o4].length) continue;
+                var sEl = perOrientElements[o4][shapeRankIdx[o4][r]];
+                var thisSig = (sEl.polygons && sEl.polygons.length > 0 ? "p" : "") + (sEl.strokes && sEl.strokes.length > 0 ? "s" : "");
+                if (sig === null) sig = thisSig;
+                else if (sig !== thisSig) mismatch = true;
+            }
+            if (!mismatch) continue;
+            for (var o5 = 0; o5 < shapeRankIdx.length; o5++) {
+                if (r >= shapeRankIdx[o5].length) continue;
+                var idx5 = shapeRankIdx[o5][r];
+                var sEl2 = perOrientElements[o5][idx5];
+                if (sEl2.name) continue;
+                var clone = _shallowClone(sEl2);
+                clone.name = "_orient_" + orientNames[o5] + "_" + r;
+                perOrientElements[o5][idx5] = clone;
+            }
+        }
+
+        var keyframes = [];
+        for (var o5 = 0; o5 < orientNames.length; o5++) {
             keyframes.push({
-                startFrame: o2,
+                startFrame: o5,
                 duration: 1,
-                name: orientNames[o2], // becomes this slice's AnimationLibrary label
-                elements: elements
+                name: orientNames[o5], // becomes this slice's AnimationLibrary label
+                elements: perOrientElements[o5]
             });
         }
         combinedLayers.push({ name: lname, layerType: "normal", index: li, keyframes: keyframes });

@@ -444,14 +444,25 @@ function _removeOppositeWindingDuplicates(polys) {
         return s / 2;
     }
 
-    var byKey = {};  // "$<key>" -> array of { idx, sa }
+    function _fillKeyForDedup(p) {
+        if (p._noFillHole) return null; // never a legitimate "keep both" partner
+        if (p.gradient) {
+            var g = p.gradient;
+            var k = "G:" + (g.style || "");
+            if (g.colors) k += "|" + g.colors.join(",");
+            return k;
+        }
+        return "C:" + (p.color || "");
+    }
+
+    var byKey = {};  // "$<key>" -> array of { idx, sa, fillKey }
     for (var i = 0; i < polys.length; i++) {
         var v = polys[i].vertices;
         if (!v || v.length < 3) continue;
         var key = "$" + _geomKey(v);
         var sa = _signedArea(v);
         if (!byKey[key]) byKey[key] = [];
-        byKey[key].push({ idx: i, sa: sa });
+        byKey[key].push({ idx: i, sa: sa, fillKey: _fillKeyForDedup(polys[i]) });
     }
 
     var toDrop = {};
@@ -459,9 +470,13 @@ function _removeOppositeWindingDuplicates(polys) {
         if (!byKey.hasOwnProperty(k)) continue;
         var group = byKey[k];
         if (group.length < 2) continue;
-        // Look for a CCW (sa > 0) + CW (sa < 0) pair. If found, drop the CW
-        // ones. Touch NOTHING if all entries have the same sign (degenerate
-        // case or non-Flash duplicate we'd rather preserve).
+        // Look for a CCW (sa > 0) + CW (sa < 0) pair. Touch NOTHING if all
+        // entries have the same sign (degenerate case or non-Flash
+        // duplicate we'd rather preserve). Flash's own CW/CCW convention
+        // for "which side is the noFill one" isn't consistent from one
+        // boundary to the next (observed both ways on real shapes), so
+        // which SIGN gets dropped is decided per-entry below, not fixed to
+        // "always CW".
         var hasCCW = false, hasCW = false;
         for (var g = 0; g < group.length; g++) {
             if (group[g].sa > 0.001) hasCCW = true;
@@ -469,7 +484,33 @@ function _removeOppositeWindingDuplicates(polys) {
         }
         if (hasCCW && hasCW) {
             for (var g = 0; g < group.length; g++) {
-                if (group[g].sa < -0.001) toDrop[group[g].idx] = true;
+                if (group[g].sa > -0.001 && group[g].sa < 0.001) continue; // degenerate, leave alone
+                // The SAME closed loop can legitimately be needed on BOTH
+                // sides at once: it's simultaneously the inner hole boundary
+                // of one fill and the outer boundary of an ADJACENT,
+                // DIFFERENTLY-colored one (e.g. concentric rings/gradient
+                // bands, each color's own boundary shared with its
+                // neighbor) -- not a redundant "same shape traced twice"
+                // duplicate. Only drop an entry when there's an OPPOSITE-
+                // signed counterpart in this group that's either the exact
+                // same fillKey (a genuine same-position, same-color repeat
+                // -- the original "shading layer hides the layer under it"
+                // case this function targets) or this entry itself has no
+                // fill of its own to lose (a noFillHole boundary, or the
+                // true outermost edge with nothing beyond it). A
+                // DIFFERENT-fillKey opposite-signed counterpart means both
+                // sides are still needed, each for its own ring's pairing
+                // below -- neither gets dropped in that case.
+                var thisFillKey = group[g].fillKey;
+                var safeToDrop = (thisFillKey === null);
+                if (!safeToDrop) {
+                    for (var g2 = 0; g2 < group.length; g2++) {
+                        if (g2 === g) continue;
+                        var oppositeSign = (group[g].sa > 0) !== (group[g2].sa > 0);
+                        if (oppositeSign && group[g2].fillKey === thisFillKey) { safeToDrop = true; break; }
+                    }
+                }
+                if (safeToDrop) toDrop[group[g].idx] = true;
             }
         }
     }
@@ -487,7 +528,18 @@ function _removeOppositeWindingDuplicates(polys) {
 }
 
 function _groupPolygonsWithHoles(polys) {
-    if (!polys || polys.length <= 1) return polys;
+    if (!polys || polys.length === 0) return polys;
+    if (polys.length === 1) {
+        // A single "no fill" contour with nothing else in this same shape
+        // to pair it with as an outer -- e.g. a pure stroke-outline shape,
+        // whose enclosed region is legitimately unfilled, not an actual cut
+        // into some sibling shape's fill (each element's contours are only
+        // ever grouped WITHIN that same element -- a hole and its outer
+        // living in two different sibling shapes can't be paired here at
+        // all). Drop it instead of letting it fall through as its own
+        // spurious, colorless polygon.
+        return polys[0]._noFillHole ? [] : polys;
+    }
     __log("  -> _groupPolygonsWithHoles on " + polys.length + " polys...");
 
     function _sa(verts) {
@@ -581,6 +633,7 @@ function _groupPolygonsWithHoles(polys) {
                 bbox: _bbox(v),
                 fillKey: _fillKey(polys[i]),
                 lightness: _polyLightness(polys[i]),
+                noFillHole: !!polys[i]._noFillHole,
                 valid: true
             });
         }
@@ -600,8 +653,17 @@ function _groupPolygonsWithHoles(polys) {
     var assigned = {};
     var result = [];
 
+    // Pass 1: let every REAL (non-noFillHole) polygon search for and claim
+    // its holes first, regardless of area-sort order. `order` is sorted
+    // purely by area -- nothing ties a "no fill" hole candidate to
+    // appearing right after (or even near) the polygon it belongs to, so a
+    // large noFillHole entry can easily be sorted BEFORE its real, smaller
+    // owner. Skipping it here (instead of dropping it outright) leaves it
+    // available for a later outer's inner search loop below to still find
+    // and claim it as a genuine hole.
     for (var oi = 0; oi < order.length; oi++) {
         var oM = order[oi];
+        if (oM.noFillHole) continue;
         if (assigned[oM.idx]) continue;
         if (!oM.valid) {
             result.push(polys[oM.idx]);
@@ -633,16 +695,28 @@ function _groupPolygonsWithHoles(polys) {
             // >> 5 u²).
             if (hM.area < 1.0) continue;
             if (hM.area >= oM.area) continue;
-            if (hM.fillKey !== oM.fillKey) continue;
-            // A REAL Flash hole has a winding OPPOSITE to its outer
-            // (even-odd convention: outer CCW, hole CW, or vice versa). Two
-            // contours of the same fillKey with the SAME area sign are
-            // overlapping fills (a layering effect in Flash), not holes.
-            // Without this check we'd bridge polys that shouldn't be, the
-            // self-touching result confuses earcut on the Godot side, and
-            // the polygon becomes invisible. Typical case: Rock1, where
-            // every shading layer has sign='-' (same winding).
-            if (hM.signedArea * oM.signedArea > 0) continue;
+            // A "no fill" contour (Flash's OTHER way to represent a hole,
+            // besides same-fill-opposite-winding) has no fillKey of its own
+            // to compare, and no color that could make it a plausible
+            // OVERLAPPING DECORATION either (unlike the same-fillKey case
+            // below) -- by construction it can only ever be a genuine hole.
+            // Skip both the fillKey AND winding checks for it: the bbox/
+            // point-containment/coverage checks further down still fully
+            // disambiguate which outer it belongs to.
+            if (!hM.noFillHole && hM.fillKey !== oM.fillKey) continue;
+            // A REAL Flash hole of the SAME-FILLKEY kind has a winding
+            // OPPOSITE to its outer (even-odd convention: outer CCW, hole
+            // CW, or vice versa). Two contours of the same fillKey with the
+            // SAME area sign are overlapping fills (a layering effect in
+            // Flash), not holes. Without this check we'd bridge polys that
+            // shouldn't be, the self-touching result confuses earcut on the
+            // Godot side, and the polygon becomes invisible. Typical case:
+            // Rock1, where every shading layer has sign='-' (same winding).
+            // Doesn't apply to a noFillHole candidate: _extractSubLoops
+            // doesn't guarantee alternating winding when it splits a single
+            // self-touching bridge path into separate loops, so a genuine
+            // noFillHole/outer pair can legitimately share the same sign.
+            if (!hM.noFillHole && hM.signedArea * oM.signedArea > 0) continue;
 
             var hb = hM.bbox;
             if (hb.minX < ob.minX || hb.minY < ob.minY ||
@@ -652,11 +726,22 @@ function _groupPolygonsWithHoles(polys) {
             var cx = 0, cy = 0;
             for (var ci = 0; ci < hVerts.length; ci++) { cx += hVerts[ci].x; cy += hVerts[ci].y; }
             cx /= hVerts.length; cy /= hVerts.length;
-            
+
             // SAFETY LIMIT: If outerVerts is huge, skip the precise point-in-polygon check.
             if (outerVerts.length <= 300) {
                 if (!_pip({ x: cx, y: cy }, outerVerts)) continue;
-                if (!_pip(hVerts[0], outerVerts)) continue;
+                // Second confirmation point, nudged 2% from the hole's first
+                // vertex TOWARD its own centroid: a plain hVerts[0] can land
+                // exactly ON the outer's boundary edge when the hole and its
+                // outer share a seam (e.g. concentric/touching ring bands,
+                // or a noFillHole boundary) -- floating-point ray-casting
+                // right at a boundary is a well-known false-negative case
+                // for point-in-polygon tests. Nudging inward keeps the
+                // check meaningful (still near the hole's actual shape)
+                // without the boundary-precision flakiness.
+                var nudgeX = hVerts[0].x + (cx - hVerts[0].x) * 0.02;
+                var nudgeY = hVerts[0].y + (cy - hVerts[0].y) * 0.02;
+                if (!_pip({ x: nudgeX, y: nudgeY }, outerVerts)) continue;
             }
 
             // Even-odd nesting
@@ -746,6 +831,14 @@ function _groupPolygonsWithHoles(polys) {
         result.push(entry);
     }
 
+    // Pass 2: any "no fill" contour still unassigned after every real
+    // polygon above had its turn -- never claimed as anyone's hole -- has
+    // no fill of its own, so drop it instead of falling through as its own
+    // stray, colorless polygon.
+    for (var oi2 = 0; oi2 < order.length; oi2++) {
+        assigned[order[oi2].idx] = 1;
+    }
+
     __log("  <- _groupPolygonsWithHoles DONE (" + result.length + " merged polys)");
     return result;
 }
@@ -809,6 +902,7 @@ function _extractSubLoops(p) {
         if (matchedIdx !== -1) {
             var loopPoly = { vertices: current.slice(matchedIdx), color: p.color };
             if (p.gradient) loopPoly.gradient = _cloneGradient(p.gradient);
+            if (p._noFillHole) loopPoly._noFillHole = true;
             finalPolys.push(loopPoly);
             
             // Clean the grid of points being removed from 'current'
@@ -835,6 +929,7 @@ function _extractSubLoops(p) {
     if (current.length > 2) {
         var remainingPoly = { vertices: current, color: p.color };
         if (p.gradient) remainingPoly.gradient = _cloneGradient(p.gradient);
+        if (p._noFillHole) remainingPoly._noFillHole = true;
         finalPolys.push(remainingPoly);
     }
     
@@ -854,11 +949,21 @@ function inspectShape(el, isShapeTween, forceExtract) {
             var isMassive = (el.width > 300 || el.height > 300);
             var isValidFill = true;
             var hasGradient = false;
+            // A noFill contour is only ever useful as a hole for some OTHER
+            // contour's real fill in this SAME shape (see below) -- with no
+            // real fill anywhere in the shape at all, every noFill contour
+            // is guaranteed to end up dropped regardless (nothing to pair
+            // it with). Checked here, cheaply (just contour.fill.style, no
+            // vertex walking), so the expensive per-edge walk below can
+            // skip noFill contours entirely in that case instead of fully
+            // extracting geometry that's thrown away either way.
+            var hasAnyRealFill = false;
             if (el.contours && el.contours.length > 0) {
                 for (var c = 0; c < el.contours.length; c++) {
                     var fill = el.contours[c].fill;
                     if (fill) {
                         if (fill.style === "linearGradient" || fill.style === "radialGradient") hasGradient = true;
+                        if (fill.style !== "noFill") hasAnyRealFill = true;
                         if (fill.style !== "solid" && fill.style !== "noFill" && fill.style !== "linearGradient" && fill.style !== "radialGradient") {
                             isValidFill = false;
                             break;
@@ -881,12 +986,37 @@ function inspectShape(el, isShapeTween, forceExtract) {
                         if (!he) continue;
                         var startHe = he;
                         var poly = { vertices: [], color: "#FFFFFF" };
-                        
+
+                        var isNoFillContour = false;
                         try {
                             if (!contour.fill || contour.fill.style === "noFill") {
-                                continue; // Skip holes or strokes with no fill
-                            }
-                            if (contour.fill.style === "linearGradient" || contour.fill.style === "radialGradient") {
+                                // A hole cut into a fill can be represented by
+                                // Flash as its own contour with NO fill of its
+                                // own -- as opposed to the "same fill, opposite
+                                // winding" case _groupPolygonsWithHoles already
+                                // handles below. Discarding it outright (as
+                                // before) throws away the hole's geometry
+                                // entirely: the containing fill then renders
+                                // solid, with no hole at all. Still collected
+                                // below (flagged, no real color) so
+                                // _groupPolygonsWithHoles can recognize and
+                                // bridge it -- but only when that pass will
+                                // actually run: for a shape tween, hole-
+                                // grouping is disabled entirely (topology can
+                                // change between frames -- see below), so an
+                                // ungrouped noFill contour would just become
+                                // its own stray, colorless polygon. Keep the
+                                // original skip in that case -- also skip
+                                // (same reasoning) when NOTHING in this
+                                // shape has a real fill to pair this against
+                                // in the first place: it would only ever be
+                                // dropped by _groupPolygonsWithHoles's own
+                                // "lone noFillHole, nothing to claim it"
+                                // case, so extracting its full geometry here
+                                // is wasted work.
+                                if (isShapeTween || !hasAnyRealFill) continue;
+                                isNoFillContour = true;
+                            } else if (contour.fill.style === "linearGradient" || contour.fill.style === "radialGradient") {
                             poly.gradient = {
                                 style: contour.fill.style,
                                 colors: [],
@@ -1000,6 +1130,7 @@ function inspectShape(el, isShapeTween, forceExtract) {
                             
                             currentPoly = { vertices: [], color: poly.color };
                             if (poly.gradient) currentPoly.gradient = _cloneGradient(poly.gradient);
+                            if (isNoFillContour) currentPoly._noFillHole = true;
                             currentEnd = null;
                         }
 
@@ -1029,7 +1160,11 @@ function inspectShape(el, isShapeTween, forceExtract) {
                 // v4 - Hole detection: group contours of the same fill into
                 // outer -> holes relationships. Disabled for shape tweens
                 // (topology can change between frames -> would break interpolation).
-                if (s.polygons.length > 1 && !isShapeTween) {
+                // Also runs for a SINGLE lone "no fill" polygon (nothing in
+                // this same shape to pair it with as an outer) so
+                // _groupPolygonsWithHoles can still drop it -- see there.
+                var singleNoFillHole = (s.polygons.length === 1 && s.polygons[0]._noFillHole);
+                if ((s.polygons.length > 1 || singleNoFillHole) && !isShapeTween) {
                     // Before hole-grouping: eliminate overlapping CCW/CW
                     // pairs (two fillStyles on each side of a shared edge
                     // exported as 2 distinct polys at the same position).
