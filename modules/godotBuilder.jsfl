@@ -2449,7 +2449,7 @@ function _clearExcessNamedSlots(node, variantPathStr, anim, startIndex, prefix, 
 // creating/attaching the node itself (parent.addChildRanked, node.owner),
 // never anim.tracks nor subResources -- so it can be extracted without
 // threading the rest of _processElementNode's state.
-function _resolveElementNode(elem, parent, ownerRoot, wrapperName, shaderNeeds, modulateNeedsCanvasGroup, layerZIndex, getExt) {
+function _resolveElementNode(elem, parent, ownerRoot, wrapperName, shaderNeeds, modulateNeedsCanvasGroup, layerZIndex, getExt, isStaticLayer) {
     if (parent !== ownerRoot && !parent.parent) {
         ownerRoot.addChild(parent);
     }
@@ -2470,6 +2470,17 @@ function _resolveElementNode(elem, parent, ownerRoot, wrapperName, shaderNeeds, 
             if (elem.polygons && elem.polygons.length > 0) {
                 node = new GNode(wrapperName, "Polygon2D");
                 node.properties["color"] = "Color(1, 1, 1, 1)";
+                if (!isStaticLayer || elem._isTweenShape) {
+                    // A genuine multi-keyframe shape tween: TweenShapeMeshConverter.gd
+                    // (written unconditionally alongside FlashMovieClip.gd) swaps this
+                    // Polygon2D for a pre-triangulated MeshInstance2D the first time this
+                    // scene loads, using Godot's own Geometry2D.triangulate_polygon() --
+                    // see that script for why this happens at runtime rather than here at
+                    // export time. The ":polygon"/":uv"/":polygons"/":texture"/":color"/
+                    // ":visible" tracks below are emitted exactly as for any other
+                    // animated shape; nothing else about this node changes.
+                    node.properties["script"] = "ExtResource(\"" + getExt("res://scripts/TweenShapeMeshConverter.gd", "Script") + "\")";
+                }
             } else if (elem.elementType === "shape" && elem.strokes && elem.strokes.length > 0) {
                 // Shape made only of strokes (no fill): the wrapper becomes
                 // directly the first stroke's Line2D instead of a Node2D +
@@ -2537,7 +2548,7 @@ function _processElementNode(elem, parent, ownerRoot, anim, startTime, duration,
                              maxTime, kfTransition, shaderNeeds, customTexPath, layerType,
                              getExt, subResources, isStaticLayer, modulateNeedsCanvasGroup, gradCache, layerZIndex) {
     // --- 1. Wrapper/node: lookup or creation -----------------------------
-    var _resolved = _resolveElementNode(elem, parent, ownerRoot, wrapperName, shaderNeeds, modulateNeedsCanvasGroup, layerZIndex, getExt);
+    var _resolved = _resolveElementNode(elem, parent, ownerRoot, wrapperName, shaderNeeds, modulateNeedsCanvasGroup, layerZIndex, getExt, isStaticLayer);
     var node = _resolved.node;
     var wrapperNode = _resolved.wrapperNode;
     var isNewNode = _resolved.isNewNode;
@@ -4314,6 +4325,293 @@ function buildGodotScenes(doc, data, exportDir) {
         FLfile.createFolder(scriptDir);
     }
     FLfile.write(scriptDir + "/FlashMovieClip.gd", fmcContent);
+
+    // TweenShapeMesh.gd / TweenShapeMeshConverter.gd: written unconditionally
+    // (shared, per-Godot-project scripts, same convention as
+    // FlashMovieClip.gd above), used only by the Polygon2D shapes
+    // _resolveElementNode attaches TweenShapeMeshConverter.gd to (a
+    // multi-keyframe shape tween -- see there). Pre-triangulates each
+    // keyframe ONCE at runtime, via Godot's own Geometry2D.
+    // triangulate_polygon(), the first time each scene loads -- instead of
+    // JSFL hand-triangulating at export time, which would mean re-porting
+    // and re-verifying a triangulation algorithm outside of Godot itself.
+    var tweenMeshContent = "extends MeshInstance2D\n" +
+    "class_name TweenShapeMesh\n" +
+    "## Lightweight multi-mesh holder: swaps `mesh` between a fixed list of\n" +
+    "## pre-built ArrayMeshes via `mesh_index`. Populated once (via set_meshes),\n" +
+    "## right after construction, by TweenShapeMeshConverter.gd -- this script\n" +
+    "## itself does no triangulation or mesh building of its own.\n" +
+    "\n" +
+    "var _meshes: Array[ArrayMesh] = []\n" +
+    "\n" +
+    "var mesh_index: int = 0:\n" +
+    "\tset(value):\n" +
+    "\t\tmesh_index = value\n" +
+    "\t\tif value >= 0 and value < _meshes.size() and _meshes[value] != null:\n" +
+    "\t\t\tmesh = _meshes[value]\n" +
+    "\n" +
+    "func set_meshes(meshes: Array[ArrayMesh]) -> void:\n" +
+    "\t_meshes = meshes\n" +
+    "\tif mesh_index >= 0 and mesh_index < _meshes.size() and _meshes[mesh_index] != null:\n" +
+    "\t\tmesh = _meshes[mesh_index]\n";
+    FLfile.write(scriptDir + "/TweenShapeMesh.gd", tweenMeshContent);
+
+    var tweenConverterContent = "extends Polygon2D\n" +
+    "class_name TweenShapeMeshConverter\n" +
+    "## Attached (by godotBuilder.jsfl) to any Polygon2D whose \"polygon\" fill is\n" +
+    "## track-animated across more than one keyframe -- an organic Flash shape\n" +
+    "## tween. Nothing about the normal animated-shape export changes: this node\n" +
+    "## still gets the exact same \":polygon\"/\":uv\"/\":polygons\"/\":texture\"/\n" +
+    "## \":color\"/\":visible\" tracks any other animated shape gets.\n" +
+    "##\n" +
+    "## At _ready(), this script reads those tracks straight off its own\n" +
+    "## AnimationPlayer, triangulates each DISTINCT keyframe shape ONCE via\n" +
+    "## Godot's own Geometry2D.triangulate_polygon() (never a hand-rolled\n" +
+    "## triangulator), replaces itself with a TweenShapeMesh (a plain\n" +
+    "## MeshInstance2D) holding one pre-built ArrayMesh per keyframe, and adds a\n" +
+    "## new \":mesh_index\" int track driving that swap -- so at runtime Godot just\n" +
+    "## swaps between pre-triangulated meshes instead of re-triangulating a raw\n" +
+    "## \"polygon\" value on every keyframe change, every time the animation plays.\n" +
+    "##\n" +
+    "## Deliberately does NOT rename or remove the original \":polygon\"/\":uv\"/\n" +
+    "## \":polygons\" tracks -- only disables them (Animation.track_set_enabled).\n" +
+    "## Godot resource-caches each Animation sub-resource, so every instance of\n" +
+    "## the same PackedScene shares the SAME Animation objects; keeping the\n" +
+    "## source tracks intact (just disabled) means every instance can always\n" +
+    "## independently re-derive the identical shapes/mesh order from them, with\n" +
+    "## no dependency on which instance's _ready() happens to run first.\n" +
+    "\n" +
+    "func _ready() -> void:\n" +
+    "\tvar root: Node = get_owner()\n" +
+    "\tif root == null:\n" +
+    "\t\troot = self\n" +
+    "\tvar ap := _find_animation_player(root)\n" +
+    "\tif ap == null:\n" +
+    "\t\treturn  # No AnimationPlayer to read tracks from: nothing to optimize.\n" +
+    "\n" +
+    "\tvar my_path := root.get_path_to(self)\n" +
+    "\tvar poly_track_name := \"%s:polygon\" % my_path\n" +
+    "\tvar uv_track_name := \"%s:uv\" % my_path\n" +
+    "\tvar polys_track_name := \"%s:polygons\" % my_path\n" +
+    "\tvar mesh_index_track_name := \"%s:mesh_index\" % my_path\n" +
+    "\n" +
+    "\t# Pass 1 (read-only, deterministic): derive every distinct keyframe\n" +
+    "\t# shape -- across every animation touching this node path, RESET\n" +
+    "\t# included -- from the untouched source tracks. Since the source data\n" +
+    "\t# never changes, this produces the exact same shapes/mesh_index mapping\n" +
+    "\t# no matter which instance of this scene runs it, or how many times.\n" +
+    "\tvar shapes: Array[PackedVector2Array] = []\n" +
+    "\tvar shape_uvs: Array[PackedVector2Array] = []\n" +
+    "\tvar shape_tris: Array[PackedInt32Array] = []\n" +
+    "\tvar shape_index_by_key: Dictionary = {}\n" +
+    "\tvar per_anim: Array = []\n" +
+    "\n" +
+    "\tfor anim_name in ap.get_animation_list():\n" +
+    "\t\tvar anim := ap.get_animation(anim_name)\n" +
+    "\t\tvar poly_idx := anim.find_track(poly_track_name, Animation.TYPE_VALUE)\n" +
+    "\t\tif poly_idx == -1:\n" +
+    "\t\t\tcontinue\n" +
+    "\t\tvar key_count := anim.track_get_key_count(poly_idx)\n" +
+    "\t\tif key_count <= 1:\n" +
+    "\t\t\tcontinue  # A single static value: not worth converting.\n" +
+    "\n" +
+    "\t\tvar uv_idx := anim.find_track(uv_track_name, Animation.TYPE_VALUE)\n" +
+    "\t\tvar polys_idx := anim.find_track(polys_track_name, Animation.TYPE_VALUE)\n" +
+    "\t\tvar mesh_indices: Array[int] = []\n" +
+    "\t\tmesh_indices.resize(key_count)\n" +
+    "\n" +
+    "\t\tfor k in range(key_count):\n" +
+    "\t\t\tvar pts: PackedVector2Array = anim.track_get_key_value(poly_idx, k)\n" +
+    "\t\t\tvar key_time: float = anim.track_get_key_time(poly_idx, k)\n" +
+    "\t\t\t# NOT positional (uv_idx/polys_idx key `k`): addTrackKey (the\n" +
+    "\t\t\t# JSFL exporter) skips inserting a key whose value repeats the\n" +
+    "\t\t\t# previous one, so \":uv\"/\":polygons\" can end up with FEWER keys,\n" +
+    "\t\t\t# at DIFFERENT times, than \":polygon\" -- reading them by the same\n" +
+    "\t\t\t# index `k` can silently pair this keyframe's points with a\n" +
+    "\t\t\t# stale, differently-sized groups/uv array from some other\n" +
+    "\t\t\t# keyframe. Look up by time instead: whichever key was most\n" +
+    "\t\t\t# recently in effect at this exact keyframe's own time, matching\n" +
+    "\t\t\t# how discrete tracks are actually applied during playback.\n" +
+    "\t\t\tvar uvs: PackedVector2Array = _value_at_time(anim, uv_idx, key_time, PackedVector2Array())\n" +
+    "\t\t\tvar groups: Array = _value_at_time(anim, polys_idx, key_time, [])\n" +
+    "\n" +
+    "\t\t\tvar sig := _shape_signature(pts)\n" +
+    "\t\t\tif shape_index_by_key.has(sig):\n" +
+    "\t\t\t\tmesh_indices[k] = shape_index_by_key[sig]\n" +
+    "\t\t\t\tcontinue\n" +
+    "\n" +
+    "\t\t\tvar idx := shapes.size()\n" +
+    "\t\t\tshape_index_by_key[sig] = idx\n" +
+    "\t\t\tshapes.append(pts)\n" +
+    "\t\t\tshape_uvs.append(uvs)\n" +
+    "\t\t\tshape_tris.append(_triangulate(pts, groups))\n" +
+    "\t\t\tmesh_indices[k] = idx\n" +
+    "\n" +
+    "\t\tper_anim.append({\n" +
+    "\t\t\t\"anim\": anim, \"poly_idx\": poly_idx, \"uv_idx\": uv_idx, \"polys_idx\": polys_idx,\n" +
+    "\t\t\t\"times\": _key_times(anim, poly_idx), \"mesh_indices\": mesh_indices,\n" +
+    "\t\t})\n" +
+    "\n" +
+    "\tif per_anim.is_empty():\n" +
+    "\t\treturn  # Nothing animated (or already fully static): stay a plain Polygon2D.\n" +
+    "\n" +
+    "\t# Build this instance's own meshes (every instance builds its own --\n" +
+    "\t# ArrayMesh/mesh state is never shared, only the Animation resource is).\n" +
+    "\tvar meshes: Array[ArrayMesh] = []\n" +
+    "\tmeshes.resize(shapes.size())\n" +
+    "\tfor i in range(shapes.size()):\n" +
+    "\t\tmeshes[i] = _build_mesh(shapes[i], shape_uvs[i], shape_tris[i])\n" +
+    "\n" +
+    "\t# Pass 2 (mutating, but idempotent): add the \":mesh_index\" track and\n" +
+    "\t# disable the now-redundant source tracks, but only the FIRST time --\n" +
+    "\t# later instances sharing this same Animation resource see it already\n" +
+    "\t# converted and skip straight past.\n" +
+    "\tfor entry in per_anim:\n" +
+    "\t\tvar anim: Animation = entry[\"anim\"]\n" +
+    "\t\tif anim.find_track(mesh_index_track_name, Animation.TYPE_VALUE) == -1:\n" +
+    "\t\t\tvar mi_idx := anim.add_track(Animation.TYPE_VALUE)\n" +
+    "\t\t\tanim.track_set_path(mi_idx, mesh_index_track_name)\n" +
+    "\t\t\tanim.value_track_set_update_mode(mi_idx, Animation.UPDATE_DISCRETE)\n" +
+    "\t\t\tvar times: Array = entry[\"times\"]\n" +
+    "\t\t\tvar mesh_indices: Array = entry[\"mesh_indices\"]\n" +
+    "\t\t\tfor k in range(times.size()):\n" +
+    "\t\t\t\tanim.track_insert_key(mi_idx, times[k], mesh_indices[k])\n" +
+    "\n" +
+    "\t\t\tanim.track_set_enabled(entry[\"poly_idx\"], false)\n" +
+    "\t\t\tvar uv_idx: int = entry[\"uv_idx\"]\n" +
+    "\t\t\tif uv_idx != -1:\n" +
+    "\t\t\t\tanim.track_set_enabled(uv_idx, false)\n" +
+    "\t\t\tvar polys_idx: int = entry[\"polys_idx\"]\n" +
+    "\t\t\tif polys_idx != -1:\n" +
+    "\t\t\t\tanim.track_set_enabled(polys_idx, false)\n" +
+    "\n" +
+    "\t# Swap self for a TweenShapeMesh carrying the same transform/visuals --\n" +
+    "\t# every instance does this, unconditionally, since nodes are never\n" +
+    "\t# shared across instances the way the Animation resource above is.\n" +
+    "\tvar mesh_node := TweenShapeMesh.new()\n" +
+    "\tmesh_node.name = name\n" +
+    "\tmesh_node.position = position\n" +
+    "\tmesh_node.rotation = rotation\n" +
+    "\tmesh_node.scale = scale\n" +
+    "\tmesh_node.skew = skew\n" +
+    "\tmesh_node.z_index = z_index\n" +
+    "\tmesh_node.z_as_relative = z_as_relative\n" +
+    "\tmesh_node.visible = visible\n" +
+    "\tmesh_node.modulate = color\n" +
+    "\tmesh_node.texture = texture\n" +
+    "\tmesh_node.set_meshes(meshes)\n" +
+    "\n" +
+    "\t# The tree is still mid-setup while sibling _ready() calls are firing\n" +
+    "\t# (this is one of them): add_child()/move_child()/owner all reject\n" +
+    "\t# synchronous calls here (\"Parent node is busy setting up children\").\n" +
+    "\t# Defer the whole swap to run once that batch finishes, and remove self\n" +
+    "\t# BEFORE adding mesh_node (same name) so Godot never has to uniquify it\n" +
+    "\t# against the still-present original -- which would break every\n" +
+    "\t# NodePath the AnimationPlayer tracks above already point to.\n" +
+    "\tcall_deferred(\"_finish_swap\", mesh_node, get_parent(), get_index(), owner)\n" +
+    "\n" +
+    "\n" +
+    "func _finish_swap(mesh_node: Node, parent: Node, index: int, scene_owner: Node) -> void:\n" +
+    "\tparent.remove_child(self)\n" +
+    "\tparent.add_child(mesh_node)\n" +
+    "\tparent.move_child(mesh_node, index)\n" +
+    "\tmesh_node.owner = scene_owner\n" +
+    "\tqueue_free()\n" +
+    "\n" +
+    "\n" +
+    "# Triangulates one keyframe's fill. `groups`, when non-empty, is the raw\n" +
+    "# value of that keyframe's \":polygons\" track key: one PackedInt32Array per\n" +
+    "# disjoint sub-polygon, each listing which indices of `pts` belong to it\n" +
+    "# (Polygon2D's own convention for several disconnected shapes sharing one\n" +
+    "# vertex pool). Geometry2D.triangulate_polygon() expects a single simple\n" +
+    "# polygon, so each sub-polygon is triangulated on its own and the resulting\n" +
+    "# LOCAL indices are mapped back to `pts`' global indices before combining.\n" +
+    "func _triangulate(pts: PackedVector2Array, groups: Array) -> PackedInt32Array:\n" +
+    "\tif groups.size() <= 1:\n" +
+    "\t\tif pts.size() < 3:\n" +
+    "\t\t\treturn PackedInt32Array()\n" +
+    "\t\treturn Geometry2D.triangulate_polygon(pts)\n" +
+    "\n" +
+    "\tvar combined := PackedInt32Array()\n" +
+    "\tfor group in groups:\n" +
+    "\t\tvar local_indices: PackedInt32Array = group\n" +
+    "\t\tif local_indices.size() < 3:\n" +
+    "\t\t\tcontinue\n" +
+    "\t\tvar sub_pts := PackedVector2Array()\n" +
+    "\t\tsub_pts.resize(local_indices.size())\n" +
+    "\t\tfor i in range(local_indices.size()):\n" +
+    "\t\t\tsub_pts[i] = pts[local_indices[i]]\n" +
+    "\t\tvar sub_tris := Geometry2D.triangulate_polygon(sub_pts)\n" +
+    "\t\tfor t in sub_tris:\n" +
+    "\t\t\tcombined.append(local_indices[t])\n" +
+    "\treturn combined\n" +
+    "\n" +
+    "\n" +
+    "func _build_mesh(pts_2d: PackedVector2Array, uvs: PackedVector2Array, tri_indices: PackedInt32Array) -> ArrayMesh:\n" +
+    "\tif pts_2d.size() < 3 or tri_indices.size() < 3:\n" +
+    "\t\treturn null  # Degenerate keyframe: TweenShapeMesh leaves `mesh` unset for it.\n" +
+    "\tvar pts_3d := PackedVector3Array()\n" +
+    "\tpts_3d.resize(pts_2d.size())\n" +
+    "\tfor v in range(pts_2d.size()):\n" +
+    "\t\tpts_3d[v] = Vector3(pts_2d[v].x, pts_2d[v].y, 0.0)\n" +
+    "\n" +
+    "\tvar arrays := []\n" +
+    "\tarrays.resize(Mesh.ARRAY_MAX)\n" +
+    "\tarrays[Mesh.ARRAY_VERTEX] = pts_3d\n" +
+    "\tif uvs.size() == pts_2d.size():\n" +
+    "\t\tarrays[Mesh.ARRAY_TEX_UV] = uvs\n" +
+    "\tarrays[Mesh.ARRAY_INDEX] = tri_indices\n" +
+    "\n" +
+    "\tvar array_mesh := ArrayMesh.new()\n" +
+    "\tarray_mesh.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, arrays)\n" +
+    "\treturn array_mesh\n" +
+    "\n" +
+    "\n" +
+    "func _key_times(anim: Animation, track_idx: int) -> Array[float]:\n" +
+    "\tvar times: Array[float] = []\n" +
+    "\tfor k in range(anim.track_get_key_count(track_idx)):\n" +
+    "\t\ttimes.append(anim.track_get_key_time(track_idx, k))\n" +
+    "\treturn times\n" +
+    "\n" +
+    "\n" +
+    "# The value in effect on `track_idx` at `time` -- i.e. the LAST key at or\n" +
+    "# before `time` (keys are always stored in ascending time order by the\n" +
+    "# exporter) -- or `default_value` if the track doesn't exist, has no keys\n" +
+    "# yet at `time`, or `track_idx` is -1.\n" +
+    "func _value_at_time(anim: Animation, track_idx: int, time: float, default_value):\n" +
+    "\tif track_idx == -1:\n" +
+    "\t\treturn default_value\n" +
+    "\tvar result = default_value\n" +
+    "\tfor k in range(anim.track_get_key_count(track_idx)):\n" +
+    "\t\tif anim.track_get_key_time(track_idx, k) <= time + 0.0005:\n" +
+    "\t\t\tresult = anim.track_get_key_value(track_idx, k)\n" +
+    "\t\telse:\n" +
+    "\t\t\tbreak\n" +
+    "\treturn result\n" +
+    "\n" +
+    "\n" +
+    "# AnimationPlayer is always a direct child of the symbol scene's own root\n" +
+    "# in this exporter's convention -- checked by exact name first (the common\n" +
+    "# case, one lookup), falling back to a plain scan of root's direct children\n" +
+    "# by type if that name ever differs. Deliberately NOT a recursive/deep\n" +
+    "# search: an instanced child scene (PackedScene) may have its own, unrelated\n" +
+    "# AnimationPlayer further down the tree, which must never be picked up here.\n" +
+    "func _find_animation_player(root: Node) -> AnimationPlayer:\n" +
+    "\tvar direct := root.get_node_or_null(\"AnimationPlayer\")\n" +
+    "\tif direct is AnimationPlayer:\n" +
+    "\t\treturn direct\n" +
+    "\tfor child in root.get_children():\n" +
+    "\t\tif child is AnimationPlayer:\n" +
+    "\t\t\treturn child\n" +
+    "\treturn null\n" +
+    "\n" +
+    "\n" +
+    "static func _shape_signature(pts: PackedVector2Array) -> String:\n" +
+    "\tvar s := \"\"\n" +
+    "\tfor p in pts:\n" +
+    "\t\ts += \"%.2f,%.2f|\" % [p.x, p.y]\n" +
+    "\treturn s\n";
+    FLfile.write(scriptDir + "/TweenShapeMeshConverter.gd", tweenConverterContent);
 }
 
 // =============================================================================
