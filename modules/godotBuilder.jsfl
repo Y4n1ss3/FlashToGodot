@@ -136,656 +136,6 @@ function _bridgeBlocked(A, B, work, wi, hole, hj) {
     return false;
 }
 
-// =============================================================================
-//  earcut -- polygon triangulation (ported from mapbox/earcut v2.2.4, ISC
-//  license: https://github.com/mapbox/earcut). Near-verbatim port: the
-//  classic v2.2.4 release is already plain ES3-style JS (var, constructor
-//  functions, no destructuring/arrow functions/let/const) with no runtime
-//  dependencies, so every identifier here is simply prefixed (_earcut*/
-//  _EarcutNode) to avoid colliding with anything else in this shared global
-//  scope -- verified byte-identical triangulation output against the
-//  original library (including on a real ~1200-vertex polygon from an
-//  actual exported shape tween) before this port was trusted.
-//
-//  Used to pre-triangulate each keyframe of a genuine multi-keyframe Flash
-//  shape tween into a static ArrayMesh at EXPORT time (see
-//  _buildTweenShapeMeshes below), instead of relying on Godot's own
-//  Polygon2D re-triangulating its `polygon` property every time an
-//  animation track changes it at RUNTIME -- for a shape with many
-//  keyframes and a large vertex count (an animated/organic shape tween,
-//  not a simple classic position/scale tween of a static shape), that
-//  runtime re-triangulation is a real, avoidable per-frame CPU cost.
-// =============================================================================
-function _earcut(data, holeIndices, dim) {
-
-    dim = dim || 2;
-
-    var hasHoles = holeIndices && holeIndices.length,
-        outerLen = hasHoles ? holeIndices[0] * dim : data.length,
-        outerNode = _earcutLinkedList(data, 0, outerLen, dim, true),
-        triangles = [];
-
-    if (!outerNode || outerNode.next === outerNode.prev) return triangles;
-
-    var minX, minY, maxX, maxY, x, y, invSize;
-
-    if (hasHoles) outerNode = _earcutEliminateHoles(data, holeIndices, outerNode, dim);
-
-    // if the shape is not too simple, we'll use z-order curve hash later; calculate polygon bbox
-    if (data.length > 80 * dim) {
-        minX = maxX = data[0];
-        minY = maxY = data[1];
-
-        for (var i = dim; i < outerLen; i += dim) {
-            x = data[i];
-            y = data[i + 1];
-            if (x < minX) minX = x;
-            if (y < minY) minY = y;
-            if (x > maxX) maxX = x;
-            if (y > maxY) maxY = y;
-        }
-
-        // minX, minY and invSize are later used to transform coords into integers for z-order calculation
-        invSize = Math.max(maxX - minX, maxY - minY);
-        invSize = invSize !== 0 ? 32767 / invSize : 0;
-    }
-
-    _earcutLinked(outerNode, triangles, dim, minX, minY, invSize, 0);
-
-    return triangles;
-}
-
-// create a circular doubly linked list from polygon points in the specified winding order
-function _earcutLinkedList(data, start, end, dim, clockwise) {
-    var i, last;
-
-    if (clockwise === (_earcutSignedArea(data, start, end, dim) > 0)) {
-        for (i = start; i < end; i += dim) last = _earcutInsertNode(i, data[i], data[i + 1], last);
-    } else {
-        for (i = end - dim; i >= start; i -= dim) last = _earcutInsertNode(i, data[i], data[i + 1], last);
-    }
-
-    if (last && _earcutEquals(last, last.next)) {
-        _earcutRemoveNode(last);
-        last = last.next;
-    }
-
-    return last;
-}
-
-// eliminate colinear or duplicate points
-function _earcutFilterPoints(start, end) {
-    if (!start) return start;
-    if (!end) end = start;
-
-    var p = start,
-        again;
-    do {
-        again = false;
-
-        if (!p.steiner && (_earcutEquals(p, p.next) || _earcutArea(p.prev, p, p.next) === 0)) {
-            _earcutRemoveNode(p);
-            p = end = p.prev;
-            if (p === p.next) break;
-            again = true;
-
-        } else {
-            p = p.next;
-        }
-    } while (again || p !== end);
-
-    return end;
-}
-
-// main ear slicing loop which triangulates a polygon (given as a linked list)
-function _earcutLinked(ear, triangles, dim, minX, minY, invSize, pass) {
-    if (!ear) return;
-
-    // interlink polygon nodes in z-order
-    if (!pass && invSize) _earcutIndexCurve(ear, minX, minY, invSize);
-
-    var stop = ear,
-        prev, next;
-
-    // iterate through ears, slicing them one by one
-    while (ear.prev !== ear.next) {
-        prev = ear.prev;
-        next = ear.next;
-
-        if (invSize ? _earcutIsEarHashed(ear, minX, minY, invSize) : _earcutIsEar(ear)) {
-            // cut off the triangle
-            triangles.push(prev.i / dim | 0);
-            triangles.push(ear.i / dim | 0);
-            triangles.push(next.i / dim | 0);
-
-            _earcutRemoveNode(ear);
-
-            // skipping the next vertex leads to less sliver triangles
-            ear = next.next;
-            stop = next.next;
-
-            continue;
-        }
-
-        ear = next;
-
-        // if we looped through the whole remaining polygon and can't find any more ears
-        if (ear === stop) {
-            // try filtering points and slicing again
-            if (!pass) {
-                _earcutLinked(_earcutFilterPoints(ear), triangles, dim, minX, minY, invSize, 1);
-
-            // if this didn't work, try curing all small self-intersections locally
-            } else if (pass === 1) {
-                ear = _earcutCureLocalIntersections(_earcutFilterPoints(ear), triangles, dim);
-                _earcutLinked(ear, triangles, dim, minX, minY, invSize, 2);
-
-            // as a last resort, try splitting the remaining polygon into two
-            } else if (pass === 2) {
-                _earcutSplitEarcut(ear, triangles, dim, minX, minY, invSize);
-            }
-
-            break;
-        }
-    }
-}
-
-// check whether a polygon node forms a valid ear with adjacent nodes
-function _earcutIsEar(ear) {
-    var a = ear.prev,
-        b = ear,
-        c = ear.next;
-
-    if (_earcutArea(a, b, c) >= 0) return false; // reflex, can't be an ear
-
-    // now make sure we don't have other points inside the potential ear
-    var ax = a.x, bx = b.x, cx = c.x, ay = a.y, by = b.y, cy = c.y;
-
-    // triangle bbox; min & max are calculated like this for speed
-    var x0 = ax < bx ? (ax < cx ? ax : cx) : (bx < cx ? bx : cx),
-        y0 = ay < by ? (ay < cy ? ay : cy) : (by < cy ? by : cy),
-        x1 = ax > bx ? (ax > cx ? ax : cx) : (bx > cx ? bx : cx),
-        y1 = ay > by ? (ay > cy ? ay : cy) : (by > cy ? by : cy);
-
-    var p = c.next;
-    while (p !== a) {
-        if (p.x >= x0 && p.x <= x1 && p.y >= y0 && p.y <= y1 &&
-            _earcutPointInTriangle(ax, ay, bx, by, cx, cy, p.x, p.y) &&
-            _earcutArea(p.prev, p, p.next) >= 0) return false;
-        p = p.next;
-    }
-
-    return true;
-}
-
-function _earcutIsEarHashed(ear, minX, minY, invSize) {
-    var a = ear.prev,
-        b = ear,
-        c = ear.next;
-
-    if (_earcutArea(a, b, c) >= 0) return false; // reflex, can't be an ear
-
-    var ax = a.x, bx = b.x, cx = c.x, ay = a.y, by = b.y, cy = c.y;
-
-    // triangle bbox; min & max are calculated like this for speed
-    var x0 = ax < bx ? (ax < cx ? ax : cx) : (bx < cx ? bx : cx),
-        y0 = ay < by ? (ay < cy ? ay : cy) : (by < cy ? by : cy),
-        x1 = ax > bx ? (ax > cx ? ax : cx) : (bx > cx ? bx : cx),
-        y1 = ay > by ? (ay > cy ? ay : cy) : (by > cy ? by : cy);
-
-    // z-order range for the current triangle bbox;
-    var minZ = _earcutZOrder(x0, y0, minX, minY, invSize),
-        maxZ = _earcutZOrder(x1, y1, minX, minY, invSize);
-
-    var p = ear.prevZ,
-        n = ear.nextZ;
-
-    // look for points inside the triangle in both directions
-    while (p && p.z >= minZ && n && n.z <= maxZ) {
-        if (p.x >= x0 && p.x <= x1 && p.y >= y0 && p.y <= y1 && p !== a && p !== c &&
-            _earcutPointInTriangle(ax, ay, bx, by, cx, cy, p.x, p.y) && _earcutArea(p.prev, p, p.next) >= 0) return false;
-        p = p.prevZ;
-
-        if (n.x >= x0 && n.x <= x1 && n.y >= y0 && n.y <= y1 && n !== a && n !== c &&
-            _earcutPointInTriangle(ax, ay, bx, by, cx, cy, n.x, n.y) && _earcutArea(n.prev, n, n.next) >= 0) return false;
-        n = n.nextZ;
-    }
-
-    // look for remaining points in decreasing z-order
-    while (p && p.z >= minZ) {
-        if (p.x >= x0 && p.x <= x1 && p.y >= y0 && p.y <= y1 && p !== a && p !== c &&
-            _earcutPointInTriangle(ax, ay, bx, by, cx, cy, p.x, p.y) && _earcutArea(p.prev, p, p.next) >= 0) return false;
-        p = p.prevZ;
-    }
-
-    // look for remaining points in increasing z-order
-    while (n && n.z <= maxZ) {
-        if (n.x >= x0 && n.x <= x1 && n.y >= y0 && n.y <= y1 && n !== a && n !== c &&
-            _earcutPointInTriangle(ax, ay, bx, by, cx, cy, n.x, n.y) && _earcutArea(n.prev, n, n.next) >= 0) return false;
-        n = n.nextZ;
-    }
-
-    return true;
-}
-
-// go through all polygon nodes and cure small local self-intersections
-function _earcutCureLocalIntersections(start, triangles, dim) {
-    var p = start;
-    do {
-        var a = p.prev,
-            b = p.next.next;
-
-        if (!_earcutEquals(a, b) && _earcutIntersects(a, p, p.next, b) && _earcutLocallyInside(a, b) && _earcutLocallyInside(b, a)) {
-
-            triangles.push(a.i / dim | 0);
-            triangles.push(p.i / dim | 0);
-            triangles.push(b.i / dim | 0);
-
-            // remove two nodes involved
-            _earcutRemoveNode(p);
-            _earcutRemoveNode(p.next);
-
-            p = start = b;
-        }
-        p = p.next;
-    } while (p !== start);
-
-    return _earcutFilterPoints(p);
-}
-
-// try splitting polygon into two and triangulate them independently
-function _earcutSplitEarcut(start, triangles, dim, minX, minY, invSize) {
-    // look for a valid diagonal that divides the polygon into two
-    var a = start;
-    do {
-        var b = a.next.next;
-        while (b !== a.prev) {
-            if (a.i !== b.i && _earcutIsValidDiagonal(a, b)) {
-                // split the polygon in two by the diagonal
-                var c = _earcutSplitPolygon(a, b);
-
-                // filter colinear points around the cuts
-                a = _earcutFilterPoints(a, a.next);
-                c = _earcutFilterPoints(c, c.next);
-
-                // run _earcut on each half
-                _earcutLinked(a, triangles, dim, minX, minY, invSize, 0);
-                _earcutLinked(c, triangles, dim, minX, minY, invSize, 0);
-                return;
-            }
-            b = b.next;
-        }
-        a = a.next;
-    } while (a !== start);
-}
-
-// link every hole into the outer loop, producing a single-ring polygon without holes
-function _earcutEliminateHoles(data, holeIndices, outerNode, dim) {
-    var queue = [],
-        i, len, start, end, list;
-
-    for (i = 0, len = holeIndices.length; i < len; i++) {
-        start = holeIndices[i] * dim;
-        end = i < len - 1 ? holeIndices[i + 1] * dim : data.length;
-        list = _earcutLinkedList(data, start, end, dim, false);
-        if (list === list.next) list.steiner = true;
-        queue.push(_earcutGetLeftmost(list));
-    }
-
-    queue.sort(_earcutCompareX);
-
-    // process holes from left to right
-    for (i = 0; i < queue.length; i++) {
-        outerNode = _earcutEliminateHole(queue[i], outerNode);
-    }
-
-    return outerNode;
-}
-
-function _earcutCompareX(a, b) {
-    return a.x - b.x;
-}
-
-// find a bridge between vertices that connects hole with an outer ring and and link it
-function _earcutEliminateHole(hole, outerNode) {
-    var bridge = _earcutFindHoleBridge(hole, outerNode);
-    if (!bridge) {
-        return outerNode;
-    }
-
-    var bridgeReverse = _earcutSplitPolygon(bridge, hole);
-
-    // filter collinear points around the cuts
-    _earcutFilterPoints(bridgeReverse, bridgeReverse.next);
-    return _earcutFilterPoints(bridge, bridge.next);
-}
-
-// David Eberly's algorithm for finding a bridge between hole and outer polygon
-function _earcutFindHoleBridge(hole, outerNode) {
-    var p = outerNode,
-        hx = hole.x,
-        hy = hole.y,
-        qx = -Infinity,
-        m;
-
-    // find a segment intersected by a ray from the hole's leftmost point to the left;
-    // segment's endpoint with lesser x will be potential connection point
-    do {
-        if (hy <= p.y && hy >= p.next.y && p.next.y !== p.y) {
-            var x = p.x + (hy - p.y) * (p.next.x - p.x) / (p.next.y - p.y);
-            if (x <= hx && x > qx) {
-                qx = x;
-                m = p.x < p.next.x ? p : p.next;
-                if (x === hx) return m; // hole touches outer segment; pick leftmost endpoint
-            }
-        }
-        p = p.next;
-    } while (p !== outerNode);
-
-    if (!m) return null;
-
-    // look for points inside the triangle of hole point, segment intersection and endpoint;
-    // if there are no points found, we have a valid connection;
-    // otherwise choose the point of the minimum angle with the ray as connection point
-
-    var stop = m,
-        mx = m.x,
-        my = m.y,
-        tanMin = Infinity,
-        tan;
-
-    p = m;
-
-    do {
-        if (hx >= p.x && p.x >= mx && hx !== p.x &&
-                _earcutPointInTriangle(hy < my ? hx : qx, hy, mx, my, hy < my ? qx : hx, hy, p.x, p.y)) {
-
-            tan = Math.abs(hy - p.y) / (hx - p.x); // tangential
-
-            if (_earcutLocallyInside(p, hole) &&
-                (tan < tanMin || (tan === tanMin && (p.x > m.x || (p.x === m.x && _earcutSectorContainsSector(m, p)))))) {
-                m = p;
-                tanMin = tan;
-            }
-        }
-
-        p = p.next;
-    } while (p !== stop);
-
-    return m;
-}
-
-// whether sector in vertex m contains sector in vertex p in the same coordinates
-function _earcutSectorContainsSector(m, p) {
-    return _earcutArea(m.prev, m, p.prev) < 0 && _earcutArea(p.next, m, m.next) < 0;
-}
-
-// interlink polygon nodes in z-order
-function _earcutIndexCurve(start, minX, minY, invSize) {
-    var p = start;
-    do {
-        if (p.z === 0) p.z = _earcutZOrder(p.x, p.y, minX, minY, invSize);
-        p.prevZ = p.prev;
-        p.nextZ = p.next;
-        p = p.next;
-    } while (p !== start);
-
-    p.prevZ.nextZ = null;
-    p.prevZ = null;
-
-    _earcutSortLinked(p);
-}
-
-// Simon Tatham's linked list merge sort algorithm
-// http://www.chiark.greenend.org.uk/~sgtatham/algorithms/listsort.html
-function _earcutSortLinked(list) {
-    var i, p, q, e, tail, numMerges, pSize, qSize,
-        inSize = 1;
-
-    do {
-        p = list;
-        list = null;
-        tail = null;
-        numMerges = 0;
-
-        while (p) {
-            numMerges++;
-            q = p;
-            pSize = 0;
-            for (i = 0; i < inSize; i++) {
-                pSize++;
-                q = q.nextZ;
-                if (!q) break;
-            }
-            qSize = inSize;
-
-            while (pSize > 0 || (qSize > 0 && q)) {
-
-                if (pSize !== 0 && (qSize === 0 || !q || p.z <= q.z)) {
-                    e = p;
-                    p = p.nextZ;
-                    pSize--;
-                } else {
-                    e = q;
-                    q = q.nextZ;
-                    qSize--;
-                }
-
-                if (tail) tail.nextZ = e;
-                else list = e;
-
-                e.prevZ = tail;
-                tail = e;
-            }
-
-            p = q;
-        }
-
-        tail.nextZ = null;
-        inSize *= 2;
-
-    } while (numMerges > 1);
-
-    return list;
-}
-
-// z-order of a point given coords and inverse of the longer side of data bbox
-function _earcutZOrder(x, y, minX, minY, invSize) {
-    // coords are transformed into non-negative 15-bit integer range
-    x = (x - minX) * invSize | 0;
-    y = (y - minY) * invSize | 0;
-
-    x = (x | (x << 8)) & 0x00FF00FF;
-    x = (x | (x << 4)) & 0x0F0F0F0F;
-    x = (x | (x << 2)) & 0x33333333;
-    x = (x | (x << 1)) & 0x55555555;
-
-    y = (y | (y << 8)) & 0x00FF00FF;
-    y = (y | (y << 4)) & 0x0F0F0F0F;
-    y = (y | (y << 2)) & 0x33333333;
-    y = (y | (y << 1)) & 0x55555555;
-
-    return x | (y << 1);
-}
-
-// find the leftmost node of a polygon ring
-function _earcutGetLeftmost(start) {
-    var p = start,
-        leftmost = start;
-    do {
-        if (p.x < leftmost.x || (p.x === leftmost.x && p.y < leftmost.y)) leftmost = p;
-        p = p.next;
-    } while (p !== start);
-
-    return leftmost;
-}
-
-// check if a point lies within a convex triangle
-function _earcutPointInTriangle(ax, ay, bx, by, cx, cy, px, py) {
-    return (cx - px) * (ay - py) >= (ax - px) * (cy - py) &&
-           (ax - px) * (by - py) >= (bx - px) * (ay - py) &&
-           (bx - px) * (cy - py) >= (cx - px) * (by - py);
-}
-
-// check if a diagonal between two polygon nodes is valid (lies in polygon interior)
-function _earcutIsValidDiagonal(a, b) {
-    return a.next.i !== b.i && a.prev.i !== b.i && !_earcutIntersectsPolygon(a, b) && // dones't intersect other edges
-           (_earcutLocallyInside(a, b) && _earcutLocallyInside(b, a) && _earcutMiddleInside(a, b) && // locally visible
-            (_earcutArea(a.prev, a, b.prev) || _earcutArea(a, b.prev, b)) || // does not create opposite-facing sectors
-            _earcutEquals(a, b) && _earcutArea(a.prev, a, a.next) > 0 && _earcutArea(b.prev, b, b.next) > 0); // special zero-length case
-}
-
-// signed area of a triangle
-function _earcutArea(p, q, r) {
-    return (q.y - p.y) * (r.x - q.x) - (q.x - p.x) * (r.y - q.y);
-}
-
-// check if two points are equal
-function _earcutEquals(p1, p2) {
-    return p1.x === p2.x && p1.y === p2.y;
-}
-
-// check if two segments intersect
-function _earcutIntersects(p1, q1, p2, q2) {
-    var o1 = _earcutSign(_earcutArea(p1, q1, p2));
-    var o2 = _earcutSign(_earcutArea(p1, q1, q2));
-    var o3 = _earcutSign(_earcutArea(p2, q2, p1));
-    var o4 = _earcutSign(_earcutArea(p2, q2, q1));
-
-    if (o1 !== o2 && o3 !== o4) return true; // general case
-
-    if (o1 === 0 && _earcutOnSegment(p1, p2, q1)) return true; // p1, q1 and p2 are collinear and p2 lies on p1q1
-    if (o2 === 0 && _earcutOnSegment(p1, q2, q1)) return true; // p1, q1 and q2 are collinear and q2 lies on p1q1
-    if (o3 === 0 && _earcutOnSegment(p2, p1, q2)) return true; // p2, q2 and p1 are collinear and p1 lies on p2q2
-    if (o4 === 0 && _earcutOnSegment(p2, q1, q2)) return true; // p2, q2 and q1 are collinear and q1 lies on p2q2
-
-    return false;
-}
-
-// for collinear points p, q, r, check if point q lies on segment pr
-function _earcutOnSegment(p, q, r) {
-    return q.x <= Math.max(p.x, r.x) && q.x >= Math.min(p.x, r.x) && q.y <= Math.max(p.y, r.y) && q.y >= Math.min(p.y, r.y);
-}
-
-function _earcutSign(num) {
-    return num > 0 ? 1 : num < 0 ? -1 : 0;
-}
-
-// check if a polygon diagonal intersects any polygon segments
-function _earcutIntersectsPolygon(a, b) {
-    var p = a;
-    do {
-        if (p.i !== a.i && p.next.i !== a.i && p.i !== b.i && p.next.i !== b.i &&
-                _earcutIntersects(p, p.next, a, b)) return true;
-        p = p.next;
-    } while (p !== a);
-
-    return false;
-}
-
-// check if a polygon diagonal is locally inside the polygon
-function _earcutLocallyInside(a, b) {
-    return _earcutArea(a.prev, a, a.next) < 0 ?
-        _earcutArea(a, b, a.next) >= 0 && _earcutArea(a, a.prev, b) >= 0 :
-        _earcutArea(a, b, a.prev) < 0 || _earcutArea(a, a.next, b) < 0;
-}
-
-// check if the middle point of a polygon diagonal is inside the polygon
-function _earcutMiddleInside(a, b) {
-    var p = a,
-        inside = false,
-        px = (a.x + b.x) / 2,
-        py = (a.y + b.y) / 2;
-    do {
-        if (((p.y > py) !== (p.next.y > py)) && p.next.y !== p.y &&
-                (px < (p.next.x - p.x) * (py - p.y) / (p.next.y - p.y) + p.x))
-            inside = !inside;
-        p = p.next;
-    } while (p !== a);
-
-    return inside;
-}
-
-// link two polygon vertices with a bridge; if the vertices belong to the same ring, it splits polygon into two;
-// if one belongs to the outer ring and another to a hole, it merges it into a single ring
-function _earcutSplitPolygon(a, b) {
-    var a2 = new _EarcutNode(a.i, a.x, a.y),
-        b2 = new _EarcutNode(b.i, b.x, b.y),
-        an = a.next,
-        bp = b.prev;
-
-    a.next = b;
-    b.prev = a;
-
-    a2.next = an;
-    an.prev = a2;
-
-    b2.next = a2;
-    a2.prev = b2;
-
-    bp.next = b2;
-    b2.prev = bp;
-
-    return b2;
-}
-
-// create a node and optionally link it with previous one (in a circular doubly linked list)
-function _earcutInsertNode(i, x, y, last) {
-    var p = new _EarcutNode(i, x, y);
-
-    if (!last) {
-        p.prev = p;
-        p.next = p;
-
-    } else {
-        p.next = last.next;
-        p.prev = last;
-        last.next.prev = p;
-        last.next = p;
-    }
-    return p;
-}
-
-function _earcutRemoveNode(p) {
-    p.next.prev = p.prev;
-    p.prev.next = p.next;
-
-    if (p.prevZ) p.prevZ.nextZ = p.nextZ;
-    if (p.nextZ) p.nextZ.prevZ = p.prevZ;
-}
-
-function _EarcutNode(i, x, y) {
-    // vertex index in coordinates array
-    this.i = i;
-
-    // vertex coordinates
-    this.x = x;
-    this.y = y;
-
-    // previous and next vertex nodes in a polygon ring
-    this.prev = null;
-    this.next = null;
-
-    // z-order curve value
-    this.z = 0;
-
-    // previous and next nodes in z-order
-    this.prevZ = null;
-    this.nextZ = null;
-
-    // indicates whether this is a steiner point
-    this.steiner = false;
-}
-
-function _earcutSignedArea(data, start, end, dim) {
-    var sum = 0;
-    for (var i = start, j = end - dim; i < end; i += dim) {
-        sum += (data[j] - data[i]) * (data[i + 1] + data[j + 1]);
-        j = i;
-    }
-    return sum;
-}
-
 function _bridgeHoles(outerVerts, holesArr) {
     var work = [];
     for (var i = 0; i < outerVerts.length; i++) {
@@ -1731,7 +1081,7 @@ GAnimation.prototype.optimizeTracks = function(root) {
 
                         if (typeof valAtZero === "boolean")          targetNode.properties[propName] = valAtZero;
                         else if (typeof valAtZero === "number") {
-                            if (propName === "process_mode" || propName === "mesh_index")   targetNode.properties[propName] = valAtZero;
+                            if (propName === "process_mode")   targetNode.properties[propName] = valAtZero;
                             else                               targetNode.properties[propName] = _f(valAtZero);
                         }
                         else if (valAtZero && valAtZero.x !== undefined)   targetNode.properties[propName] = _vec2(valAtZero.x, valAtZero.y);
@@ -1747,7 +1097,7 @@ GAnimation.prototype.optimizeTracks = function(root) {
                 if (targetNode) {
                     if (typeof firstVal === "boolean")          targetNode.properties[propName] = firstVal;
                     else if (typeof firstVal === "number") {
-                        if (propName === "process_mode" || propName === "mesh_index")   targetNode.properties[propName] = firstVal; // No decimals for enums/ints!
+                        if (propName === "process_mode")   targetNode.properties[propName] = firstVal; // No decimals for enums!
                         else                               targetNode.properties[propName] = _f(firstVal);
                     }
                     else if (firstVal && firstVal.x !== undefined)   targetNode.properties[propName] = _vec2(firstVal.x, firstVal.y);
@@ -2444,7 +1794,7 @@ GAnimation.prototype.addTrackKey = function(path, typeStr, time, value, transiti
                 || typeStr === "object" || typeStr === "bool"
                 || path.indexOf(":polygon") !== -1 || path.indexOf(":points") !== -1
                 || path.indexOf(":uv") !== -1 || path.indexOf("/shape:position") !== -1
-                || path.indexOf(":process_mode") !== -1 || path.indexOf(":mesh_index") !== -1) {
+                || path.indexOf(":process_mode") !== -1) {
             updateMode = 1;
             interp = 0;
         } else if (path.indexOf(":rotation") !== -1 || path.indexOf(":skew") !== -1) {
@@ -3099,7 +2449,7 @@ function _clearExcessNamedSlots(node, variantPathStr, anim, startIndex, prefix, 
 // creating/attaching the node itself (parent.addChildRanked, node.owner),
 // never anim.tracks nor subResources -- so it can be extracted without
 // threading the rest of _processElementNode's state.
-function _resolveElementNode(elem, parent, ownerRoot, wrapperName, shaderNeeds, modulateNeedsCanvasGroup, layerZIndex, getExt, isStaticLayer) {
+function _resolveElementNode(elem, parent, ownerRoot, wrapperName, shaderNeeds, modulateNeedsCanvasGroup, layerZIndex, getExt) {
     if (parent !== ownerRoot && !parent.parent) {
         ownerRoot.addChild(parent);
     }
@@ -3117,24 +2467,7 @@ function _resolveElementNode(elem, parent, ownerRoot, wrapperName, shaderNeeds, 
         if (!node) {
             isNewNode = true;
             isNewWrapper = true;
-            if (elem.polygons && elem.polygons.length > 0 && (!isStaticLayer || elem._isTweenShape)) {
-                // This occurrence's fill geometry will be written via
-                // AnimationPlayer tracks rather than a single static
-                // property (either a real multi-keyframe layer, or a
-                // genuine Flash shape tween flattened by _expandTweens --
-                // same "!isStaticLayer || elem._isTweenShape" test used
-                // everywhere else below to decide "animated" vs "static").
-                // Backed by TweenShapeMesh.gd (written unconditionally
-                // alongside FlashMovieClip.gd) instead of Polygon2D, so its
-                // geometry can be pre-triangulated ONCE per keyframe at
-                // export time (see _earcut above) instead of Godot
-                // re-triangulating a raw "polygon" property value on every
-                // single change, every time the animation plays.
-                // See _processElementNode's polyNode.type === "MeshInstance2D"
-                // branch for the matching keyframe-data/track emission.
-                node = new GNode(wrapperName, "MeshInstance2D");
-                node.properties["script"] = "ExtResource(\"" + getExt("res://scripts/TweenShapeMesh.gd", "Script") + "\")";
-            } else if (elem.polygons && elem.polygons.length > 0) {
+            if (elem.polygons && elem.polygons.length > 0) {
                 node = new GNode(wrapperName, "Polygon2D");
                 node.properties["color"] = "Color(1, 1, 1, 1)";
             } else if (elem.elementType === "shape" && elem.strokes && elem.strokes.length > 0) {
@@ -3204,7 +2537,7 @@ function _processElementNode(elem, parent, ownerRoot, anim, startTime, duration,
                              maxTime, kfTransition, shaderNeeds, customTexPath, layerType,
                              getExt, subResources, isStaticLayer, modulateNeedsCanvasGroup, gradCache, layerZIndex) {
     // --- 1. Wrapper/node: lookup or creation -----------------------------
-    var _resolved = _resolveElementNode(elem, parent, ownerRoot, wrapperName, shaderNeeds, modulateNeedsCanvasGroup, layerZIndex, getExt, isStaticLayer);
+    var _resolved = _resolveElementNode(elem, parent, ownerRoot, wrapperName, shaderNeeds, modulateNeedsCanvasGroup, layerZIndex, getExt);
     var node = _resolved.node;
     var wrapperNode = _resolved.wrapperNode;
     var isNewNode = _resolved.isNewNode;
@@ -3309,17 +2642,9 @@ function _processElementNode(elem, parent, ownerRoot, anim, startTime, duration,
             // Poly_X and anim._maxPoly) apply the same -1 offset to stay
             // consistent with this naming.
 
-            // gIdx 0 reuses `node` itself (no separate child) whenever node
-            // is the shape's own "main" fill type -- Polygon2D as before,
-            // or now MeshInstance2D for a track-animated tween shape (see
-            // _resolveElementNode). Any further groups (gIdx > 0, extra
-            // colors/gradients on the same shape) still become plain
-            // Polygon2D "Poly_N" children either way -- not pre-triangulated,
-            // but rare in practice and still renders correctly.
-            var isMainNodeType = (node.type === "Polygon2D" || node.type === "MeshInstance2D");
             for (var gIdx = 0; gIdx < polyGroups.length; gIdx++) {
                 var group = polyGroups[gIdx];
-                var polyNodeName = (gIdx === 0 && isMainNodeType) ? "" : "Poly_" + ((gIdx > 0 && isMainNodeType) ? (gIdx - 1) : gIdx);
+                var polyNodeName = (gIdx === 0 && node.type === "Polygon2D") ? "" : "Poly_" + ((gIdx > 0 && node.type === "Polygon2D") ? (gIdx - 1) : gIdx);
                 var polyNode;
                 
                 if (polyNodeName === "") {
@@ -3337,7 +2662,6 @@ function _processElementNode(elem, parent, ownerRoot, anim, startTime, duration,
                 var pointsParts = [];
                 var uvParts = [];
                 var polygonsParts = [];
-                var meshTriParts = []; // MeshInstance2D case only: earcut triangle indices, offset per sub-polygon (see below)
                 var vertexOffset = 0;
                 var hasUv = false;
                 var invA, invB, invC, invD, invTx, invTy;
@@ -3379,29 +2703,6 @@ function _processElementNode(elem, parent, ownerRoot, anim, startTime, duration,
                     }
 
                     var finalVerts = _cleanupPolygonVertices(effectiveVerts);
-
-                    if (polyNode.type === "MeshInstance2D") {
-                        // Triangulate THIS sub-polygon alone (earcut expects one
-                        // simple polygon, not several disjoint sibling shapes --
-                        // group.polygons can hold more than one when several
-                        // disconnected shapes share the same color/gradient),
-                        // using the exact same finalVerts/vertexOffset already
-                        // driving pointsParts just below, then offset its
-                        // indices by vertexOffset so they index correctly into
-                        // the COMBINED frame_positions vertex pool (mirrors how
-                        // "indices"/polygonsParts already do it for the old
-                        // Polygon2D "polygons" property, just triangulated
-                        // instead of a plain per-subpolygon point listing).
-                        var meshFlatVerts = [];
-                        for (var mfv = 0; mfv < finalVerts.length; mfv++) {
-                            meshFlatVerts.push(finalVerts[mfv].x);
-                            meshFlatVerts.push(finalVerts[mfv].y);
-                        }
-                        var meshTri = finalVerts.length >= 3 ? _earcut(meshFlatVerts, null, 2) : [];
-                        for (var mti = 0; mti < meshTri.length; mti++) {
-                            meshTriParts.push(vertexOffset + meshTri[mti]);
-                        }
-                    }
 
                     var indices = [];
                     for (var v = 0; v < finalVerts.length; v++) {
@@ -3511,60 +2812,7 @@ function _processElementNode(elem, parent, ownerRoot, anim, startTime, duration,
                 }
                 
                 var polyPath = variantPathStr + (polyNodeName ? "/" + polyNodeName : "");
-                if (polyNode.type === "MeshInstance2D") {
-                    // Genuine shape tween: pre-triangulate THIS keyframe via
-                    // _earcut (ported above) and accumulate it into
-                    // TweenShapeMesh.gd's plain frame_positions/frame_uvs/
-                    // frame_indices arrays, instead of an animated "polygon"
-                    // property Godot would re-triangulate on every change
-                    // (see that script's header comment, and this shape's
-                    // node-creation branch above, for the full rationale).
-                    // A single ":mesh_index" integer track (added here, once
-                    // per keyframe, in place of the old ":polygon" track)
-                    // then just swaps which of the meshes TweenShapeMesh
-                    // built ONCE at load is shown. Only ever true for gIdx
-                    // === 0 (polyNode === node) -- any further polyGroups
-                    // (gIdx > 0, a multi-color/gradient tween shape, not
-                    // seen in practice) still create plain Polygon2D
-                    // Poly_N children (see below) and fall through to the
-                    // ordinary track-key branch, so they still render
-                    // correctly even though they aren't pre-triangulated.
-                    // meshTriParts was accumulated above, per sub-polygon and
-                    // offset into the combined vertex pool, while pointsStr/
-                    // uvsStr were being built -- NOT recomputed here from
-                    // finalVerts (which, after the "for (var p...)" loop above,
-                    // only ever holds the LAST sub-polygon's vertices: reusing
-                    // it here would silently triangulate just that one
-                    // sub-polygon while frame_positions holds every
-                    // sub-polygon's vertices, corrupting the mesh whenever a
-                    // group has more than one polygon).
-                    if (!polyNode._tweenFrames) polyNode._tweenFrames = [];
-                    var frameIdx = polyNode._tweenFrames.length;
-                    polyNode._tweenFrames.push({
-                        points: pointsStr,
-                        uvs: uvsStr,
-                        indices: "PackedInt32Array(" + meshTriParts.join(", ") + ")"
-                    });
-
-                    var fPosParts = [], fUvParts = [], fIdxParts = [];
-                    for (var tf = 0; tf < polyNode._tweenFrames.length; tf++) {
-                        fPosParts.push(polyNode._tweenFrames[tf].points);
-                        fUvParts.push(polyNode._tweenFrames[tf].uvs);
-                        fIdxParts.push(polyNode._tweenFrames[tf].indices);
-                    }
-                    polyNode.properties["frame_positions"] = "Array[PackedVector2Array]([" + fPosParts.join(", ") + "])";
-                    polyNode.properties["frame_uvs"] = "Array[PackedVector2Array]([" + fUvParts.join(", ") + "])";
-                    polyNode.properties["frame_indices"] = "Array[PackedInt32Array]([" + fIdxParts.join(", ") + "])";
-
-                    anim.addTrackKey(polyPath + ":mesh_index", "value", startTime, frameIdx, 0.0);
-                    if (elem._isMaskShape) {
-                        anim.addTrackKey(polyPath + ":visible", "value", startTime, true, 0.0);
-                    } else {
-                        anim.addTrackKey(polyPath + ":texture", "value", startTime, texIdStr, 0.0);
-                        anim.addTrackKey(polyPath + ":modulate", "value", startTime, "Color(1, 1, 1, 1)", 0.0);
-                        anim.addTrackKey(polyPath + ":visible", "value", startTime, true, 0.0);
-                    }
-                } else if (isStaticLayer && !elem._isTweenShape) {
+                if (isStaticLayer && !elem._isTweenShape) {
                     polyNode.properties["polygon"] = pointsStr;
                     if (group.polygons.length > 1) {
                         polyNode.properties["polygons"] = polygonsStr;
@@ -3604,20 +2852,12 @@ function _processElementNode(elem, parent, ownerRoot, anim, startTime, duration,
                 var prevMax = anim._maxPoly[variantPathStr] || 0;
                 var curLen = polyGroups.length;
                 for (var p = curLen; p < prevMax; p++) {
-                    var polyNodeName = (p === 0 && isMainNodeType) ? "" : "Poly_" + ((p > 0 && isMainNodeType) ? (p - 1) : p);
+                    var polyNodeName = (p === 0 && node.type === "Polygon2D") ? "" : "Poly_" + ((p > 0 && node.type === "Polygon2D") ? (p - 1) : p);
                     var polyPath = variantPathStr + (polyNodeName ? "/" + polyNodeName : "");
-                    if (p === 0 && node.type === "MeshInstance2D") {
-                        // The main node is a MeshInstance2D (TweenShapeMesh),
-                        // which has no "polygon"/"polygons"/"uv" properties --
-                        // just hide it instead of clearing geometry it
-                        // doesn't have.
-                        anim.addTrackKey(polyPath + ":visible", "value", startTime, false, 0.0);
-                    } else {
-                        anim.addTrackKey(polyPath + ":polygon", "value", startTime, "PackedVector2Array()", 0.0);
-                        anim.addTrackKey(polyPath + ":polygons", "value", startTime, "[]", 0.0);
-                        anim.addTrackKey(polyPath + ":uv", "value", startTime, "PackedVector2Array()", 0.0);
-                        anim.addTrackKey(polyPath + ":visible", "value", startTime, false, 0.0);
-                    }
+                    anim.addTrackKey(polyPath + ":polygon", "value", startTime, "PackedVector2Array()", 0.0);
+                    anim.addTrackKey(polyPath + ":polygons", "value", startTime, "[]", 0.0);
+                    anim.addTrackKey(polyPath + ":uv", "value", startTime, "PackedVector2Array()", 0.0);
+                    anim.addTrackKey(polyPath + ":visible", "value", startTime, false, 0.0);
                 }
                 anim._maxPoly[variantPathStr] = Math.max(prevMax, curLen);
             }
@@ -4782,15 +4022,6 @@ function generateAnimTracksStr(animObj) {
         for (var v = 0; v < tr.keys.values.length; v++) {
             var val = tr.keys.values[v];
             if (typeof val === "boolean")         valsStr.push(val ? "true" : "false");
-            else if (typeof val === "number" && tr.path.indexOf(":mesh_index") !== -1) {
-                // mesh_index is a strictly int-typed GDScript property
-                // (TweenShapeMesh.gd) -- _f() below always formats numbers
-                // as a 4-decimal float ("0.0000"), which the animation
-                // editor's type reflection then flags as an invalid key
-                // (float Variant stored against an int property) even
-                // though playback itself mostly tolerates it.
-                valsStr.push(String(Math.round(val)));
-            }
             else if (typeof val === "number")     valsStr.push(_f(val));
             else if (val && val.x !== undefined)  valsStr.push(_vec2(val.x, val.y));
             else if (val && val.ext)              valsStr.push('ExtResource("' + val.ext + '")');
@@ -5083,99 +4314,6 @@ function buildGodotScenes(doc, data, exportDir) {
         FLfile.createFolder(scriptDir);
     }
     FLfile.write(scriptDir + "/FlashMovieClip.gd", fmcContent);
-
-    // TweenShapeMesh.gd -- backs genuine multi-keyframe Flash shape tweens
-    // (see _isTweenShape below): builds each keyframe's mesh ONCE via
-    // Godot's own add_surface_from_arrays() from the plain, pre-triangulated
-    // (via _earcut above) arrays this exporter writes, instead of a
-    // Polygon2D whose "polygon" property gets a new value every keyframe --
-    // which forces Godot to re-triangulate on every single change, every
-    // time that animation plays. Full rationale in the script's own header
-    // comment. Shared across every symbol that needs it (like
-    // FlashMovieClip.gd above), written unconditionally -- harmless/no-op
-    // for exports that don't happen to contain any qualifying shape tween.
-    var tweenMeshContent = "extends MeshInstance2D\n" +
-    "class_name TweenShapeMesh\n" +
-    "## Backs a genuine Flash SHAPE tween (organic vertex-level reshaping across\n" +
-    "## many keyframes, not a classic position/scale/rotation tween of a static\n" +
-    "## shape) exported by FlashToGodot's godotBuilder.jsfl. Each keyframe's raw\n" +
-    "## geometry -- vertex positions, UVs, and TRIANGLE INDICES already computed\n" +
-    "## at EXPORT time (via earcut, ported into godotBuilder.jsfl) -- is supplied\n" +
-    "## as plain arrays, one entry per keyframe.\n" +
-    "##\n" +
-    "## Deliberately does NOT hand-build Godot's internal ArrayMesh binary format\n" +
-    "## (a packed PackedByteArray with a specific per-vertex byte stride) --\n" +
-    "## that's exactly the kind of thing that fails silently/corrupts if gotten\n" +
-    "## even slightly wrong, and there's no way to verify it from the exporter\n" +
-    "## side. Instead, _ready() calls Godot's OWN add_surface_from_arrays() once\n" +
-    "## per keyframe, using the plain arrays below -- Godot's own C++ builds the\n" +
-    "## actual mesh correctly; this script never touches that format at all.\n" +
-    "## Since the indices are ALREADY triangulated (not just raw polygon\n" +
-    "## vertices), add_surface_from_arrays() does no triangulation work either\n" +
-    "## -- this is a one-time, cheap \"hand Godot some triangles\" call per\n" +
-    "## keyframe, done once at load, not per frame.\n" +
-    "##\n" +
-    "## mesh_index then just swaps which already-built mesh is shown (a plain\n" +
-    "## resource reference assignment, not a reshape) -- driven by a plain\n" +
-    "## AnimationPlayer \":mesh_index\" integer value track using the exact same\n" +
-    "## keyframe timing a raw \":polygon\" track would have used, so this is a\n" +
-    "## drop-in replacement for a Polygon2D whose \"polygon\" property was being\n" +
-    "## animated with a new value every keyframe (which forces Godot to\n" +
-    "## re-triangulate on every single change, every time that animation plays).\n" +
-    "\n" +
-    "@export var frame_positions: Array[PackedVector2Array] = []\n" +
-    "@export var frame_uvs: Array[PackedVector2Array] = []\n" +
-    "@export var frame_indices: Array[PackedInt32Array] = []\n" +
-    "\n" +
-    "var _meshes: Array[ArrayMesh] = []\n" +
-    "var _built: bool = false\n" +
-    "\n" +
-    "var mesh_index: int = 0:\n" +
-    "\tset(value):\n" +
-    "\t\tmesh_index = value\n" +
-    "\t\tif not _built:\n" +
-    "\t\t\t_build_meshes()\n" +
-    "\t\tif value >= 0 and value < _meshes.size():\n" +
-    "\t\t\tmesh = _meshes[value]\n" +
-    "\n" +
-    "func _ready() -> void:\n" +
-    "\tif not _built:\n" +
-    "\t\t_build_meshes()\n" +
-    "\t# Re-apply whatever mesh_index an AnimationPlayer track (or the RESET\n" +
-    "\t# animation) already set before _meshes existed -- the setter above\n" +
-    "\t# no-ops until _built is true, so the very first value set (often\n" +
-    "\t# during scene construction, before _ready runs) needs re-asserting.\n" +
-    "\tif mesh_index >= 0 and mesh_index < _meshes.size():\n" +
-    "\t\tmesh = _meshes[mesh_index]\n" +
-    "\n" +
-    "func _build_meshes() -> void:\n" +
-    "\t_built = true\n" +
-    "\t_meshes.resize(frame_positions.size())\n" +
-    "\tfor i in range(frame_positions.size()):\n" +
-    "\t\tvar positions_2d := frame_positions[i]\n" +
-    "\t\t# Degenerate/empty keyframe (fewer than 3 vertices, or the\n" +
-    "\t\t# exporter's triangulation genuinely produced no triangles for it)\n" +
-    "\t\t# -- leave _meshes[i] null rather than calling\n" +
-    "\t\t# add_surface_from_arrays() with an empty index array, which the\n" +
-    "\t\t# rendering server rejects outright (index_array_len mismatch).\n" +
-    "\t\tif positions_2d.size() < 3 or i >= frame_indices.size() or frame_indices[i].size() < 3:\n" +
-    "\t\t\tcontinue\n" +
-    "\t\tvar positions_3d := PackedVector3Array()\n" +
-    "\t\tpositions_3d.resize(positions_2d.size())\n" +
-    "\t\tfor v in range(positions_2d.size()):\n" +
-    "\t\t\tpositions_3d[v] = Vector3(positions_2d[v].x, positions_2d[v].y, 0.0)\n" +
-    "\n" +
-    "\t\tvar arrays := []\n" +
-    "\t\tarrays.resize(Mesh.ARRAY_MAX)\n" +
-    "\t\tarrays[Mesh.ARRAY_VERTEX] = positions_3d\n" +
-    "\t\tif i < frame_uvs.size() and frame_uvs[i].size() == positions_2d.size():\n" +
-    "\t\t\tarrays[Mesh.ARRAY_TEX_UV] = frame_uvs[i]\n" +
-    "\t\tarrays[Mesh.ARRAY_INDEX] = frame_indices[i]\n" +
-    "\n" +
-    "\t\tvar array_mesh := ArrayMesh.new()\n" +
-    "\t\tarray_mesh.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, arrays)\n" +
-    "\t\t_meshes[i] = array_mesh\n";
-    FLfile.write(scriptDir + "/TweenShapeMesh.gd", tweenMeshContent);
 }
 
 // =============================================================================
