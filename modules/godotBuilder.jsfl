@@ -691,57 +691,13 @@ function _extractColorTransform(ct) {
     };
 }
 
-function _parsePngFilename(fname) {
-    var info = {
-        useAbsoluteBounds: false,
-        boundsX: 0.0, boundsY: 0.0,
-        pngWidth: undefined, pngHeight: undefined,
-        offsetDx: 0.0, offsetDy: 0.0,
-        spriteScale: 1.0
-    };
-    var scaleMatch = fileName.match(/_SPRITESCALE_([0-9\.]+)/);
-    if (scaleMatch) {
-        info.spriteScale = parseFloat(scaleMatch[1]);
-        fileName = fileName.replace(scaleMatch[0], "");
-    }
-    var parts = fileName.split("_BOUNDS_");
-    if (parts.length > 1) {
-        var boundAndSize = parts[1].replace(".png", "");
-        var sizeSplit = boundAndSize.split("_SIZE_");
-        var bp = sizeSplit[0].split("_");
-        if (bp.length >= 2) {
-            info.useAbsoluteBounds = true;
-            info.boundsX = safeNum(parseFloat(bp[0]));
-            info.boundsY = safeNum(parseFloat(bp[1]));
-        }
-        if (sizeSplit.length > 1) {
-            var sp = sizeSplit[1].split("_");
-            if (sp.length >= 2) {
-                info.pngWidth  = safeNum(parseFloat(sp[0]));
-                info.pngHeight = safeNum(parseFloat(sp[1]));
-            }
-        }
-    } else if (fileName.indexOf("_OFFSET_") !== -1) {
-        var parts2 = fileName.split("_OFFSET_");
-        if (parts2.length > 1) {
-            var op = parts2[1].replace(".png", "").split("_");
-            if (op.length >= 2) {
-                info.offsetDx = safeNum(parseFloat(op[0]));
-                info.offsetDy = safeNum(parseFloat(op[1]));
-            }
-        }
-    }
-    return info;
-}
-
 function _isFullyVectorizable(elements) {
     // Recursively checks that all "shape" elements (through nested groups)
     // have a complete vector representation (polygons or strokes). A
-    // single member without a valid fill means exporterPNG.jsfl exported
-    // A SINGLE composite PNG for the whole group (a group with no direct
-    // contours is treated as "invalid fill" by needsPNG) -> the group
-    // must not be decomposed, otherwise that PNG becomes unreachable and
-    // the non-vectorizable content silently disappears.
+    // single member without a valid fill means at least one shape in this
+    // group has no vector data at all (e.g. an unsupported effect) -> the
+    // group must not be decomposed, or that content's positioning/bounds
+    // context is lost when it ends up as its own disconnected element.
     if (!elements) return true;
     for (var i = 0; i < elements.length; i++) {
         var el = elements[i];
@@ -763,11 +719,10 @@ function _flattenGroups(elements) {
         var el = elements[i];
         if (el.elementType === "group" && el.members && el.members.length > 0) {
             if (!_isFullyVectorizable(el.members)) {
-                // At least one member needs a PNG -> keep the group as A
-                // SINGLE opaque "shape" element (no polygons), so the
-                // existing Sprite2D/customTex mechanism can still find it,
-                // instead of decomposing it and losing any link to the PNG
-                // already exported for this group.
+                // At least one member has no vector data -> keep the group
+                // as a SINGLE opaque "shape" element (no polygons) instead
+                // of decomposing it, so that non-vectorizable content isn't
+                // separated from the rest of the group it belongs with.
                 var asOneUnit = _shallowClone(el);
                 asOneUnit.elementType = "shape";
                 asOneUnit.isGroup = false;
@@ -1897,66 +1852,7 @@ function _removeOrphanExtResource(root, anim, id, extResources, extIdMap) {
     return false;
 }
 
-function _inlineMaskAsSprite(node, boundsLookup, exportDir, getExt, scaleFactor, root, anim, extResources, extIdMap) {
-    if (!boundsLookup || !exportDir || !getExt) return false;
-    if (!scaleFactor) scaleFactor = 1.0;
-
-    var nodeName = node.name || "";
-    var symPrefix = nodeName.indexOf("instance_") === 0 ? nodeName.substring(9) : nodeName;
-    if (!symPrefix) return false;
-
-    var matchedFile = null;
-    for (var fn in boundsLookup) {
-        if (fn.indexOf(symPrefix + "_") === 0 && fn.indexOf("_SHAPE_") !== -1 && fn.indexOf("_BOUNDS_") !== -1) {
-            matchedFile = boundsLookup[fn];
-            break;
-        }
-    }
-    if (!matchedFile) {
-        if (typeof fl !== "undefined") fl.trace("  -> [mask inline] no PNG found for " + symPrefix + ", clip_children won't hide the mask");
-        return false;
-    }
-
-    var meta = _parsePngFilename(matchedFile);
-    if (!meta.pngWidth || !meta.pngHeight) {
-        if (typeof fl !== "undefined") fl.trace("  -> [mask inline] PNG " + matchedFile + " missing SIZE info");
-        return false;
-    }
-
-    var instProp = node.properties["instance"] || "";
-    var idMatch = instProp.match(/ExtResource\("([^"]+)"\)/);
-    var orphanCandidateId = idMatch ? idMatch[1] : null;
-
-    node.type = "Sprite2D";
-    delete node.properties["instance"];
-
-    var tex = RES_PREFIX + "img/" + matchedFile;
-    node.properties["texture"] = "ExtResource(\"" + getExt(tex, "Texture2D") + "\")";
-    node.properties["centered"] = true;
-
-    var spriteScale = (meta.spriteScale !== undefined) ? meta.spriteScale : 1.0;
-    var cx, cy;
-    if (meta.useAbsoluteBounds) {
-        cx = meta.boundsX * scaleFactor + (meta.pngWidth / 2.0) * spriteScale;
-        cy = meta.boundsY * scaleFactor + (meta.pngHeight / 2.0) * spriteScale;
-    } else {
-        cx = (meta.pngWidth / 2.0) * spriteScale;
-        cy = (meta.pngHeight / 2.0) * spriteScale;
-    }
-    node.properties["position"] = _vec2(cx, cy);
-    if (spriteScale !== 1.0) {
-        node.properties["scale"] = _vec2(spriteScale, spriteScale);
-    }
-
-    if (orphanCandidateId && root && extResources && extIdMap) {
-        _removeOrphanExtResource(root, anim, orphanCandidateId, extResources, extIdMap);
-    }
-
-    if (typeof fl !== "undefined") fl.trace("  -> [mask inline] " + symPrefix + " PackedScene -> Sprite2D (tex=" + matchedFile + ")");
-    return true;
-}
-
-function _postProcessMasks(root, sym, anim, boundsLookup, exportDir, getExt, scaleFactor, extResources, extIdMap) {
+function _postProcessMasks(root, sym, anim, exportDir, getExt, scaleFactor, extResources, extIdMap) {
     if (!sym.layers) return;
 
     function _findMaskSprite(layerNode) {
@@ -2014,11 +1910,12 @@ function _postProcessMasks(root, sym, anim, boundsLookup, exportDir, getExt, sca
                 var currentMaskWrapper = found.wrapper;
                 
                 if (currentMaskSprite.type === "PackedScene") {
-                    var inlined = _inlineMaskAsSprite(currentMaskSprite, boundsLookup, exportDir, getExt, scaleFactor, root, anim, extResources, extIdMap);
-                    if (!inlined) {
-                        if (typeof fl !== "undefined") fl.trace("  -> [mask] skipping mask processing for " + sym.name + "/" + layer.name + " (inlining failed)");
-                        continue;
-                    }
+                    // clip_children masking needs a directly renderable
+                    // shape (Sprite2D/Polygon2D), not a nested symbol
+                    // instance -- nothing currently rewrites one into the
+                    // other, so this mask layer is left unprocessed.
+                    if (typeof fl !== "undefined") fl.trace("  -> [mask] skipping mask processing for " + sym.name + "/" + layer.name + " (mask is a symbol instance, not a shape)");
+                    continue;
                 }
                 
                 currentMaskSprite.properties["clip_children"] = 1;
@@ -2346,7 +2243,7 @@ function _setupMaterials(node, isRoot) {
 // Central pipeline function: converts ONE Flash element (shape or
 // instance) present at ONE given keyframe into Godot node(s) + animation
 // tracks. Deliberately not decomposed into sub-functions despite its
-// size: almost all of its local state (node/wrapperNode, offsetDx/Dy,
+// size: almost all of its local state (node/wrapperNode, animPosX/Y,
 // _matDec...) flows through the function from start to end, so splitting
 // it would require threading 8-10 parameters everywhere without reducing
 // the actual complexity -- just moving it around, with a real risk of a
@@ -2355,12 +2252,11 @@ function _setupMaterials(node, isRoot) {
 //   1. Wrapper/node: lookup or creation (Polygon2D/Line2D/Sprite2D/PackedScene/Node2D)
 //   2. Line2D -> Node2D demotion if a fill arrives on a later keyframe
 //   3. Shape geometry: polyGroups, triangulation/cleanup, gradients/textures
-//   4. Sprite/bitmap (external PNG texture)
-//   5. Strokes -> Line2D, with the symmetric demotion of point 2
-//   6. Cleanup of excess Poly_X/Line_X slots (inherited from a previous keyframe)
-//   7. visible/process_mode tracks
-//   8. Transform (position/rotation/scale/skew), wrapper init + animated
-//   9. Color transform: shader (Advanced Color Effect) or plain modulate
+//   4. Strokes -> Line2D, with the symmetric demotion of point 2
+//   5. Cleanup of excess Poly_X/Line_X slots (inherited from a previous keyframe)
+//   6. visible/process_mode tracks
+//   7. Transform (position/rotation/scale/skew), wrapper init + animated
+//   8. Color transform: shader (Advanced Color Effect) or plain modulate
 // Demotes a Line2D node (created as a direct wrapper for a single stroke,
 // v4.7) back to Node2D when a later keyframe ends up giving it several
 // strokes OR a fill (this function's two callers). The existing stroke is
@@ -2545,7 +2441,7 @@ function _resolveElementNode(elem, parent, ownerRoot, wrapperName, shaderNeeds, 
 
 function _processElementNode(elem, parent, ownerRoot, anim, startTime, duration, frameRate,
                              wrapperName, exportDir, scaleFactor, symName, startFrameIndex,
-                             maxTime, kfTransition, shaderNeeds, customTexPath, layerType,
+                             maxTime, kfTransition, shaderNeeds, layerType,
                              getExt, subResources, isStaticLayer, modulateNeedsCanvasGroup, gradCache, layerZIndex) {
     // --- 1. Wrapper/node: lookup or creation -----------------------------
     var _resolved = _resolveElementNode(elem, parent, ownerRoot, wrapperName, shaderNeeds, modulateNeedsCanvasGroup, layerZIndex, getExt, isStaticLayer);
@@ -2566,11 +2462,6 @@ function _processElementNode(elem, parent, ownerRoot, anim, startTime, duration,
     if (node.type === "Line2D" && elem.polygons && elem.polygons.length > 0) {
         _demoteLine2DToNode2D(node, variantPathStr, anim);
     }
-
-    var offsetDx = 0.0, offsetDy = 0.0;
-    var useAbsoluteBounds = false;
-    var boundsX = 0.0, boundsY = 0.0;
-    var pngWidth, pngHeight;
 
     // --- 3. Shape geometry: polyGroups, triangulation, gradients/textures ---
     if (elem.elementType === "shape" || elem._inlineSprite) {
@@ -2873,70 +2764,9 @@ function _processElementNode(elem, parent, ownerRoot, anim, startTime, duration,
                 anim._maxPoly[variantPathStr] = Math.max(prevMax, curLen);
             }
             
-        // --- 4. Sprite/bitmap (texture PNG externe) ---------------------
-        } else if (!elem.strokes || elem.strokes.length === 0) {
-            if (!elem._isTweenShape && customTexPath) {
-                var fileName = customTexPath.substring(customTexPath.lastIndexOf("/") + 1);
-                var meta = _parsePngFilename(fileName);
-                useAbsoluteBounds = meta.useAbsoluteBounds;
-                boundsX = meta.boundsX; boundsY = meta.boundsY;
-                pngWidth = meta.pngWidth; pngHeight = meta.pngHeight;
-                offsetDx = meta.offsetDx; offsetDy = meta.offsetDy;
-            }
-
-            var tex = null;
-            if (customTexPath) {
-                tex = RES_PREFIX + "img/" + customTexPath.substring(customTexPath.lastIndexOf("/") + 1);
-            }
-
-            if (isNewNode && tex) {
-                node.properties["texture"] = "ExtResource(\"" + getExt(tex, "Texture2D") + "\")";
-                node.properties["centered"] = true;
-                if (pngWidth !== undefined && pngHeight !== undefined) {
-                    var spriteScale = meta.spriteScale !== undefined ? meta.spriteScale : 1.0;
-                    var cx0 = (pngWidth / 2.0) * spriteScale, cy0 = (pngHeight / 2.0) * spriteScale;
-                    if (elem._inlineSprite) {
-                        if (useAbsoluteBounds) {
-                            cx0 = (boundsX * scaleFactor) + cx0;
-                            cy0 = (boundsY * scaleFactor) + cy0;
-                        } else {
-                            cx0 = (elem._innerLeft * scaleFactor) + cx0;
-                            cy0 = (elem._innerTop  * scaleFactor) + cy0;
-                        }
-                    }
-                    node.properties["position"] = _vec2(cx0, cy0);
-                    if (spriteScale !== 1.0) {
-                        node.properties["scale"] = _vec2(spriteScale, spriteScale);
-                    }
-                }
-            }
-
-            if (tex) {
-                anim.addTrackKey(variantPathStr + ":texture", "value", startTime,
-                    {ext: getExt(tex, "Texture2D")}, kfTransition);
-                if (pngWidth !== undefined && pngHeight !== undefined) {
-                    var spriteScale = meta.spriteScale !== undefined ? meta.spriteScale : 1.0;
-                    var cx = (pngWidth / 2.0) * spriteScale, cy = (pngHeight / 2.0) * spriteScale;
-                    if (elem._inlineSprite) {
-                        if (useAbsoluteBounds) {
-                            cx = (boundsX * scaleFactor) + cx;
-                            cy = (boundsY * scaleFactor) + cy;
-                        } else {
-                            cx = (elem._innerLeft * scaleFactor) + cx;
-                            cy = (elem._innerTop  * scaleFactor) + cy;
-                        }
-                    }
-                    anim.addTrackKey(variantPathStr + ":position", "value", startTime,
-                        {x: cx, y: cy}, 0.0);
-                    if (spriteScale !== 1.0) {
-                        anim.addTrackKey(variantPathStr + ":scale", "value", startTime,
-                            {x: spriteScale, y: spriteScale}, 0.0);
-                    }
-                }
-            }
         }
 
-        // --- 5. Strokes -> Line2D -----------------------------------------
+        // --- 4. Strokes -> Line2D -----------------------------------------
         var hasStrokes = elem.strokes && elem.strokes.length > 0;
         if (hasStrokes && (elem.elementType === "shape" || elem._inlineSprite)) {
             // Symmetric demotion of the Polygon2D/Poly_N case above: this
@@ -3002,7 +2832,7 @@ function _processElementNode(elem, parent, ownerRoot, anim, startTime, duration,
             
         }
 
-        // --- 6. Cleanup of excess Poly_X/Line_X slots ---------------------
+        // --- 5. Cleanup of excess Poly_X/Line_X slots ---------------------
         // UNCONDITIONAL reset of Poly_X / Line_X slots not used by this
         // keyframe. Before the fix, these two loops were nested inside
         // `if (elem.polygons.length > 0)` and `if (hasStrokes)`
@@ -3036,7 +2866,7 @@ function _processElementNode(elem, parent, ownerRoot, anim, startTime, duration,
         ]);
     }
 
-    // --- 7. visible/process_mode tracks -----------------------------------
+    // --- 6. visible/process_mode tracks -----------------------------------
     var vis = elem.visible !== undefined ? elem.visible : true;
     var pathVis = variantPathStr + ":visible";
     var pathProc = variantPathStr + ":process_mode";
@@ -3054,7 +2884,7 @@ function _processElementNode(elem, parent, ownerRoot, anim, startTime, duration,
         anim.addTrackKey(pathProc, "value", startTime + duration, 4, 0.0);
     }
 
-    // --- 8. Transform (position/rotation/scale/skew) ----------------------
+    // --- 7. Transform (position/rotation/scale/skew) ----------------------
     // Matrix decomposition computed once (instead of twice with the same
     // arguments): it feeds both the wrapper's initial values (the
     // isNewWrapper block right below) and the animation key at startTime
@@ -3074,14 +2904,8 @@ function _processElementNode(elem, parent, ownerRoot, anim, startTime, duration,
     }
 
     if (elem.elementType === "shape" && !elem._isTweenShape && (!elem.polygons || elem.polygons.length === 0) && (!elem.strokes || elem.strokes.length === 0)) {
-        var animPosX, animPosY;
-        if (useAbsoluteBounds) {
-            animPosX = boundsX;
-            animPosY = boundsY;
-        } else {
-            animPosX = (elem.left || 0) + offsetDx;
-            animPosY = (elem.top  || 0) + offsetDy;
-        }
+        var animPosX = elem.left || 0;
+        var animPosY = elem.top  || 0;
 
         var rot = 0.0;
         var scX = 1.0;
@@ -3147,7 +2971,7 @@ function _processElementNode(elem, parent, ownerRoot, anim, startTime, duration,
         }
     }
 
-    // --- 9. Color transform: shader (Advanced Color Effect) or plain modulate ---
+    // --- 8. Color transform: shader (Advanced Color Effect) or plain modulate ---
     var ctn = _extractColorTransform(elem.colorTransform);
 
     var r_pct = ctn.rP, g_pct = ctn.gP, b_pct = ctn.bP, a_pct = ctn.aP;
@@ -3164,16 +2988,11 @@ function _processElementNode(elem, parent, ownerRoot, anim, startTime, duration,
 
     if (has_shader) {
         if (!wrapperNode.properties["material"]) {
-            var shader_path;
-            if (customTexPath && !elem.cacheAsBitmap) {
-                shader_path = customTexPath.replace(".tscn", ".gdshader");
-            } else {
-                shader_path = RES_PREFIX + "shaders/flash_color_normal.gdshader";
-                if (elem.blendMode === "add")
-                    shader_path = RES_PREFIX + "shaders/flash_color_add.gdshader";
-                else if (elem.blendMode === "multiply")
-                    shader_path = RES_PREFIX + "shaders/flash_color_mul.gdshader";
-            }
+            var shader_path = RES_PREFIX + "shaders/flash_color_normal.gdshader";
+            if (elem.blendMode === "add")
+                shader_path = RES_PREFIX + "shaders/flash_color_add.gdshader";
+            else if (elem.blendMode === "multiply")
+                shader_path = RES_PREFIX + "shaders/flash_color_mul.gdshader";
 
             var matId = "mat_" + nextId();
             subResources.push('[sub_resource type="ShaderMaterial" id="' + matId + '"]'
@@ -3248,7 +3067,7 @@ function _reorderShapePolysAndLines(node, isTopLevel) {
 // can be reused to build a subtree that gets embedded into a larger,
 // hand-assembled scene (see buildVariantScenes) instead of always being
 // serialized as its own standalone .tscn file.
-function _buildSceneTree(sym, frameRate, exportDir, boundsLookup, boundsIndex, symbolMap, symbolContainsShader, skipEnablerFor) {
+function _buildSceneTree(sym, frameRate, exportDir, symbolMap, symbolContainsShader, skipEnablerFor) {
     if (!sym.safeName) sym.safeName = sanitizeForLookup(sym.name);
     var extResources = [];
     var extIdMap = {};
@@ -3576,8 +3395,6 @@ function _buildSceneTree(sym, frameRate, exportDir, boundsLookup, boundsIndex, s
             }
 
             if (!layer.keyframes) continue;
-            var lastShapeTextures = [];
-            var lastShapeElems = [];
             var lastElemPositions = {};
             for (var k = 0; k < layer.keyframes.length; k++) {
                 var kf = layer.keyframes[k];
@@ -3587,7 +3404,6 @@ function _buildSceneTree(sym, frameRate, exportDir, boundsLookup, boundsIndex, s
 
                 if (!kf.elements) continue;
                 var occurrenceMap = {};
-                var shapeCount2 = 0;
                 var _explodedMain = _explodeTweenElements(kf.elements, symbolMap);
                 var _stableMain = _stabilizeOccurrenceIndices(_explodedMain, lastElemPositions);
                 var takenOccIndices = {};
@@ -3656,61 +3472,16 @@ function _buildSceneTree(sym, frameRate, exportDir, boundsLookup, boundsIndex, s
                     var poolKey = occKey + "_layer_" + layerName;
                     var uniqueNodeName = allocateOrExtendWrapper(targetParent.name, poolKey, fullOccKey, startTime, startTime + duration, isInstance);
 
-                    var customTex = "";
-                    if (elem.elementType === "shape" || elem._inlineSprite) {
-                        var imgPath = "";
-
-                        if (elem._isGuideLayer) {
-                            imgPath = "";
-                        } else if (elem._isTweenShape) {
-                            imgPath = lastShapeTextures[shapeCount2] || "";
-                        } else {
-                            var sName  = elem._sourceSymbol !== undefined ? sanitizeForLookup(elem._sourceSymbol) : sanitizeForLookup(sym.name);
-                            var sLayer = elem._sourceLayer  !== undefined ? sanitizeForLookup(elem._sourceLayer)  : lookupLayerName;
-                            var sFrame = elem._sourceFrame  !== undefined ? elem._sourceFrame : kf.startFrame;
-                            var sShapeIdx = elem.sourceShapeIndex !== undefined ? elem.sourceShapeIndex : shapeCount2;
-
-                            var baseNoSpace  = sName + "_" + sLayer + "_" + sFrame;
-                            var shapePrefix  = baseNoSpace + "_SHAPE_" + sShapeIdx + "_BOUNDS_";
-                            var oldPrefix    = baseNoSpace + "_BOUNDS_";
-                            var offsetPrefix = baseNoSpace + "_OFFSET_";
-
-                            var candidates = boundsIndex["$" + baseNoSpace] || [];
-                            for (var ci = 0; ci < candidates.length; ci++) {
-                                var fn = candidates[ci];
-                                if (fn.indexOf(shapePrefix) === 0) {
-                                    imgPath = exportDir + "img/" + boundsLookup[fn];
-                                    break;
-                                }
-                            }
-                            if (imgPath === "") {
-                                for (var ci = 0; ci < candidates.length; ci++) {
-                                    var fn = candidates[ci];
-                                    if (fn.indexOf(oldPrefix) === 0 || fn.indexOf(offsetPrefix) === 0 || fn === baseNoSpace) {
-                                        imgPath = exportDir + "img/" + boundsLookup[fn];
-                                        break;
-                                    }
-                                }
-                            }
-
-                            lastShapeTextures[shapeCount2] = imgPath;
-                            lastShapeElems[shapeCount2] = elem;
-                        }
-
-                        customTex = imgPath;
-                        shapeCount2++;
-                    }
-
                     _processElementNode(elem, targetParent, root, anim, startTime, duration, frameRate,
                         uniqueNodeName, exportDir, scaleFactor, sym.name, kf.startFrame, maxTime,
-                        kfTransition, shaderNeeds, customTex, layer.layerType, getExt, subResources, (layer.keyframes.length === 1), modulateNeedsCanvasGroup, gradCache, layerZIndex);
+                        kfTransition, shaderNeeds, layer.layerType, getExt, subResources, (layer.keyframes.length === 1), modulateNeedsCanvasGroup, gradCache, layerZIndex);
                 }
                 lastElemPositions = _recordElemPositions(_explodedMain, _stableMain);
             }
         }
     }
 
-    _postProcessMasks(root, sym, anim, boundsLookup, exportDir, getExt, scaleFactor, extResources, extIdMap);
+    _postProcessMasks(root, sym, anim, exportDir, getExt, scaleFactor, extResources, extIdMap);
 
     if (actionScripts.length > 0) {
         for (var asi = 0; asi < actionScripts.length; asi++) {
@@ -3846,8 +3617,8 @@ function _buildSceneTree(sym, frameRate, exportDir, boundsLookup, boundsIndex, s
 // Thin wrapper around _buildSceneTree: builds the tree then serializes it
 // to its own standalone .tscn (+ .gd if it has ActionScript) under
 // exportDir, exactly as before this function was split.
-function buildSceneForSymbol(sym, frameRate, exportDir, boundsLookup, boundsIndex, symbolMap, symbolContainsShader, skipEnablerFor) {
-    var built = _buildSceneTree(sym, frameRate, exportDir, boundsLookup, boundsIndex, symbolMap, symbolContainsShader, skipEnablerFor);
+function buildSceneForSymbol(sym, frameRate, exportDir, symbolMap, symbolContainsShader, skipEnablerFor) {
+    var built = _buildSceneTree(sym, frameRate, exportDir, symbolMap, symbolContainsShader, skipEnablerFor);
     var root = built.root;
     var extResources = built.extResources;
     var subResources = built.subResources;
@@ -4154,51 +3925,11 @@ function _computeGodotProjectRoot(exportDir) {
     return godotProjectRoot;
 }
 
-// Indexes exportDir/img/*.png (external bitmaps pre-rendered by a previous
-// step) by their base filename, plus a "$"-prefixed prefix index (grouping
-// keys sharing everything before _SHAPE_/_BOUNDS_/_OFFSET_) for the O(1)
-// lookups _processElementNode does when resolving a shape's custom texture.
-function _computeBoundsIndex(exportDir) {
-    var boundsLookup = {};
-    var allFiles = FLfile.listFolder(exportDir + "img/", "files") || [];
-    var pngList = [];
-    for (var i = 0; i < allFiles.length; i++) {
-        var fnLower = allFiles[i].toLowerCase();
-        if (fnLower.indexOf(".png") !== -1 && fnLower.indexOf(".import") === -1) {
-            pngList.push(allFiles[i]);
-        }
-    }
-    for (var i = 0; i < pngList.length; i++) {
-        var fn = pngList[i];
-        var noExt = fn.replace(/.png$/i, "");
-        boundsLookup[noExt] = fn;
-    }
-    var boundsIndex = {};
-    for (var fn in boundsLookup) {
-        var sp = fn.indexOf("_SHAPE_");
-        var bp = fn.indexOf("_BOUNDS_");
-        var op = fn.indexOf("_OFFSET_");
-        var base = (sp !== -1) ? fn.substring(0, sp) :
-                   (bp !== -1) ? fn.substring(0, bp) :
-                   (op !== -1) ? fn.substring(0, op) : fn;
-        var bKey = "$" + base;
-        if (!boundsIndex[bKey]) boundsIndex[bKey] = [];
-        boundsIndex[bKey].push(fn);
-    }
-    if (typeof fl !== "undefined") fl.trace("DEBUG godotBuilder_v4: pngList length = " + pngList.length
-        + ", boundsLookup count = " + pngList.length + " from path: " + exportDir + "img/*.png");
-    return { boundsLookup: boundsLookup, boundsIndex: boundsIndex };
-}
-
 // =============================================================================
 //  Top-level export entry point
 // =============================================================================
 function buildGodotScenes(doc, data, exportDir) {
     var godotProjectRoot = _computeGodotProjectRoot(exportDir);
-
-    var _bounds = _computeBoundsIndex(exportDir);
-    var boundsLookup = _bounds.boundsLookup;
-    var boundsIndex = _bounds.boundsIndex;
 
     FLfile.createFolder(exportDir + "symbols/");
     FLfile.createFolder(exportDir + "shaders/");
@@ -4253,7 +3984,7 @@ function buildGodotScenes(doc, data, exportDir) {
     for (var i = 0; i < data.library.symbols.length; i++) {
         var s = data.library.symbols[i];
         if (_isAutoTweenName(s.name)) continue;
-        buildSceneForSymbol(s, data.document.frameRate || 25, exportDir, boundsLookup, boundsIndex, symbolMap, symbolContainsShader, skipEnablerFor);
+        buildSceneForSymbol(s, data.document.frameRate || 25, exportDir, symbolMap, symbolContainsShader, skipEnablerFor);
     }
 
     var scene = data.scenes[0];
@@ -4266,7 +3997,7 @@ function buildGodotScenes(doc, data, exportDir) {
         docWidth: data.document.width || 1920,
         docHeight: data.document.height || 1080
     };
-    buildSceneForSymbol(pseudoMain, data.document.frameRate || 25, exportDir, boundsLookup, boundsIndex, symbolMap, symbolContainsShader);
+    buildSceneForSymbol(pseudoMain, data.document.frameRate || 25, exportDir, symbolMap, symbolContainsShader);
 
     // Create FlashMovieClip.gd base class at the root of the Godot project
     var fmcContent = "extends Node2D\n" +
@@ -4932,9 +4663,6 @@ function buildVariantScenes(data, exportDir) {
     var uri = exportDir;
     if (uri.charAt(uri.length - 1) !== "/") uri += "/";
     _computeGodotProjectRoot(uri);
-    var _bounds = _computeBoundsIndex(uri);
-    var boundsLookup = _bounds.boundsLookup;
-    var boundsIndex = _bounds.boundsIndex;
 
     var frameRate = (data.document && data.document.frameRate) || 25;
     var symbolMap = _buildSymbolMap(data.library.symbols);
@@ -4970,7 +4698,7 @@ function buildVariantScenes(data, exportDir) {
     var deps = _collectSymbolDependencies(partNames, symbolMap);
     for (var d = 0; d < deps.length; d++) {
         var depSym = symbolMap[deps[d]];
-        if (depSym) buildSceneForSymbol(depSym, frameRate, uri, boundsLookup, boundsIndex, symbolMap, symbolContainsShader, {});
+        if (depSym) buildSceneForSymbol(depSym, frameRate, uri, symbolMap, symbolContainsShader, {});
     }
     if (typeof fl !== "undefined" && deps.length > 0) fl.trace("buildVariantScenes: built " + deps.length
         + " nested dependency symbol(s) referenced by variant parts");
@@ -5008,7 +4736,7 @@ function buildVariantScenes(data, exportDir) {
             // frame of every group (thousands of instances).
             var skipEnablerForSelf = {};
             skipEnablerForSelf[synthSym.name] = true;
-            var built = _buildSceneTree(synthSym, frameRate, uri, boundsLookup, boundsIndex, symbolMap, symbolContainsShader, skipEnablerForSelf);
+            var built = _buildSceneTree(synthSym, frameRate, uri, symbolMap, symbolContainsShader, skipEnablerForSelf);
             var tscnText = serializeTscn(built.root, built.extResources, built.subResources);
             FLfile.write(groupDir + (n + 1) + ".tscn", tscnText);
         }
