@@ -2730,7 +2730,14 @@ function _resolveElementNode(elem, parent, ownerRoot, wrapperName, shaderNeeds, 
                     // see that script for why this happens at runtime rather than here at
                     // export time. The ":polygon"/":uv"/":polygons"/":texture"/":color"/
                     // ":visible" tracks below are emitted exactly as for any other
-                    // animated shape; nothing else about this node changes.
+                    // animated shape; nothing else about this node changes. If a later
+                    // keyframe of this same pooled node gives it separate Poly_N/Line_N
+                    // children (another fill color, or a stroke), that script's own
+                    // _finish_swap re-parents them onto the new mesh node instead of
+                    // losing them -- confirmed necessary on a real animated 2-fill/
+                    // 6-stroke eye shape, where they used to get silently queue_free()d
+                    // along with the original Polygon2D (runtime-only, invisible in the
+                    // editor, since the script never runs there).
                     // elem._isOrientationVariant excludes the OTHER thing
                     // that also produces a 4-keyframe layer here: a
                     // variant scene's synthesized orientation "keyframes"
@@ -4658,10 +4665,29 @@ function buildGodotScenes(doc, data, exportDir) {
     "\n" +
     "\n" +
     "func _finish_swap(mesh_node: Node, parent: Node, index: int, scene_owner: Node) -> void:\n" +
+    "\t# A shape with more than one fill color, or any stroke, gets those\n" +
+    "\t# as Poly_N/Line_N CHILDREN of self (a real, separate fill region or\n" +
+    "\t# outline). Only self's OWN \":polygon\" track feeds the mesh built\n" +
+    "\t# above -- these children are untouched by any of it, so move them\n" +
+    "\t# over to mesh_node before freeing self, instead of queue_free() silently\n" +
+    "\t# taking them down with it. They keep rendering exactly as before\n" +
+    "\t# (plain Polygon2D/Line2D, Godot's own triangulation for any Poly_N)\n" +
+    "\t# -- only self's own fill is what benefits from the mesh swap.\n" +
+    "\t# mesh_node must already be IN the tree (parented, with its own\n" +
+    "\t# owner set) before any child's owner can be set to scene_owner --\n" +
+    "\t# Godot rejects \"child.owner = scene_owner\" otherwise (\"Invalid\n" +
+    "\t# owner. Owner must be an ancestor in the tree\"), since scene_owner\n" +
+    "\t# isn't actually an ancestor of child yet at that point. So: swap\n" +
+    "\t# self for mesh_node FIRST, re-parent the captured children AFTER.\n" +
+    "\tvar kids := get_children()\n" +
     "\tparent.remove_child(self)\n" +
     "\tparent.add_child(mesh_node)\n" +
     "\tparent.move_child(mesh_node, index)\n" +
     "\tmesh_node.owner = scene_owner\n" +
+    "\tfor child in kids:\n" +
+    "\t\tremove_child(child)\n" +
+    "\t\tmesh_node.add_child(child)\n" +
+    "\t\tchild.owner = scene_owner\n" +
     "\tqueue_free()\n" +
     "\n" +
     "\n" +
