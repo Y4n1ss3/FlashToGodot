@@ -26,6 +26,56 @@
 
 var RES_PREFIX = "res://";
 
+// Re-enabled: TweenShapeMeshConverter.gd's runtime Polygon2D -> MeshInstance2D
+// swap (see _resolveElementNode, the one place this is checked) was briefly
+// turned off over a suspected conflict with AntialiasedPolygon2D (see
+// _attachAntialiasedScripts) -- reasoning that no longer holds. That
+// worry was written for an EARLIER antialiasing approach (type=
+// "AntialiasedPolygon2D" directly), since reverted; under the current
+// approach (a plain Polygon2D + an explicit `script=` property, see
+// _attachAntialiasedScripts) that function already guards
+// `!node.properties["script"]` before attaching -- a node this converter
+// already scripted is simply skipped, not clobbered. Confirmed via
+// re-reading both functions together: _resolveElementNode runs (and sets
+// this script) while the tree is being built; _attachAntialiasedScripts
+// only runs once at the very end of _buildSceneTree, so by then the
+// guard always sees whatever this flag already assigned. Left off would
+// have meant every multi-keyframe shape tween (e.g. "forme_vague"'s
+// looping wave animation, always autoplaying) stays a plain Polygon2D,
+// re-triangulated by Godot on every keyframe change, every time the
+// animation plays -- a real, continuous per-frame cost, not the one-off
+// spike this perf work originally focused on.
+var ENABLE_TWEEN_SHAPE_MESH_CONVERTER = true;
+
+// A shape tween only gets converted if its OWNING SYMBOL's whole timeline
+// (maxTime, computed once per symbol in _buildSceneTree -- the same value
+// that becomes the exported Animation's own `length`) exceeds this, in
+// seconds -- see _resolveElementNode, the one place this is checked. A
+// short, one-shot tween (a button press flourish, a blink) re-triangulates
+// only a handful of times total and is never worth the extra
+// TweenShapeMeshConverter node + runtime triangulation pass; a long or
+// (like "forme_vague"'s wave) always-looping one pays that
+// re-triangulation cost every keyframe change, forever, for as long as
+// the scene is loaded -- exactly the case this optimization exists for.
+var MIN_TWEEN_MESH_DURATION_SEC = 3.0;
+
+// Toggles the antialiased_line2d addon integration (see
+// _attachAntialiasedScripts) -- gives crisp Polygon2D/Line2D edges under
+// the GL Compatibility renderer this project targets, where Godot's own
+// 2D MSAA isn't available at all ("not yet supported for GLES3"). An
+// earlier attempt emitted type="AntialiasedPolygon2D"/"AntialiasedLine2D"
+// directly, which failed project-wide ("Cannot get class ...") -- see
+// _attachAntialiasedScripts' own doc for the real fix (attach a script
+// onto the native type instead, exactly like the editor's own "Change
+// Type" actually serializes it). A shape (yeux_.tscn's Poly_1) that
+// briefly appeared to go invisible only under this flag was root-caused
+// to something else entirely -- a CURVE_QUALITY-sensitive vertex-matching
+// bug in inspector.jsfl's _removeOppositeWindingDuplicates, unrelated to
+// this addon and already fixed there -- confirmed via a Node.js repro
+// against the real extracted geometry (zero divergence across every
+// keyframe once fixed).
+var ENABLE_ANTIALIASED_SHAPES = true;
+
 function _sanitize_name(name) {
     return safeStr(name).replace(/[^a-zA-Z0-9_]/g, "_");
 }
@@ -145,7 +195,8 @@ function _bridgeHoles(outerVerts, holesArr) {
     // (independent of any hole -- e.g. a dense/complex Flash shape).
     // _cleanupPolygonVertices's own repair pass never reaches this data
     // (it only sees whatever _bridgeHoles returns, and skips its own
-    // repair above 500 vertices anyway): every candidate bridge built on
+    // repair above its own vertex cap anyway, see that function's own
+    // doc): every candidate bridge built on
     // top of an already-self-intersecting outer necessarily also self-
     // intersects, so every hole silently ends up uncut. Repair the outer
     // FIRST, before it's ever used as a bridge base.
@@ -326,6 +377,374 @@ function _pointInPolygon(pt, poly) {
         if (intersect) inside = !inside;
     }
     return inside;
+}
+
+// ---------------------------------------------------------------------
+// Self-TOUCH repair (distinct from self-INTERSECTION repair).
+//
+// A contour can come back and touch itself EXACTLY (a vertex sitting on a
+// non-adjacent edge, or on top of a non-adjacent vertex) without ever
+// crossing: a "pinch". Flash's own edge tracing produces these whenever a
+// shape has a zero-width neck -- typically a notch/crack whose two sides
+// meet at a point, or two lobes joined at a single point. Such a contour
+// is NOT a self-intersection (_hasSelfIntersection's strict transverse
+// crossing test doesn't flag it, correctly), it conserves area, every
+// hole-splitting safety net accepts it -- and Godot's Polygon2D
+// triangulation fails on it anyway ("Invalid polygon data, triangulation
+// failed", renderer_canvas_cull.cpp), drawing NOTHING for the whole node.
+// Confirmed on a real 1084-vertex rock outline: an offline ear-clipping
+// port got stuck with 8 unclippable vertices at exactly one such pinch
+// (a vertex at distance 0.0000 from an edge 14 indices away); no local
+// nudge of that vertex could escape (every offset, up to 10 units, crossed
+// the tightly packed neighboring boundary), because a pinch is
+// TOPOLOGICAL, not a numerical near-miss.
+//
+// The topologically correct repair is to SPLIT the loop at the pinch into
+// two closed loops sharing that point (the same idea as inspector.jsfl's
+// _extractSubLoops, which only handles an EXACT vertex revisit -- this
+// also handles a vertex landing mid-edge, by inserting a twin point
+// there). The shoelace identity signed(A) + signed(B) == signed(original)
+// holds exactly for that split, and the SIGN of each half says what it
+// is: a half winding the SAME way as the original is a filled lobe; a
+// half winding the OPPOSITE way is an empty notch, i.e. a hole that
+// happens to touch the outer boundary -- which is then handed to the
+// regular hole machinery (_splitHoles / _bridgeHoles), whose cuts are
+// real, non-zero-width ones the triangulator handles fine. Confirmed on
+// that same rock: outer 1070 vertices + a 15-vertex opposite-winding
+// notch, both halves individually simple and ear-clippable, areas summing
+// exactly to the original.
+//
+// Only genuinely DISTANT parts of the loop count: consecutive points on a
+// densely subdivided curve are naturally within a fraction of a unit of
+// their neighbors' edges, so pairs closer than `minSep` indices apart are
+// ignored (a real pinch joins parts of the loop far apart in index).
+// ---------------------------------------------------------------------
+function _pointSegmentDistT(p, a, b) {
+    var dx = b.x - a.x, dy = b.y - a.y;
+    var len2 = dx * dx + dy * dy;
+    if (len2 < 1e-12) {
+        var ex = p.x - a.x, ey = p.y - a.y;
+        return { d: Math.sqrt(ex * ex + ey * ey), t: 0 };
+    }
+    var t = ((p.x - a.x) * dx + (p.y - a.y) * dy) / len2;
+    if (t < 0) t = 0; else if (t > 1) t = 1;
+    var px = a.x + t * dx, py = a.y + t * dy;
+    var ddx = p.x - px, ddy = p.y - py;
+    return { d: Math.sqrt(ddx * ddx + ddy * ddy), t: t };
+}
+
+// Finds one pinch: vertex `i` lying within `threshold` of the non-adjacent
+// edge (j, j+1). Returns { i, j, t } (t = where along that edge) or null.
+function _findSelfTouch(verts, threshold) {
+    var n = verts.length;
+    if (n < 6 || n > 3000) return null; // O(n^2): same cap as the other repairs
+    // 3, not more: with an exact-touch threshold the only false positives
+    // are immediate neighbors on a dense curve (1-2 apart, ~0.2-0.4 units
+    // off their neighbors' edges, well above the threshold anyway), while a
+    // real pinch left by a hole cut can sit just 3-4 indices apart
+    // (confirmed on a real shape, see _splitPieceByHole's nudge pass).
+    var minSep = 3;
+    for (var i = 0; i < n; i++) {
+        var p = verts[i];
+        for (var j = 0; j < n; j++) {
+            var sep = i - j; if (sep < 0) sep = -sep;
+            if (n - sep < sep) sep = n - sep;
+            if (sep < minSep) continue;
+            var a = verts[j], b = verts[(j + 1) % n];
+            // Cheap bbox reject before the real distance.
+            var minX = a.x < b.x ? a.x : b.x, maxX = a.x < b.x ? b.x : a.x;
+            var minY = a.y < b.y ? a.y : b.y, maxY = a.y < b.y ? b.y : a.y;
+            if (p.x < minX - threshold || p.x > maxX + threshold || p.y < minY - threshold || p.y > maxY + threshold) continue;
+            var r = _pointSegmentDistT(p, a, b);
+            if (r.d < threshold) return { i: i, j: j, t: r.t };
+        }
+    }
+    return null;
+}
+
+// Drops the loop's last point while it coincides (within `threshold`) with
+// its first -- the two halves of a split both start AND end on the shared
+// pinch point, and a closed polygon must not repeat it (a zero-length
+// closing edge is itself an ear-clipping killer).
+function _dropClosingDuplicate(loop, threshold) {
+    var t2 = threshold * threshold;
+    // Consecutive duplicates first -- a zero-length hole cut leaves the
+    // same point twice in a row in the piece it was cut from, and that
+    // pair then lands in whichever half of a pinch split it falls into.
+    var out = [];
+    for (var i = 0; i < loop.length; i++) {
+        var p = loop[i];
+        if (out.length > 0) {
+            var q = out[out.length - 1];
+            var ddx = p.x - q.x, ddy = p.y - q.y;
+            if (ddx * ddx + ddy * ddy < t2) continue;
+        }
+        out.push(p);
+    }
+    while (out.length > 1) {
+        var f = out[0], l = out[out.length - 1];
+        var dx = f.x - l.x, dy = f.y - l.y;
+        if (dx * dx + dy * dy < t2) out.pop(); else break;
+    }
+    return out;
+}
+
+// Splits `verts` at the pinch found by _findSelfTouch into two closed
+// loops sharing the pinch point. Returns [loopA, loopB] or null.
+function _splitLoopAtTouch(verts, touch, threshold) {
+    var n = verts.length;
+    var i = touch.i, j = touch.j, t = touch.t;
+    var seq = verts.slice();
+    var newIdx, iIdx = i;
+    // Snap to an existing endpoint only when the touch really is AT that
+    // vertex (foot within `threshold` of it) -- a parametric cutoff (t>0.98)
+    // snapped a real mid-edge touch to a vertex half a unit away on a
+    // 40-unit edge, which welded a 0.5-unit spike onto the notch and left
+    // it self-touching (confirmed on a real triangular notch).
+    var ej = verts[j], ej1 = verts[(j + 1) % n];
+    var fx = ej.x + (ej1.x - ej.x) * t, fy = ej.y + (ej1.y - ej.y) * t;
+    var dj = Math.sqrt((fx - ej.x) * (fx - ej.x) + (fy - ej.y) * (fy - ej.y));
+    var dj1 = Math.sqrt((fx - ej1.x) * (fx - ej1.x) + (fy - ej1.y) * (fy - ej1.y));
+    if (dj < threshold) {
+        newIdx = j;                       // touches vertex j itself
+    } else if (dj1 < threshold) {
+        newIdx = (j + 1) % n;             // touches vertex j+1 itself
+    } else {
+        // Mid-edge: insert a twin of vertex i on edge (j, j+1) so both
+        // halves have a real vertex to close on.
+        seq.splice(j + 1, 0, { x: verts[i].x, y: verts[i].y });
+        newIdx = j + 1;
+        if (j + 1 <= i) iIdx = i + 1;     // i shifted by the insertion
+    }
+    if (iIdx === newIdx) return null;
+    var lo = iIdx < newIdx ? iIdx : newIdx;
+    var hi = iIdx < newIdx ? newIdx : iIdx;
+    var a = _dropClosingDuplicate(seq.slice(lo, hi + 1), threshold);
+    var b = _dropClosingDuplicate(seq.slice(hi).concat(seq.slice(0, lo + 1)), threshold);
+    return [a, b];
+}
+
+// A notch cut off at a pinch typically shares MORE than the pinch point
+// with the lobe it came from: its side can run exactly along the lobe's
+// own edge for a stretch (a hole drawn flush against a straight outer
+// edge -- the real Rock1 case). Re-venting it as a hole would then just
+// recreate a touch at every one of those flush vertices (vertex-on-edge,
+// which _nudgeCoincidentVertices never sees). Push every notch vertex
+// that sits within `eps` of a lobe edge by `delta` INTO the lobe, so the
+// notch becomes a proper hole with a real wall around it. Direction: the
+// lobe edge's normal, whichever sign lands the point inside the lobe
+// (checked with _pointInPolygon, so no winding-convention assumption).
+// `delta` = 0.5 Flash units, the same "visually negligible against shapes
+// drawn at Flash's native scale" offset _bridgeHoles uses for its bridge
+// return points. Falls back to the notch unchanged if pushing made it
+// self-intersect.
+function _pushNotchInward(notch, lobe, eps, delta) {
+    var k = notch.length, m = lobe.length;
+    // Per notch vertex: the unit direction to push it along (null = stay).
+    var push = [];
+    for (var i = 0; i < k; i++) push.push(null);
+    function _edgeNormal(a, b) {
+        var dx = b.x - a.x, dy = b.y - a.y;
+        var len = Math.sqrt(dx * dx + dy * dy);
+        if (len < 1e-9) return null;
+        return { x: -dy / len, y: dx / len };
+    }
+    function _nearEdge(p, a, b) {
+        var minX = a.x < b.x ? a.x : b.x, maxX = a.x < b.x ? b.x : a.x;
+        var minY = a.y < b.y ? a.y : b.y, maxY = a.y < b.y ? b.y : a.y;
+        if (p.x < minX - eps || p.x > maxX + eps || p.y < minY - eps || p.y > maxY + eps) return false;
+        return _pointSegmentDistT(p, a, b).d < eps;
+    }
+    // Rule 1: a notch VERTEX sitting on a lobe edge -> push it along that
+    // lobe edge's normal.
+    for (var i = 0; i < k; i++) {
+        for (var j = 0; j < m; j++) {
+            var a = lobe[j], b = lobe[(j + 1) % m];
+            if (!_nearEdge(notch[i], a, b)) continue;
+            var n1 = _edgeNormal(a, b);
+            if (n1) push[i] = n1;
+            break;
+        }
+    }
+    // Rule 2 (the mirror case): a LOBE vertex sitting on a notch EDGE ->
+    // push BOTH ends of that notch edge along the edge's own normal, so the
+    // whole edge moves off that vertex. Confirmed necessary on a real shape:
+    // a triangular notch whose vertical side lay flush along the outline,
+    // an outline vertex exactly on it (distance 0), rule 1 alone moved
+    // nothing (no notch vertex was near a lobe edge there) and Godot was
+    // left 3 unclippable vertices.
+    for (var e = 0; e < k; e++) {
+        var ea = notch[e], eb = notch[(e + 1) % k];
+        var n2 = _edgeNormal(ea, eb);
+        if (!n2) continue;
+        for (var v = 0; v < m; v++) {
+            if (!_nearEdge(lobe[v], ea, eb)) continue;
+            if (!push[e]) push[e] = n2;
+            if (!push[(e + 1) % k]) push[(e + 1) % k] = n2;
+            break;
+        }
+    }
+    var cx = 0, cy = 0;
+    for (var ci = 0; ci < k; ci++) { cx += notch[ci].x; cy += notch[ci].y; }
+    cx /= k; cy /= k;
+    var out = [];
+    var moved = 0;
+    for (var i2 = 0; i2 < k; i2++) {
+        var p = notch[i2];
+        var np = { x: p.x, y: p.y };
+        var dir = push[i2];
+        if (dir) {
+            // First choice: shrink the notch -- step toward its own centroid.
+            // A point just inside the notch is by construction inside the
+            // lobe's outline too (the lobe no longer detours around the
+            // notch, so it encloses that area), and this works at a notch
+            // APEX where stepping sideways along the shared line's normal
+            // exits the shape on both sides (confirmed on a real triangular
+            // notch: its apex sat on the outline, the fill there was thinner
+            // than the step, both normal candidates failed and nothing
+            // moved). Verified against the notch itself; concave notches
+            // where the centroid step lands outside fall back to the
+            // normal-based step, verified against the lobe.
+            var tx = cx - p.x, ty = cy - p.y;
+            var tl = Math.sqrt(tx * tx + ty * ty);
+            var placed = false;
+            if (tl > 1e-9) {
+                var cc = { x: p.x + tx / tl * delta, y: p.y + ty / tl * delta };
+                if (_pointInPolygon(cc, notch)) { np = cc; moved++; placed = true; }
+            }
+            if (!placed) {
+                // Whichever side of the shared line lands inside the lobe's
+                // outline (the notch's own interior does; the outside doesn't).
+                var c1 = { x: p.x + dir.x * delta, y: p.y + dir.y * delta };
+                var c2 = { x: p.x - dir.x * delta, y: p.y - dir.y * delta };
+                if (_pointInPolygon(c1, lobe)) { np = c1; moved++; }
+                else if (_pointInPolygon(c2, lobe)) { np = c2; moved++; }
+            }
+        }
+        out.push(np);
+    }
+    if (moved === 0) return notch;
+    if (_hasSelfIntersection(out)) return notch;
+    return out;
+}
+
+// Mean width of a closed loop (2*area/perimeter -- exact for a rectangle,
+// a fair proxy for any long sliver) below one Flash unit: a crack drawn as
+// a hairline. See the call site in _splitSelfTouches for why such a notch
+// is filled in rather than vented.
+function _isHairline(loop) {
+    if (loop.length < 3) return true;
+    var area = Math.abs(_signedAreaSum(loop)) / 2;
+    var per = 0;
+    for (var i = 0; i < loop.length; i++) {
+        var a = loop[i], b = loop[(i + 1) % loop.length];
+        var dx = b.x - a.x, dy = b.y - a.y;
+        per += Math.sqrt(dx * dx + dy * dy);
+    }
+    if (per < 1e-9) return true;
+    return (2 * area / per) < 1.0;
+}
+
+// Repairs every pinch in a polygon-with-holes' OUTER contour. Returns an
+// array of { vertices, holes } descriptors (usually exactly one, unchanged,
+// for the common no-pinch case): a lobe per same-winding half, each
+// opposite-winding half filed as a hole of the loop it was cut from, and
+// the original holes re-assigned to whichever resulting lobe contains
+// them. Never returns something worse than its input: a split whose halves
+// aren't both simple is abandoned and that loop left as it was.
+function _splitSelfTouches(polyData) {
+    var TOUCH_EPS = 0.05; // same coincidence tolerance as _nudgeCoincidentVertices
+    var descriptors = [{ vertices: polyData.vertices, holes: [] }];
+    var originalHoles = polyData.holes ? polyData.holes : [];
+    var guard = 0;
+    var changed = true;
+    while (changed && guard < 50) {
+        changed = false;
+        guard++;
+        for (var di = 0; di < descriptors.length; di++) {
+            var desc = descriptors[di];
+            if (desc._noSplit) continue;
+            var touch = _findSelfTouch(desc.vertices, TOUCH_EPS);
+            if (!touch) continue;
+            var halves = _splitLoopAtTouch(desc.vertices, touch, TOUCH_EPS);
+            if (!halves) { desc._noSplit = true; continue; }
+            var a = halves[0], b = halves[1];
+            var origSum = _signedAreaSum(desc.vertices);
+            var sa = a.length >= 3 ? _signedAreaSum(a) : 0;
+            var sb = b.length >= 3 ? _signedAreaSum(b) : 0;
+            // A sliver half (area < 1 unit^2 -- the same "degenerate ghost"
+            // threshold _groupPolygonsWithHoles uses) is noise: keep the
+            // other half alone, the pinch is gone with it.
+            if (Math.abs(sa) / 2 < 1.0 || a.length < 3) {
+                if (b.length >= 3 && !_hasSelfIntersection(b)) { desc.vertices = b; changed = true; }
+                else desc._noSplit = true;
+                continue;
+            }
+            if (Math.abs(sb) / 2 < 1.0 || b.length < 3) {
+                if (a.length >= 3 && !_hasSelfIntersection(a)) { desc.vertices = a; changed = true; }
+                else desc._noSplit = true;
+                continue;
+            }
+            if (_hasSelfIntersection(a) || _hasSelfIntersection(b)) { desc._noSplit = true; continue; }
+            var aSame = (sa > 0) === (origSum > 0);
+            var bSame = (sb > 0) === (origSum > 0);
+            if (aSame && bSame) {
+                // Two filled lobes joined at a point -> two separate outers.
+                // Any holes this loop had already collected go to whichever
+                // lobe contains them (fallback: the bigger one).
+                var lobeA = { vertices: a, holes: [] };
+                var lobeB = { vertices: b, holes: [] };
+                var bigger = Math.abs(sa) >= Math.abs(sb) ? lobeA : lobeB;
+                for (var hi = 0; hi < desc.holes.length; hi++) {
+                    var hole = desc.holes[hi];
+                    if (_pointInPolygon(hole[0], a)) lobeA.holes.push(hole);
+                    else if (_pointInPolygon(hole[0], b)) lobeB.holes.push(hole);
+                    else bigger.holes.push(hole);
+                }
+                descriptors.splice(di, 1, lobeA, lobeB);
+            } else if (aSame || bSame) {
+                var lobe = aSame ? a : b;
+                var notch = aSame ? b : a;  // the opposite-winding half: an empty notch
+                desc.vertices = lobe;
+                if (_isHairline(notch)) {
+                    // A notch narrower than a unit or so (mean width =
+                    // 2*area/perimeter) is a crack drawn as a hairline
+                    // sliver -- the real Rock1 case: 0.5 units wide, ~100
+                    // long, ending in a tiny round. Confirmed with a
+                    // faithful port of Godot's own Triangulate (Ratcliff ear
+                    // clipping, CMP_EPSILON=1e-5, relaxed retry) that this
+                    // crack cannot be kept in ANY form: re-vented as a hole
+                    // through _splitHoles (2-cut) or _bridgeHoles, the
+                    // resulting contour always ends with 8 unclippable
+                    // vertices along the crack, and Godot draws nothing for
+                    // the whole body. Filled in (the lobe alone) it
+                    // triangulates fine. So a hairline notch is FILLED IN:
+                    // what's lost is a ~2px line at Godot scale; what's
+                    // gained is the entire shape being visible at all.
+                    __log("  -> _splitSelfTouches: filling in a hairline notch (" + notch.length + " verts, area " + (Math.abs(_signedAreaSum(notch)) / 2).toFixed(2) + ")");
+                } else {
+                    desc.holes.push(_pushNotchInward(notch, lobe, TOUCH_EPS, 0.5));
+                }
+            } else {
+                desc._noSplit = true;       // can't happen (halves sum to the original); be safe
+                continue;
+            }
+            changed = true;
+        }
+    }
+    for (var di2 = 0; di2 < descriptors.length; di2++) delete descriptors[di2]._noSplit;
+    // Original holes: to the resulting lobe that contains them.
+    for (var oh = 0; oh < originalHoles.length; oh++) {
+        var h = originalHoles[oh];
+        var target = descriptors[0];
+        if (descriptors.length > 1 && h.length > 0) {
+            for (var dj = 0; dj < descriptors.length; dj++) {
+                if (_pointInPolygon(h[0], descriptors[dj].vertices)) { target = descriptors[dj]; break; }
+            }
+        }
+        target.holes.push(h);
+    }
+    return descriptors;
 }
 
 // Splits an outer polygon containing `holesArr` holes into an array of
@@ -544,13 +963,62 @@ function _splitPieceByHole(piece, hole) {
             var Pa = candA.pi, Ha = candA.hi, Pb = candB.pi, Hb = candB.hi;
             var piece1 = walk(piece, Pa, Pb).concat(walk(h, Hb, Ha));
             var piece2 = walk(piece, Pb, Pa).concat(walk(h, Ha, Hb));
+            // Same closing pass _bridgeHoles runs on ITS output: a hole
+            // vertex sitting exactly on an outer vertex (a hole touching
+            // the boundary in the source art) ends up in a half as two
+            // NON-adjacent identical points -- a zero-width pinch. Neither
+            // the crossing test nor the area check below can see it, but
+            // Godot's triangulator dies on it (confirmed on a real shape: a
+            // 3-vertex triangular notch touching the outline left 3
+            // unclippable vertices, the whole 802-vertex body drawn as
+            // nothing). Each nudge is verified against a fresh crossing.
+            // Applied ONLY to the candidate that passes every check below
+            // (see the return), never per attempt: a nudge pass is itself a
+            // loop of O(n) crossing checks per coincident pair, and running
+            // it on every one of up to 60 candidate pairs per hole turned a
+            // 4-second symbol into a 10-minute one.
             fullChecks++;
             if (_hasSelfIntersection(piece1) || _hasSelfIntersection(piece2)) {
                 if (fullChecks >= maxFullChecks) return null;
                 continue;
             }
+            // AREA CONSERVATION CHECK: a clean 2-cut split must reduce the
+            // piece's own area by essentially exactly the hole's area --
+            // pieceA+pieceB should equal pieceArea-holeArea, near-exactly,
+            // for ANY valid split (a mathematical fact of partitioning a
+            // simple polygon along a shared cut, not an approximation).
+            // _hasSelfIntersection alone (strict transverse-crossing only)
+            // isn't enough to catch every invalid candidate: confirmed on a
+            // real shape (Rock1, 43 holes) where one candidate pair for one
+            // hole produced two pieces that were EACH individually simple/
+            // non-self-intersecting, yet together covered ~3900 sq. units
+            // MORE than the original piece -- a wrong Pa/Ha/Pb/Hb pairing
+            // that still passes the crossing-only test (e.g. a hole vented
+            // the "wrong way" so a big chunk of the piece gets counted on
+            // both sides of the cut) but is geometrically nonsense. Left
+            // uncaught, that single bad hole was enough to blow the
+            // OUTER _splitAreaDeviation check (the caller's own, whole-
+            // shape safety net) past its 1% tolerance -- which then threw
+            // away EVERY hole's clean split, not just this one, falling
+            // back to bridging all 43 holes into one contour instead
+            // (exactly the kind of shape _bridgeHoles's own header warns
+            // Godot's triangulator can silently render as nothing).
+            // Checking area conservation HERE, per candidate, lets this
+            // one bad candidate be rejected and a different one tried (or
+            // this hole individually bridged, see _splitHoles's own
+            // fallback) while every OTHER hole still gets its clean split.
+            var pieceArea = Math.abs(_signedAreaSum(piece)) / 2;
+            var holeArea = Math.abs(_signedAreaSum(h)) / 2;
+            var expectedArea = pieceArea - holeArea;
+            var a1 = Math.abs(_signedAreaSum(piece1)) / 2;
+            var a2 = Math.abs(_signedAreaSum(piece2)) / 2;
+            var areaDev = expectedArea > 1e-6 ? Math.abs((a1 + a2) - expectedArea) / expectedArea : 0;
+            if (areaDev > 0.001) {
+                if (fullChecks >= maxFullChecks) return null;
+                continue;
+            }
 
-            return { pieceA: piece1, pieceB: piece2 };
+            return { pieceA: _nudgeCoincidentVertices(piece1), pieceB: _nudgeCoincidentVertices(piece2) };
         }
     }
     return null;
@@ -819,8 +1287,17 @@ function _hasSelfIntersection(verts) {
 // - removes the last point if it coincides with the first (contour
 //   already explicitly closed),
 // - repairs residual self-intersections (only on reasonably-sized
-//   contours, â‰¤ 500 vertices: `_hasSelfIntersection` is O(VÂ²), useless/
-//   costly beyond that).
+//   contours, <= 3000 vertices -- _removeSelfIntersections' own repair
+//   loop is O(V^2) per pass, up to 4*10 passes in the worst case, so this
+//   still bounds the cost; _hasSelfIntersection itself is cheap at any
+//   size, grid-optimized, see its own doc). Was capped at 500 -- raised
+//   after a real repro (a 419-contour "Rock1" shape, its merged/bridged
+//   fill ending up at 1328 vertices) slipped through invisible in Godot:
+//   the crossing survived specifically because THIS check was skipped for
+//   being over the old cap, not because _hasSelfIntersection/
+//   _removeSelfIntersections themselves can't handle that size -- a
+//   direct offline check confirmed _hasSelfIntersection finds real
+//   crossings on that exact 1328-vertex contour near-instantly.
 // Pure function: depends only on its input, touches no state of
 // _processElementNode.
 function _cleanupPolygonVertices(effectiveVerts) {
@@ -868,7 +1345,7 @@ function _cleanupPolygonVertices(effectiveVerts) {
         }
     }
 
-    if (finalVerts.length > 3 && finalVerts.length <= 500 && _hasSelfIntersection(finalVerts)) {
+    if (finalVerts.length > 3 && finalVerts.length <= 3000 && _hasSelfIntersection(finalVerts)) {
         var repaired = _removeSelfIntersections(finalVerts);
         // _removeSelfIntersections never verifies its OWN result: its
         // "un-twist by reversing" loop is bounded to 10 internal
@@ -2701,7 +3178,7 @@ function _clearExcessNamedSlots(node, variantPathStr, anim, startIndex, prefix, 
 // creating/attaching the node itself (parent.addChildRanked, node.owner),
 // never anim.tracks nor subResources -- so it can be extracted without
 // threading the rest of _processElementNode's state.
-function _resolveElementNode(elem, parent, ownerRoot, wrapperName, shaderNeeds, modulateNeedsCanvasGroup, layerZIndex, getExt, isStaticLayer) {
+function _resolveElementNode(elem, parent, ownerRoot, wrapperName, shaderNeeds, modulateNeedsCanvasGroup, layerZIndex, getExt, isStaticLayer, symbolMaxTime) {
     if (parent !== ownerRoot && !parent.parent) {
         ownerRoot.addChild(parent);
     }
@@ -2722,9 +3199,14 @@ function _resolveElementNode(elem, parent, ownerRoot, wrapperName, shaderNeeds, 
             if (elem.polygons && elem.polygons.length > 0) {
                 node = new GNode(wrapperName, "Polygon2D");
                 node.properties["color"] = "Color(1, 1, 1, 1)";
-                if ((!isStaticLayer || elem._isTweenShape) && !elem._isOrientationVariant) {
-                    // A genuine multi-keyframe shape tween: TweenShapeMeshConverter.gd
-                    // (written unconditionally alongside FlashMovieClip.gd) swaps this
+                if (ENABLE_TWEEN_SHAPE_MESH_CONVERTER && (!isStaticLayer || elem._isTweenShape) && !elem._isOrientationVariant
+                        && (symbolMaxTime || 0) > MIN_TWEEN_MESH_DURATION_SEC) {
+                    // A genuine multi-keyframe shape tween, on a symbol whose
+                    // whole timeline runs longer than MIN_TWEEN_MESH_DURATION_
+                    // SEC (see its own doc -- not worth the extra node/runtime
+                    // triangulation pass for a short one-shot tween):
+                    // TweenShapeMeshConverter.gd (written unconditionally
+                    // alongside FlashMovieClip.gd) swaps this
                     // Polygon2D for a pre-triangulated MeshInstance2D the first time this
                     // scene loads, using Godot's own Geometry2D.triangulate_polygon() --
                     // see that script for why this happens at runtime rather than here at
@@ -2770,6 +3252,13 @@ function _resolveElementNode(elem, parent, ownerRoot, wrapperName, shaderNeeds, 
                 var _spi = _symbolPathInfo(elem.symbolName);
                 var resPath = RES_PREFIX + "symbols/" + _spi.subPath + ".tscn";
                 node.properties["instance"] = "ExtResource(\"" + getExt(resPath, "PackedScene") + "\")";
+                // Not a real .tscn property -- a plain JS field on the GNode
+                // object itself, invisible to serializeTscn (which only
+                // ever reads node.properties), so this is a no-op outside
+                // of buildVariantScenes' own post-build
+                // _inlineInstancePlaceholders pass, which is the only thing
+                // that ever reads it. See that function's own doc for why.
+                node._inlineSymbolName = elem.symbolName;
             } else {
                 node = new GNode(wrapperName, "Node2D");
             }
@@ -2799,6 +3288,7 @@ function _resolveElementNode(elem, parent, ownerRoot, wrapperName, shaderNeeds, 
                 var _spi = _symbolPathInfo(elem.symbolName);
                 var resPath = RES_PREFIX + "symbols/" + _spi.subPath + ".tscn";
                 node.properties["instance"] = "ExtResource(\"" + getExt(resPath, "PackedScene") + "\")";
+                node._inlineSymbolName = elem.symbolName;  // see the other branch's identical field for why
             } else {
                 node = new GNode(variantName, "Node2D");
             }
@@ -2815,7 +3305,7 @@ function _processElementNode(elem, parent, ownerRoot, anim, startTime, duration,
                              maxTime, kfTransition, shaderNeeds, layerType,
                              getExt, subResources, isStaticLayer, modulateNeedsCanvasGroup, gradCache, layerZIndex) {
     // --- 1. Wrapper/node: lookup or creation -----------------------------
-    var _resolved = _resolveElementNode(elem, parent, ownerRoot, wrapperName, shaderNeeds, modulateNeedsCanvasGroup, layerZIndex, getExt, isStaticLayer);
+    var _resolved = _resolveElementNode(elem, parent, ownerRoot, wrapperName, shaderNeeds, modulateNeedsCanvasGroup, layerZIndex, getExt, isStaticLayer, maxTime);
     var node = _resolved.node;
     var wrapperNode = _resolved.wrapperNode;
     var isNewNode = _resolved.isNewNode;
@@ -2972,8 +3462,18 @@ function _processElementNode(elem, parent, ownerRoot, anim, startTime, duration,
                 }
 
                 for (var p = 0; p < group.polygons.length; p++) {
-                    var polyData = group.polygons[p];
-                    var piecesToEmit;
+                    var rawPolyData = group.polygons[p];
+                    var piecesToEmit = [];
+
+                    // A pinched outer contour (see _splitSelfTouches) is
+                    // first split into its lobes, each with the holes that
+                    // belong to it -- usually exactly one descriptor, the
+                    // input unchanged. Everything below then runs per
+                    // descriptor exactly as it used to run per polygon.
+                    var descriptors = _splitSelfTouches(rawPolyData);
+                    for (var di = 0; di < descriptors.length; di++) {
+                    var polyData = descriptors[di];
+                    var descPieces;
 
                     if (polyData.holes && polyData.holes.length > 0) {
                         // Split into simple, hole-free pieces (real cuts,
@@ -2989,7 +3489,7 @@ function _processElementNode(elem, parent, ownerRoot, anim, startTime, duration,
                         // polygon once it's complex enough).
                         var splitResult = _splitHoles(polyData.vertices, polyData.holes);
                         if (splitResult.unvented.length === 0 && _splitAreaDeviation(polyData, splitResult.pieces) <= 0.01) {
-                            piecesToEmit = splitResult.pieces;
+                            descPieces = splitResult.pieces;
                         } else {
                             // Splitting couldn't cleanly account for every
                             // hole on this particular shape (rare -- a
@@ -3004,11 +3504,42 @@ function _processElementNode(elem, parent, ownerRoot, anim, startTime, duration,
                             // regression, only unfixed for this one case.
                             var bridged = _bridgeHoles(polyData.vertices, polyData.holes);
                             var effectiveVerts = (bridged && !_hasSelfIntersection(bridged)) ? bridged : polyData.vertices;
-                            piecesToEmit = [effectiveVerts];
+                            descPieces = [effectiveVerts];
                         }
                     } else {
-                        piecesToEmit = [polyData.vertices];
+                        descPieces = [polyData.vertices];
                     }
+                    piecesToEmit = piecesToEmit.concat(descPieces);
+                    } // end per-descriptor loop
+
+                    // Second pinch pass, on the OUTPUT pieces this time: hole
+                    // venting itself can create a pinch the input never had.
+                    // Confirmed on the real Rock1 outline: one hole's own
+                    // side ran exactly along a straight outer edge (a hole
+                    // vertex at distance 0.0000 from that edge, mid-edge --
+                    // no vertex-vertex coincidence for _nudgeCoincidentVertices
+                    // to see), so after _splitPieceByHole vented it, the
+                    // resulting piece touched itself there and Godot refused
+                    // to triangulate the whole node. Each pinched piece is
+                    // split into its lobe(s) + notch(es); a notch is re-vented
+                    // through _bridgeHoles specifically (not _splitHoles): its
+                    // real-width bridge plus its closing _nudgeCoincidentVertices
+                    // pass is what separates the notch's twin point from the
+                    // outer's, which is exactly the repair a pinch needs.
+                    var pinchRepaired = [];
+                    for (var pp = 0; pp < piecesToEmit.length; pp++) {
+                        var pieceDescs = _splitSelfTouches({ vertices: piecesToEmit[pp], holes: [] });
+                        for (var pd = 0; pd < pieceDescs.length; pd++) {
+                            var pDesc = pieceDescs[pd];
+                            if (pDesc.holes.length > 0) {
+                                var vented = _bridgeHoles(pDesc.vertices, pDesc.holes);
+                                pinchRepaired.push((vented && !_hasSelfIntersection(vented)) ? vented : pDesc.vertices);
+                            } else {
+                                pinchRepaired.push(pDesc.vertices);
+                            }
+                        }
+                    }
+                    piecesToEmit = pinchRepaired;
 
                     for (var pe = 0; pe < piecesToEmit.length; pe++) {
                         var finalVerts = _cleanupPolygonVertices(piecesToEmit[pe]);
@@ -4033,7 +4564,85 @@ function _buildSceneTree(sym, frameRate, exportDir, symbolMap, symbolContainsSha
     // reasoning (never crosses anything that visually overlaps).
     _mergeSameColorAcrossTree(root);
 
+    // Also last, for the same reason (the truly final set of Polygon2D/
+    // Line2D nodes) -- see _attachAntialiasedScripts' own doc for why this
+    // attaches a script rather than emitting type="AntialiasedPolygon2D"/
+    // "AntialiasedLine2D" directly. Needs getExt (a closure over this
+    // function's own extResources/extIdMap), so it has to run here, inside
+    // _buildSceneTree, rather than later in serializeTscn/buildSceneForSymbol.
+    if (ENABLE_ANTIALIASED_SHAPES) _attachAntialiasedScripts(root, getExt);
+
     return { root: root, extResources: extResources, subResources: subResources, actionScripts: actionScripts };
+}
+
+// Attaches the antialiased_line2d addon's own Polygon2D/Line2D subclass
+// script (see rooms_godot4/addons/antialiased_line2d) to every plain
+// Polygon2D/Line2D node in `root`'s tree -- gives crisp edges under the GL
+// Compatibility renderer this project targets, where Godot's own 2D MSAA
+// isn't available at all ("not yet supported for GLES3").
+//
+// Deliberately does NOT emit type="AntialiasedPolygon2D"/"AntialiasedLine2D"
+// directly (an earlier version of this did) -- confirmed via a real repro
+// that Godot's .tscn TEXT loader resolves a node's `type="..."` purely
+// against ClassDB (built-in engine classes only), NOT against globally-
+// registered SCRIPT classes, even though the editor's OWN "Change Type"
+// dialog (which resolves through ScriptServer, a separate mechanism) has
+// no trouble creating one interactively -- every node instantiated from a
+// SERIALIZED scene with that type string failed outright ("Cannot get
+// class ...", replaced with a blank placeholder / "not a valid node"),
+// project-wide, the global script class cache notwithstanding (confirmed
+// correctly populated, so that wasn't it either). The form that actually
+// works keeps `type=` at the NATIVE base class and adds an explicit
+// `script=` property instead -- exactly how the editor itself serializes
+// a Change-Type'd node, and the same pattern this file already uses for
+// TweenShapeMeshConverter.gd (see ENABLE_TWEEN_SHAPE_MESH_CONVERTER).
+function _attachAntialiasedScripts(node, getExt) {
+    if (!node.properties["instance"] && !node.properties["script"]) {
+        if (node.type === "Polygon2D") {
+            node.properties["script"] = "ExtResource(\"" + getExt("res://addons/antialiased_line2d/antialiased_polygon2d.gd", "Script") + "\")";
+            // AntialiasedPolygon2D auto-generates its OWN Line2D border
+            // child at runtime, defaulting to stroke_width = 10.0 -- this
+            // pipeline already exports a shape's actual outline (if it has
+            // one) as a separate sibling node (see Poly_N/Line_N), so left
+            // alone every single fill would sprout an unwanted extra 10px
+            // border on top of whatever's already there. 0 disables it
+            // without needing to also silence stroke_color.
+            //
+            // Giving every fill a small non-zero stroke instead (matched to
+            // its own color) was tried, to get SOME antialiasing on a
+            // fill's own boundary under this project's GL Compatibility
+            // renderer (where neither Godot's native 2D MSAA nor this
+            // addon's usual per-outline AA apply to a plain fill with no
+            // separate Line_N at all) -- reverted, confirmed a real, worse
+            // regression via a direct screenshot: this project's
+            // illustrations are built from many small, differently-colored
+            // fills sharing edges with their neighbours (color-blocked
+            // shading, e.g. a shoe's panels), not isolated shapes over a
+            // transparent background. Two ADJACENT opaque fills each
+            // growing their own semi-transparent feathered stroke along
+            // their shared border compose into a visible dark seam right
+            // on that border, not smoothing of any kind -- the technique
+            // only actually helps a shape's OUTER silhouette edge (nothing
+            // opaque behind it to seam against), which is a much narrower
+            // win than "every fill" for the visible cost. Left at 0 unless
+            // a future attempt specifically targets outer-silhouette edges
+            // only (would need real adjacency/winding analysis to tell
+            // those apart from shared internal edges, not attempted here --
+            // an edge-classification pass along these lines WAS tried and
+            // reverted too: it correctly told exposed edges from shared
+            // ones, but the small AA lines it added still didn't hold up
+            // under closer/zoomed inspection -- see 2D antialiasing's own
+            // documented gap for the Compatibility renderer this project
+            // targets, https://docs.godotengine.org/en/stable/tutorials/2d/2d_antialiasing.html,
+            // which confirms there's no real workaround at the Polygon2D
+            // level for this renderer at all, only true supersampling or a
+            // renderer switch would actually fix it).
+            node.properties["stroke_width"] = "0.0";
+        } else if (node.type === "Line2D") {
+            node.properties["script"] = "ExtResource(\"" + getExt("res://addons/antialiased_line2d/antialiased_line2d.gd", "Script") + "\")";
+        }
+    }
+    for (var i = 0; i < node.children.length; i++) _attachAntialiasedScripts(node.children[i], getExt);
 }
 
 // Thin wrapper around _buildSceneTree: builds the tree then serializes it
@@ -4534,7 +5143,22 @@ function buildGodotScenes(doc, data, exportDir) {
     "## independently re-derive the identical shapes/mesh order from them, with\n" +
     "## no dependency on which instance's _ready() happens to run first.\n" +
     "\n" +
+    "## Re-enabled (see godotBuilder.jsfl's ENABLE_TWEEN_SHAPE_MESH_CONVERTER,\n" +
+    "## the attachment gate this const stays in sync with). Was briefly off\n" +
+    "## over a suspected conflict with AntialiasedPolygon2D under an EARLIER\n" +
+    "## antialiasing approach (type=\"AntialiasedPolygon2D\" directly, since\n" +
+    "## reverted) -- under the current approach (a plain Polygon2D + an\n" +
+    "## explicit `script=` property, see _attachAntialiasedScripts) that\n" +
+    "## function already skips any node that already has a script attached,\n" +
+    "## so this converter and the antialiasing addon never actually collide.\n" +
+    "## Baked into the GENERATED content here too (not just godotBuilder\n" +
+    "## .jsfl's own attachment gate) so both consts change together on the\n" +
+    "## next export, never drift apart with one flipped and not the other.\n" +
+    "const ENABLED := true\n" +
+    "\n" +
     "func _ready() -> void:\n" +
+    "\tif not ENABLED:\n" +
+    "\t\treturn\n" +
     "\tvar root: Node = get_owner()\n" +
     "\tif root == null:\n" +
     "\t\troot = self\n" +
@@ -5160,62 +5784,169 @@ function _buildOrientationSynthSymbol(group, orientNames, frameIdx, symbolMap, r
     return { name: rootName, layers: combinedLayers };
 }
 
+// Sets `newOwner` on `node` and every descendant -- used right after
+// grafting a whole subtree built under a DIFFERENT root (see
+// _inlineInstancePlaceholders below) onto this scene instead: every node
+// in that subtree still carries the DISCARDED inner build's own root as
+// `.owner` (set by its own _buildSceneTree call), which would otherwise
+// leak into the final .tscn's own `owner = ...` lines pointing at a node
+// that was never actually part of this scene.
+function _reownRecursive(node, newOwner) {
+    node.owner = newOwner;
+    for (var i = 0; i < node.children.length; i++) _reownRecursive(node.children[i], newOwner);
+}
+
+// Replaces every "instance" placeholder under `node` (a plain
+// type="PackedScene" node with an `instance` ExtResource property, see
+// _resolveElementNode's own two identical branches -- both stash the
+// referenced symbol's name on node._inlineSymbolName specifically for
+// this function, a plain JS field invisible to serializeTscn/the normal
+// export path, which never calls this at all) with that symbol's OWN,
+// FRESH _buildSceneTree() output, grafted in place -- the placeholder
+// BECOMES the dependency's own root (same type/properties), keeping
+// its existing name/position in `node`'s tree (so anything that already
+// points at it, e.g. this element's own animation tracks, keeps
+// resolving), while its children come from the dependency's build.
+//
+// Written for buildVariantScenes specifically (see its own call site) --
+// a downloaded variant .tscn is meant to be fully self-contained (no
+// separate `symbols/<path>.tscn` ext_resource it depends on existing
+// project-side), unlike a normal buildGodotScenes export, where instanced
+// symbols staying separate PackedScene references is deliberate (avoids
+// duplicating a shared symbol's own content into every scene that instances
+// it). Recurses into whatever gets grafted too, in case the dependency
+// ITSELF instances another symbol -- `chain` (a symbolName -> true set of
+// symbols currently being inlined on this same recursion branch) guards
+// against a circular instance graph the same way _inlineStaticInstances'
+// own `chain` does: a symbol already on the chain is left as an inert,
+// un-inlined placeholder (still type="PackedScene", pointing at a
+// symbols/<path>.tscn that buildVariantScenes no longer actually writes --
+// an edge case real content is never expected to hit, not worth a more
+// elaborate fallback for) rather than recursing forever.
+//
+// Merges each inlined dependency's own extResources/subResources
+// directly into outerExtResources/outerSubResources (the SAME arrays the
+// caller's own top-level _buildSceneTree call already populated), so one
+// final serializeTscn call covers the whole, now fully-inlined tree.
+// Resource ids (see nextId()) are randomly generated, not a shared
+// monotonic counter, so a collision between the outer build's own ids and
+// an inlined dependency's is theoretically possible but vanishingly
+// unlikely (same accepted tradeoff nextId() itself already documents) --
+// not worth deduplicating/rewriting ids across builds for.
+function _inlineInstancePlaceholders(node, symbolMap, frameRate, exportDir, symbolContainsShader, outerExtResources, outerSubResources, chain) {
+    // Snapshot BEFORE recursing -- grafting below adds NEW children to
+    // `node` (from the dependency's own root), which get walked separately
+    // afterward instead, so a dependency that itself instances something
+    // is only ever inlined once, not double-processed by both loops.
+    var originalChildren = node.children.slice();
+    for (var i = 0; i < originalChildren.length; i++) {
+        _inlineInstancePlaceholders(originalChildren[i], symbolMap, frameRate, exportDir, symbolContainsShader, outerExtResources, outerSubResources, chain);
+    }
+
+    var symName = node._inlineSymbolName;
+    if (!symName) return;
+    delete node._inlineSymbolName;
+    var innerSym = symbolMap[symName];
+    if (!innerSym || chain[symName]) return; // unknown symbol, or circular -- leave the placeholder inert, see this function's own doc
+
+    chain[symName] = true;
+    // Same reasoning as buildVariantScenes' own skipEnablerForSelf for the
+    // TOP-level variant frame (see its own comment): this dependency is
+    // ALWAYS a child within the variant's tree now, never placed
+    // standalone, so it doesn't need its OWN VisibleOnScreenEnabler2D --
+    // whatever's ultimately displaying this variant already handles
+    // on/off-screen culling for the whole thing.
+    var skipEnablerForInner = {};
+    skipEnablerForInner[innerSym.name] = true;
+    var built = _buildSceneTree(innerSym, frameRate, exportDir, symbolMap, symbolContainsShader, skipEnablerForInner);
+    delete chain[symName];
+
+    // MERGE, not replace -- `node`'s own properties already hold THIS
+    // particular instance's own position/rotation/scale/modulate/visible
+    // (baked in by the rest of _processElementNode from elem.matrix/
+    // colorTransform, same as any other node type, well before this
+    // function ever runs), which must survive; only `instance` itself
+    // (no longer valid -- this is a plain Node2D now, not a PackedScene)
+    // is gone for sure, and built.root's own properties (typically none
+    // at all for an ordinary symbol root) only fill in whatever `node`
+    // doesn't already have of its own.
+    node.type = built.root.type;
+    delete node.properties["instance"];
+    for (var propKey in built.root.properties) {
+        if (!(propKey in node.properties)) node.properties[propKey] = built.root.properties[propKey];
+    }
+    var newChildren = built.root.children.slice();
+    for (var c = 0; c < newChildren.length; c++) {
+        var child = newChildren[c];
+        child.parent = null; // detach from the (about to be discarded) inner root before re-adding under `node`
+        node.addChild(child);
+        _reownRecursive(child, node.owner);
+    }
+    for (var er = 0; er < built.extResources.length; er++) outerExtResources.push(built.extResources[er]);
+    for (var sr = 0; sr < built.subResources.length; sr++) outerSubResources.push(built.subResources[sr]);
+
+    for (var c2 = 0; c2 < newChildren.length; c2++) {
+        _inlineInstancePlaceholders(newChildren[c2], symbolMap, frameRate, exportDir, symbolContainsShader, outerExtResources, outerSubResources, chain);
+    }
+}
+
+// _inlineInstancePlaceholders only ever REMOVES a node's own `instance`
+// property once it inlines that placeholder -- it never goes back and
+// removes the now-unused `[ext_resource type="PackedScene" ...]`
+// DECLARATION line _resolveElementNode's own getExt() call already added
+// to extResources for it (getExt runs long before this whole inlining
+// pass even starts). Left alone, every successfully-inlined variant frame
+// still ends up with one or more of these orphaned declarations sitting
+// harmlessly-looking but NOT harmless: Godot's own .tscn loader resolves
+// every declared ext_resource up front as a real dependency, REGARDLESS
+// of whether any node still references its id -- confirmed via a real
+// generated file (a "sparkle" decoration nested 2 symbols deep) where
+// every one of its instance placeholders WAS correctly inlined (verified
+// directly: type="Node2D", own AnimationPlayer and all), yet the file
+// still declared 3 now-dead PackedScene ext_resources pointing at
+// symbols/ paths a truly standalone download would have no reason to
+// expect to exist. Called once per variant frame, after
+// _inlineInstancePlaceholders finishes with it, right before
+// serializeTscn.
+function _pruneUnusedPackedSceneExtResources(root, extResources) {
+    var usedIds = {};
+    function collectUsedIds(node) {
+        var inst = node.properties && node.properties["instance"];
+        if (inst) {
+            var m = /ExtResource\("([^"]+)"\)/.exec(inst);
+            if (m) usedIds[m[1]] = true;
+        }
+        for (var i = 0; i < node.children.length; i++) collectUsedIds(node.children[i]);
+    }
+    collectUsedIds(root);
+
+    var kept = [];
+    for (var i = 0; i < extResources.length; i++) {
+        var line = extResources[i];
+        if (line.indexOf('type="PackedScene"') === -1) {
+            kept.push(line); // not a PackedScene declaration at all (Script/Texture2D/...) -- never this function's concern
+            continue;
+        }
+        var idMatch = /id="([^"]+)"/.exec(line);
+        if (idMatch && usedIds[idMatch[1]]) kept.push(line); // still referenced by a real (un-inlined, e.g. circular-guard) instance -- keep it
+        // else: nothing in the final tree references this id anymore -- drop the now-dead declaration
+    }
+    return kept;
+}
+
 // A variant part's frames can themselves instance OTHER library symbols
 // (e.g. a decorative sub-shape nested inside one hat design). Those show up
-// as "instance" elements, which _processElementNode turns into a PackedScene
-// ext_resource pointing at exportDir/symbols/<path>.tscn -- exactly like any
-// normal, full buildGodotScenes export would produce, since it's the same
-// _symbolPathInfo/RES_PREFIX logic either way. buildVariantScenes builds
-// ONLY the variant parts themselves (frame-sliced, never as their own full
-// standalone scene), so anything THEY reference must be built separately or
-// Godot fails to load the resulting .tscn ("Cannot open file ...") --
-// EXCEPT symbols eligible for inlining (_isInlineableStaticSymbol), which
-// _buildOrientationSynthSymbol draws directly instead and therefore never
-// need one.
-// Walks the "instance" elements of `rootNames`' full timelines (not just one
-// sliced frame -- different frames can reference different nested symbols)
-// and returns every non-inlineable symbol transitively reachable from them,
-// EXCLUDING the roots themselves.
-function _collectSymbolDependencies(rootNames, symbolMap) {
-    var visited = {};
-    var toVisit = rootNames.slice();
-
-    while (toVisit.length > 0) {
-        var name = toVisit.pop();
-        if (visited[name]) continue;
-        visited[name] = true;
-        var sym = symbolMap[name];
-        if (!sym || !sym.layers) continue;
-        for (var l = 0; l < sym.layers.length; l++) {
-            var layer = sym.layers[l];
-            if (!layer.keyframes) continue;
-            for (var k = 0; k < layer.keyframes.length; k++) {
-                var kf = layer.keyframes[k];
-                if (!kf.elements) continue;
-                // _flattenGroups: an "instance" element can be nested
-                // inside a Flash "group" (el.members) -- see the same note
-                // in _buildOrientationSynthSymbol.
-                var flatElements = _flattenGroups(kf.elements);
-                for (var e = 0; e < flatElements.length; e++) {
-                    var el = flatElements[e];
-                    if (el.elementType === "instance" && el.symbolName && !visited[el.symbolName]) {
-                        toVisit.push(el.symbolName);
-                    }
-                }
-            }
-        }
-    }
-
-    var deps = [];
-    var rootSet = {};
-    for (var i = 0; i < rootNames.length; i++) rootSet[rootNames[i]] = true;
-    for (var depName in visited) {
-        if (rootSet[depName]) continue;
-        if (_isInlineableStaticSymbol(symbolMap[depName])) continue; // drawn inline, no standalone scene needed
-        deps.push(depName);
-    }
-    return deps;
-}
+// as "instance" elements; _resolveElementNode turns them into a PackedScene
+// placeholder node same as any normal, full buildGodotScenes export would
+// produce, but buildVariantScenes' own post-build _inlineInstancePlaceholders
+// pass then grafts each one's real content (AnimationPlayer included)
+// directly into the variant frame instead of leaving it as a reference to a
+// SEPARATE symbols/<path>.tscn -- see that function's own doc for why (a
+// downloaded variant .tscn is meant to be fully self-contained). A prior
+// version of this file instead pre-built those dependencies as their own
+// standalone scenes (see _collectSymbolDependencies, since removed) for the
+// PackedScene ext_resource references to resolve against; superseded by the
+// inlining pass, which needs no separate files to exist at all.
 
 // Entry point: scans the whole library for variant groups (HAT, ITEM, ...)
 // and generates their combined per-frame scenes under
@@ -5231,7 +5962,6 @@ function buildVariantScenes(data, exportDir) {
 
     var rawGroups = _findVariantGroups(data.library.symbols);
     var validGroups = [];
-    var partNames = [];
     for (var g = 0; g < rawGroups.length; g++) {
         var group = rawGroups[g];
         var orientNames = [];
@@ -5247,22 +5977,8 @@ function buildVariantScenes(data, exportDir) {
         }
         if (frameCount <= 0) continue;
 
-        for (var o = 0; o < orientNames.length; o++) partNames.push(group.parts[orientNames[o]].name);
         validGroups.push({ prefix: group.prefix, parts: group.parts, orientNames: orientNames, frameCount: frameCount });
     }
-
-    // Build a standalone symbols/<path>.tscn (the exact same file a normal
-    // buildGodotScenes export would produce) for every symbol the variant
-    // parts' frames instance internally, so the PackedScene ext_resource
-    // references emitted below actually resolve in Godot. See
-    // _collectSymbolDependencies.
-    var deps = _collectSymbolDependencies(partNames, symbolMap);
-    for (var d = 0; d < deps.length; d++) {
-        var depSym = symbolMap[deps[d]];
-        if (depSym) buildSceneForSymbol(depSym, frameRate, uri, symbolMap, symbolContainsShader, {});
-    }
-    if (typeof fl !== "undefined" && deps.length > 0) fl.trace("buildVariantScenes: built " + deps.length
-        + " nested dependency symbol(s) referenced by variant parts");
 
     var variantsRoot = uri + "variants/";
     if (validGroups.length > 0) FLfile.createFolder(variantsRoot);
@@ -5298,6 +6014,20 @@ function buildVariantScenes(data, exportDir) {
             var skipEnablerForSelf = {};
             skipEnablerForSelf[synthSym.name] = true;
             var built = _buildSceneTree(synthSym, frameRate, uri, symbolMap, symbolContainsShader, skipEnablerForSelf);
+            // Every "instance" element this variant frame's parts use
+            // (e.g. a decorative sub-shape nested inside one hat design)
+            // would otherwise become a PackedScene ext_resource pointing
+            // at a SEPARATE symbols/<path>.tscn -- fine for a normal
+            // buildGodotScenes export (already sitting in the same
+            // project), but a downloaded variant .tscn is meant to be
+            // fully self-contained (see ItemSceneCache.gd's own doc: no
+            // bundled-file fallback, and no guarantee whatever the server
+            // hosts stays in lockstep with a given client build's own
+            // res://N/symbols/ tree). Grafts each dependency's own built
+            // subtree (AnimationPlayer included) directly into this frame
+            // instead -- see _inlineInstancePlaceholders' own doc.
+            _inlineInstancePlaceholders(built.root, symbolMap, frameRate, uri, symbolContainsShader, built.extResources, built.subResources, {});
+            built.extResources = _pruneUnusedPackedSceneExtResources(built.root, built.extResources);
             var tscnText = serializeTscn(built.root, built.extResources, built.subResources);
             FLfile.write(groupDir + (n + 1) + ".tscn", tscnText);
         }

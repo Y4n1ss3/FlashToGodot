@@ -10,10 +10,14 @@
 // <output_dir>/variants/<prefix>/<N>.tscn -- one child group per orientation,
 // plus an AnimationPlayer with one animation per orientation that toggles
 // `visible` (gameplay picks the view with AnimationPlayer.play("FRONT")).
-// It also writes a standalone symbols/<path>.tscn for every OTHER library
-// symbol the variant parts instance internally (see
-// _collectSymbolDependencies in godotBuilder.jsfl), so every ext_resource
-// reference the generated scenes make actually resolves.
+// Any OTHER library symbol a variant part instances internally (e.g. a
+// decorative sub-shape nested inside one hat design) is grafted directly
+// into the generated scene instead of left as a separate symbols/<path>.tscn
+// ext_resource reference (see _inlineInstancePlaceholders in
+// godotBuilder.jsfl) -- each written <N>.tscn is fully self-contained, with
+// no dependency on any OTHER generated file, since these variant scenes are
+// meant to be served standalone over HTTP (see rooms_godot4's own
+// ItemSceneCache.gd) rather than shipped as part of the game's own project.
 //
 // Runs entirely in Node.js, starting from a debug_data.json already
 // extracted from a real .fla (see tools/README.md) -- no Adobe Animate

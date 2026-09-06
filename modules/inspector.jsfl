@@ -427,10 +427,42 @@ function _removeOppositeWindingDuplicates(polys) {
     // Index by "geometric key" = sorted + rounded vertices. Allows matching
     // two polygons that have the SAME vertices but possibly enumerated
     // starting from a different point and/or in the opposite direction.
+    //
+    // Two things confirmed necessary via a real repro (a CURVE_QUALITY-
+    // sensitive bug where raising point density made an outer/inner-
+    // boundary pair -- the SAME closed loop traced once each direction,
+    // e.g. a fill's own boundary and its "no fill" hole cutout at the
+    // exact same position -- stop matching here, so it fell through to
+    // _groupPolygonsWithHoles and got bridged into a spurious "outer with
+    // a hole" instead of being recognized as this function's own target
+    // case and dropped/paired correctly):
+    //
+    //   1. DEDUP each vertex list before sorting/joining. A closed loop's
+    //      vertex array always repeats its OWN first point as its last
+    //      (the "closing" point) -- but WHICH point ends up duplicated
+    //      depends only on wherever that particular traversal happened to
+    //      start walking the loop, not on the loop's actual shape. Two
+    //      traversals of the exact same loop starting at different points
+    //      (an accident of Flash's internal edge order, unrelated to
+    //      CURVE_QUALITY itself) produce DIFFERENT raw multisets -- a
+    //      different point double-counted in each -- even though the
+    //      underlying set of unique points is identical.
+    //   2. Round to 0.01 (hundredths), not 0.001 (thousandths). Two
+    //      independently-subdivided traces of the same geometric point
+    //      (different contours, their own separate Bezier control points
+    //      and t-parametrization) can land on OPPOSITE sides of a
+    //      millipixel rounding boundary purely from floating-point noise
+    //      (e.g. one computes -1.23749999.., the other -1.23750001..,
+    //      rounding to -1237 vs -1238) -- a false MISmatch, not a real
+    //      positional difference. Real distinct points in this art are
+    //      never anywhere near 0.01 units apart, so this doesn't risk a
+    //      false-positive match between genuinely different points.
     function _geomKey(verts) {
+        var seen = {};
         var pts = [];
         for (var i = 0; i < verts.length; i++) {
-            pts.push(Math.round(verts[i].x * 1000) + ":" + Math.round(verts[i].y * 1000));
+            var k = Math.round(verts[i].x * 100) + ":" + Math.round(verts[i].y * 100);
+            if (!seen[k]) { seen[k] = true; pts.push(k); }
         }
         pts.sort();
         return pts.join("|");
@@ -1088,7 +1120,7 @@ function inspectShape(el, isShapeTween, forceExtract) {
                                     }
                                 }
                                 pts.push({x: endP.x, y: endP.y});
-                                
+
                                 rawEdges.push({
                                     start: {x: startP.x, y: startP.y},
                                     end: {x: endP.x, y: endP.y},
