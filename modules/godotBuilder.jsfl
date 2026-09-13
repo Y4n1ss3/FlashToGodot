@@ -1815,6 +1815,8 @@ GAnimation.prototype.optimizeTracks = function(root) {
         
         if (tr.type === "method") {
             isStatic = false; // Never optimize method tracks
+        } else if (tr.keepDynamic) {
+            isStatic = false; // See addTrackKey's own "keepDynamic" doc -- never collapse this one, however constant its values look right now
         } else if (propName.indexOf(":") !== -1 || propName.indexOf("/") !== -1) {
             isStatic = false; // Don't optimize sub-properties
         } else if (tr.keys.times[0] > 0.0005 && (propName === "points" || propName === "polygon" || propName === "polygons" || propName === "uv")) {
@@ -2573,7 +2575,24 @@ function _mergeSameColorAcrossTree(root) {
     }
 }
 
-GAnimation.prototype.addTrackKey = function(path, typeStr, time, value, transition) {
+// `keepDynamic` (optional, default false): tells optimizeTracks below to
+// NEVER collapse this track back into a plain static property, even when
+// every one of its keyframes turns out to hold the exact same value (its
+// normal "isStatic" test, see optimizeTracks' own doc). Exists for
+// buildVariantScenes' own :texture/:color/:default_color tracks (see its
+// call sites in _processElementNode) -- an equipment symbol's own
+// combined-orientations layer means these values are almost always
+// IDENTICAL across every orientation "keyframe" at EXPORT time (nothing
+// customized yet), which optimizeTracks would otherwise flatten away --
+// confirmed a real repro that this silently discarded the whole reason
+// these tracks exist in the first place: giving rooms_godot4's own
+// CustomizationStore.gd a real per-ANIMATION track to bake a runtime
+// player customization into later, independently per orientation, the
+// same mechanism this project's own flash_color_* shader tracks already
+// relied on. Sets the SAME flag on every subsequent call for a track
+// that already exists too (a later call passing true while an earlier
+// one for the SAME track didn't shouldn't un-protect it).
+GAnimation.prototype.addTrackKey = function(path, typeStr, time, value, transition, keepDynamic) {
     var tIdx = this.findTrack(path, typeStr);
     if (tIdx === -1) {
         var updateMode = 0;
@@ -2591,7 +2610,7 @@ GAnimation.prototype.addTrackKey = function(path, typeStr, time, value, transiti
 
         this.tracks.push({
             path: path, type: typeStr, imported: false, enabled: true,
-            interp: interp, loop_wrap: false,
+            interp: interp, loop_wrap: false, keepDynamic: !!keepDynamic,
             keys: { times: [], transitions: [], update: updateMode, values: [] }
         });
         tIdx = this.tracks.length - 1;
@@ -2599,6 +2618,7 @@ GAnimation.prototype.addTrackKey = function(path, typeStr, time, value, transiti
     }
 
     var tr = this.tracks[tIdx];
+    if (keepDynamic) tr.keepDynamic = true;
     time = Math.round(time * 1000) / 1000;
 
     var exactMatchIdx = -1;
@@ -3673,6 +3693,25 @@ function _processElementNode(elem, parent, ownerRoot, anim, startTime, duration,
                         polyNode.properties["uv"] = uvsStr;
                         polyNode.properties["color"] = "Color(1, 1, 1, 1)";
                         polyNode.properties["visible"] = true;
+                        // NOT also baked as anim tracks here -- an earlier
+                        // version of this tried that, confirmed via a real
+                        // repro that a track added HERE never actually
+                        // survives optimizeTracks: isStaticLayer true means
+                        // this is a genuinely single-frame symbol (the
+                        // buildGodotScenes/decor case, never customizable
+                        // via CustomizationStore to begin with), so the
+                        // track's value is identical at every one of its own
+                        // "keyframes" -- exactly what optimizeTracks
+                        // collapses straight back into a plain property,
+                        // silently undoing the whole point. The real
+                        // customizable case (equipment built by
+                        // buildVariantScenes) always goes through the OTHER
+                        // branch below instead: a variant symbol's combined-
+                        // orientations layer always reports keyframes.length
+                        // > 1, so isStaticLayer is never true for it -- see
+                        // addTrackKey's own "keepDynamic" doc for how that
+                        // branch keeps ITS OWN tracks from being optimized
+                        // away the same way.
                     }
                 } else {
                     anim.addTrackKey(polyPath + ":polygon", "value", startTime, pointsStr, 0.0);
@@ -3685,9 +3724,19 @@ function _processElementNode(elem, parent, ownerRoot, anim, startTime, duration,
                         anim.addTrackKey(polyPath + ":color", "value", startTime, "Color(1, 1, 1, 1)", 0.0);
                         anim.addTrackKey(polyPath + ":visible", "value", startTime, true, 0.0);
                     } else {
-                        anim.addTrackKey(polyPath + ":texture", "value", startTime, texIdStr, 0.0);
+                        // keepDynamic (see addTrackKey's own doc) on :texture/
+                        // :color specifically, only for _isOrientationVariant
+                        // elements (equipment built by buildVariantScenes,
+                        // see _buildOrientationSynthSymbol) -- lets rooms_
+                        // godot4's own CustomizationStore.gd bake a runtime
+                        // player customization into these two tracks later,
+                        // independently per orientation, without ALSO
+                        // protecting every OTHER (purely decorative,
+                        // buildGodotScenes) symbol's own identical-looking
+                        // static tracks from optimizeTracks for no reason.
+                        anim.addTrackKey(polyPath + ":texture", "value", startTime, texIdStr, 0.0, !!elem._isOrientationVariant);
                         anim.addTrackKey(polyPath + ":uv", "value", startTime, uvsStr, 0.0);
-                        anim.addTrackKey(polyPath + ":color", "value", startTime, "Color(1, 1, 1, 1)", 0.0);
+                        anim.addTrackKey(polyPath + ":color", "value", startTime, "Color(1, 1, 1, 1)", 0.0, !!elem._isOrientationVariant);
                         anim.addTrackKey(polyPath + ":visible", "value", startTime, true, 0.0);
                     }
                 }
@@ -3766,10 +3815,14 @@ function _processElementNode(elem, parent, ownerRoot, anim, startTime, duration,
                     strokeNode.properties["width"] = wStr;
                     strokeNode.properties["default_color"] = cStr;
                     strokeNode.properties["visible"] = true;
+                    // NOT also baked as an anim track here -- same reasoning
+                    // as the Polygon2D fill case above (see its own comment).
                 } else {
                     anim.addTrackKey(strokePath + ":points", "value", startTime, ptsStr, 0.0);
                     anim.addTrackKey(strokePath + ":width", "value", startTime, wStr, 0.0);
-                    anim.addTrackKey(strokePath + ":default_color", "value", startTime, cStr, 0.0);
+                    // keepDynamic on :default_color specifically -- see the
+                    // Polygon2D fill case's own identical comment above.
+                    anim.addTrackKey(strokePath + ":default_color", "value", startTime, cStr, 0.0, !!elem._isOrientationVariant);
                     anim.addTrackKey(strokePath + ":visible", "value", startTime, true, 0.0);
                 }
             }
@@ -3941,11 +3994,21 @@ function _processElementNode(elem, parent, ownerRoot, anim, startTime, duration,
 
     if (has_shader) {
         if (!wrapperNode.properties["material"]) {
-            var shader_path = RES_PREFIX + "shaders/flash_color_normal.gdshader";
+            // Hardcoded "res://shaders/...", NOT RES_PREFIX -- these three
+            // shader files now live at the actual Godot PROJECT ROOT (see
+            // buildGodotScenes, which writes them to godotProjectRoot, not
+            // exportDir), not alongside whatever exportDir this symbol
+            // happens to be exported into. RES_PREFIX is exportDir's OWN
+            // res:// path (which may be a subfolder of the project root,
+            // e.g. "res://N/") -- using it here would still be right for a
+            // project exported straight to its own root, but wrong for any
+            // exportDir nested under one, pointing at a "shaders/" folder
+            // that was never created there.
+            var shader_path = "res://shaders/flash_color_normal.gdshader";
             if (elem.blendMode === "add")
-                shader_path = RES_PREFIX + "shaders/flash_color_add.gdshader";
+                shader_path = "res://shaders/flash_color_add.gdshader";
             else if (elem.blendMode === "multiply")
-                shader_path = RES_PREFIX + "shaders/flash_color_mul.gdshader";
+                shader_path = "res://shaders/flash_color_mul.gdshader";
 
             var matId = "mat_" + nextId();
             subResources.push('[sub_resource type="ShaderMaterial" id="' + matId + '"]'
@@ -4963,10 +5026,18 @@ function buildGodotScenes(doc, data, exportDir) {
     var godotProjectRoot = _computeGodotProjectRoot(exportDir);
 
     FLfile.createFolder(exportDir + "symbols/");
-    FLfile.createFolder(exportDir + "shaders/");
-    FLfile.write(exportDir + "shaders/flash_color_normal.gdshader", SHADER_NORMAL);
-    FLfile.write(exportDir + "shaders/flash_color_add.gdshader",    SHADER_ADD);
-    FLfile.write(exportDir + "shaders/flash_color_mul.gdshader",    SHADER_MUL);
+    // godotProjectRoot, NOT exportDir -- these three shader files are
+    // shared, generic, and referenced via a hardcoded "res://shaders/..."
+    // path now (see the shader_path comment further down), so they must
+    // physically live at the actual Godot PROJECT ROOT, not wherever this
+    // particular export happens to be targeting (exportDir can be a
+    // subfolder of the project root, e.g. rooms_godot4's own "N/"). Every
+    // export into the SAME project keeps writing (identical, idempotent)
+    // copies here regardless of which exportDir subfolder triggered it.
+    FLfile.createFolder(godotProjectRoot + "/shaders/");
+    FLfile.write(godotProjectRoot + "/shaders/flash_color_normal.gdshader", SHADER_NORMAL);
+    FLfile.write(godotProjectRoot + "/shaders/flash_color_add.gdshader",    SHADER_ADD);
+    FLfile.write(godotProjectRoot + "/shaders/flash_color_mul.gdshader",    SHADER_MUL);
 
     var symbolMap = _buildSymbolMap(data.library.symbols);
 
