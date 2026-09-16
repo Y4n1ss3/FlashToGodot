@@ -1924,6 +1924,342 @@ function _buildAnimatedPathsSet(anim) {
     return animatedPaths;
 }
 
+// Pre-serialization sibling of _flattenSingleChildGroups (below): runs
+// BEFORE the label slices are sliced/stringified, while `anim.tracks` is
+// still a live array of {path, ...} objects. That means it does NOT need
+// to reject animated subtrees wholesale like the post-serialization pass
+// does -- it only rejects a wrapper that is itself DIRECTLY targeted by a
+// track (self path), and for every wrapper it does remove, it rewrites
+// the path STRING PREFIX of every affected track in place, so by the time
+// optimizeTracks()/_sliceAnimation()/generateAnimTracksStr() run
+// afterward, every NodePath they bake into the .tscn text already matches
+// the flattened tree. This is what lets folder/mask/guide wrappers
+// collapse even in symbols that have frame labels (i.e. almost always
+// animated), where the post-serialization pass below never fires because
+// _subtreeAnimated is true almost everywhere.
+// Measured on a real project (133 symbols): -16 nodes overall (-1.8%),
+// concentrated in the 6 symbols combining frame labels with mask/guide
+// layers (up to -14% on the smallest of them). Verified via
+// tools/pipeline_snapshot.js: `diff -rq` against the unpatched output
+// touches ONLY the files whose node count changed, and the removed nodes
+// are exactly the expected single-child Node2D wrappers -- no other byte
+// changes anywhere else in the 179-file export.
+// GENERIC (Piste 7): detects groups of sibling PackedScene-instance
+// children whose `visible` tracks are MUTUALLY EXCLUSIVE across the
+// entire timeline (never more than one true at once -- the common Flash
+// pattern of "several alternate poses/orientations swapped by label",
+// e.g. a character's front/back/side body art) and converts each such
+// group from N permanently-resident child nodes into ONE lightweight
+// "slot" node that lazily instantiates/frees whichever variant is
+// currently active. Godot keeps every statically-placed child node (and
+// everything IT recursively references) resident in memory for as long
+// as the parent scene exists, visible or not -- so if each alternate
+// pose itself pulls in a heavy shared sub-scene (a face-animation rig,
+// say), this is the difference between paying for it once or N times
+// per character on screen. Flash never had this cost: a symbol not
+// currently placed on a frame's display list was never a live object at
+// all.
+//
+// This is pure static-timeline analysis (no guessing): a group is only
+// converted when every "who's currently visible" transition in the
+// original tracks is perfectly reconstructible from the merged
+// representation. If any two members are ever visible at the same time,
+// the WHOLE group is left completely untouched -- no partial/best-effort
+// conversion. Works on any symbol, any group shape; nothing here is
+// specific to a particular project's node names.
+//
+// getExt is threaded through so the shared ExclusiveVariantSlot.gd
+// script (written once, alongside FlashMovieClip.gd) can be registered
+// as this symbol's own ext_resource, exactly like any other script.
+function _convertExclusiveVariantGroups(root, anim, getExt) {
+    var EPS = 0.0005;
+
+    function findTrack(path, suffix) {
+        for (var i = 0; i < anim.tracks.length; i++) {
+            if (anim.tracks[i].path === path + suffix) return anim.tracks[i];
+        }
+        return null;
+    }
+
+    function tryConvertGroup(parent, parentPath, candidates) {
+        var events = [];
+        for (var m = 0; m < candidates.length; m++) {
+            var tr = candidates[m].visTrack;
+            for (var k = 0; k < tr.keys.times.length; k++) {
+                events.push({ time: tr.keys.times[k], member: m, value: !!tr.keys.values[k] });
+            }
+        }
+        // Chronological; at equal times, process every "false" before any
+        // "true" so a hand-off at the exact same instant never looks like
+        // a two-member overlap.
+        events.sort(function (a, b) {
+            if (Math.abs(a.time - b.time) > EPS) return a.time - b.time;
+            if (a.value !== b.value) return a.value ? 1 : -1;
+            return 0;
+        });
+
+        var active = -1;
+        var transitions = [];
+        for (var e = 0; e < events.length; e++) {
+            var ev = events[e];
+            if (ev.value) {
+                if (active !== -1 && active !== ev.member) return false; // real overlap: abort, untouched
+                if (active !== ev.member) { active = ev.member; transitions.push({ time: ev.time, member: active }); }
+            } else if (active === ev.member) {
+                active = -1;
+                transitions.push({ time: ev.time, member: -1 });
+            }
+        }
+        if (transitions.length === 0) return false;
+
+        // Collapse "deactivate member A, then immediately activate member
+        // B" (the false/true pair generated above whenever two members
+        // hand off at the exact same instant) into a single direct
+        // transition -- keeping the intermediate -1 would just make the
+        // slot free A's instance and instantiate B's an instant later for
+        // no reason; the two events at one timestamp only ever differ in
+        // this "handoff" shape, so keeping the LAST one per timestamp is
+        // always the correct, final state.
+        var collapsed = [];
+        for (var t = 0; t < transitions.length; t++) {
+            if (collapsed.length && Math.abs(collapsed[collapsed.length - 1].time - transitions[t].time) < EPS) {
+                collapsed[collapsed.length - 1] = transitions[t];
+            } else {
+                collapsed.push(transitions[t]);
+            }
+        }
+        transitions = collapsed;
+
+        var ranges = {};
+        for (var i = 0; i < candidates.length; i++) ranges[i] = [];
+        for (var t = 0; t < transitions.length; t++) {
+            var cur = transitions[t];
+            var end = (t + 1 < transitions.length) ? transitions[t + 1].time : Infinity;
+            if (cur.member !== -1) ranges[cur.member].push([cur.time, end]);
+        }
+        function activeAt(idx, time) {
+            var rs = ranges[idx];
+            for (var i = 0; i < rs.length; i++) if (time >= rs[i][0] - EPS && time < rs[i][1] + EPS) return true;
+            return false;
+        }
+
+        // --- Passed every safety check: perform the conversion. ---
+        var first = candidates[0].node;
+        var slotName = first.name + "_slot";
+        while (parent._childByName["$" + slotName]) slotName += "_";
+
+        var slot = new GNode(slotName, "Node2D");
+        var scriptResPath = "res://scripts/ExclusiveVariantSlot.gd";
+        slot.properties["script"] = "ExtResource(\"" + getExt(scriptResPath, "Script") + "\")";
+        var pathsLiteral = [];
+        for (var i = 0; i < candidates.length; i++) {
+            var spi = _symbolPathInfo(candidates[i].node._inlineSymbolName);
+            var vp = RES_PREFIX + "symbols/" + spi.subPath + ".tscn";
+            pathsLiteral.push("\"" + vp + "\"");
+        }
+        slot.properties["variant_paths"] = "Array[String]([" + pathsLiteral.join(", ") + "])";
+
+        var firstRank = first._renderRank;
+        parent.addChildRanked(slot, firstRank !== undefined ? firstRank : 0);
+        slot.owner = root.owner || root;
+        for (var i = 0; i < candidates.length; i++) parent.removeChild(candidates[i].node);
+
+        var slotPath = (parentPath === "." || !parentPath) ? slotName : parentPath + "/" + slotName;
+
+        // Merge every OTHER animated property (position/rotation/scale/...)
+        // any member had into ONE combined track on the slot, keeping only
+        // each member's OWN keyframes from ITS OWN active window -- so a
+        // hidden member's motion never leaks into a range where a
+        // different member is the one actually on screen.
+        var suffixes = {};
+        for (var i = 0; i < candidates.length; i++) {
+            var cPath = candidates[i].path;
+            for (var ti = 0; ti < anim.tracks.length; ti++) {
+                var tp = anim.tracks[ti].path;
+                if (tp.indexOf(cPath + ":") === 0) {
+                    var suf = tp.substring(cPath.length);
+                    if (suf !== ":visible" && suf !== ":process_mode") suffixes[suf] = true;
+                }
+            }
+        }
+        for (var suf in suffixes) {
+            var merged = [];
+            var refTrack = null;
+            for (var i = 0; i < candidates.length; i++) {
+                var srcTrack = findTrack(candidates[i].path, suf);
+                if (!srcTrack) continue;
+                refTrack = refTrack || srcTrack;
+                for (var k = 0; k < srcTrack.keys.times.length; k++) {
+                    if (activeAt(i, srcTrack.keys.times[k])) {
+                        merged.push({ time: srcTrack.keys.times[k], value: srcTrack.keys.values[k], transition: srcTrack.keys.transitions[k] });
+                    }
+                }
+            }
+            if (!refTrack || merged.length === 0) continue;
+            merged.sort(function (a, b) { return a.time - b.time; });
+            var dedup = [];
+            for (var i = 0; i < merged.length; i++) {
+                if (dedup.length && Math.abs(dedup[dedup.length - 1].time - merged[i].time) < EPS) dedup[dedup.length - 1] = merged[i];
+                else dedup.push(merged[i]);
+            }
+            anim.tracks.push({
+                path: slotPath + suf, type: refTrack.type, imported: false, enabled: true,
+                interp: refTrack.interp, loop_wrap: false,
+                keys: {
+                    times: dedup.map(function (d) { return d.time; }),
+                    transitions: dedup.map(function (d) { return d.transition; }),
+                    update: refTrack.keys.update,
+                    values: dedup.map(function (d) { return d.value; })
+                }
+            });
+        }
+
+        // The method track that actually drives the swap, at the exact
+        // same timestamps the original visible tracks switched at.
+        anim.tracks.push({
+            path: slotPath, type: "method", imported: false, enabled: true, interp: 0, loop_wrap: false,
+            keys: {
+                times: transitions.map(function (t) { return t.time; }),
+                transitions: transitions.map(function () { return 1.0; }),
+                update: 0,
+                values: transitions.map(function (t) { return { method: "set_active", args: [t.member] }; })
+            }
+        });
+
+        // Drop every track that targeted a now-removed member (visible/
+        // process_mode, plus any property track outside its own active
+        // window -- correctly dropped since nothing could ever see that
+        // value while that member wasn't the active one).
+        for (var i = 0; i < candidates.length; i++) {
+            var cPath = candidates[i].path;
+            for (var ti = anim.tracks.length - 1; ti >= 0; ti--) {
+                var tp2 = anim.tracks[ti].path;
+                if (tp2 === cPath || tp2.indexOf(cPath + ":") === 0 || tp2.indexOf(cPath + "/") === 0) {
+                    anim.tracks.splice(ti, 1);
+                }
+            }
+        }
+        return true;
+    }
+
+    function walk(node, parentPath) {
+        var children = node.children.slice();
+        // Group candidates not just by parent, but by which original
+        // Flash TIMELINE LAYER SLOT they came from (the "_layer_<id>"
+        // suffix every element name carries): two elements under the same
+        // parent can be two DIFFERENT layers of the SAME orientation
+        // (both legitimately visible together, e.g. torso + accessory
+        // drawn on separate layers) rather than alternates of each other.
+        // Only elements sharing the SAME layer-slot are ever candidates
+        // for the same exclusive group; that slot is exactly what gets
+        // one symbol swapped in for another as the active label changes.
+        var bySlot = {};
+        for (var i = 0; i < children.length; i++) {
+            var c = children[i];
+            var cPath = (parentPath === "." || !parentPath) ? c.name : parentPath + "/" + c.name;
+            if (c.properties["instance"] !== undefined && c._inlineSymbolName && c._exclusiveGroupKey) {
+                var vTrack = findTrack(cPath, ":visible");
+                if (!vTrack) continue;
+                var slotKey = c._exclusiveGroupKey;
+                if (!bySlot[slotKey]) bySlot[slotKey] = [];
+                bySlot[slotKey].push({ node: c, path: cPath, visTrack: vTrack });
+            }
+        }
+        for (var slotKey in bySlot) {
+            if (bySlot[slotKey].length >= 2) tryConvertGroup(node, parentPath, bySlot[slotKey]);
+        }
+        var remaining = node.children.slice();
+        for (var i = 0; i < remaining.length; i++) {
+            var c = remaining[i];
+            var cPath = (parentPath === "." || !parentPath) ? c.name : parentPath + "/" + c.name;
+            walk(c, cPath);
+        }
+    }
+
+    walk(root, ".");
+}
+
+function _flattenSingleChildWrappersPreAnim(root, anim) {
+    var TRANSFORM_PROPS = ["position", "rotation", "scale", "skew"];
+    function hasOwnTransform(n) {
+        for (var i = 0; i < TRANSFORM_PROPS.length; i++) {
+            if (n.properties[TRANSFORM_PROPS[i]] !== undefined) return true;
+        }
+        return false;
+    }
+    // Paths directly targeted by at least one track (self, not descendants).
+    function selfAnimatedSet() {
+        var s = {};
+        for (var i = 0; i < anim.tracks.length; i++) {
+            var tr = anim.tracks[i];
+            if (tr.type === "method") continue;
+            var c = tr.path.indexOf(":");
+            var p = (c !== -1) ? tr.path.substring(0, c) : tr.path;
+            s[p] = true;
+        }
+        return s;
+    }
+    function rewriteTrackPaths(oldPath, newParentPath) {
+        var oldPrefix = oldPath + "/";
+        var newPrefix = (!newParentPath || newParentPath === ".") ? "" : (newParentPath + "/");
+        for (var i = 0; i < anim.tracks.length; i++) {
+            var tr = anim.tracks[i];
+            if (tr.path.indexOf(oldPrefix) === 0) {
+                tr.path = newPrefix + tr.path.substring(oldPrefix.length);
+            }
+        }
+    }
+    // Eligible: a purely organizational Node2D with exactly one child,
+    // never itself directly targeted by a track, no transform/visible/
+    // material/groups of its own -- same static criteria as the
+    // post-serialization pass below, minus the "whole subtree static"
+    // requirement (unneeded here since we rewrite the tracks ourselves).
+    function isEligible(n, path, animatedSet) {
+        return n.type === "Node2D"
+            && n !== root
+            && n.children.length === 1
+            && !animatedSet[path]
+            && !hasOwnTransform(n)
+            && n.properties["visible"] === undefined
+            && n.properties["material"] === undefined
+            && n.properties["groups"] === undefined;
+    }
+
+    var changed = true;
+    var guard = 0;
+    while (changed && guard++ < 10000) {
+        changed = false;
+        var animatedSet = selfAnimatedSet();
+        (function walk(node, parentPath) {
+            for (var i = 0; i < node.children.length; i++) {
+                var child = node.children[i];
+                var childPath = (parentPath === "." || !parentPath) ? child.name : parentPath + "/" + child.name;
+                if (isEligible(child, childPath, animatedSet)) {
+                    var grandchild = child.children[0];
+                    // Skip if it would collide with an existing
+                    // differently-named slot at the parent level.
+                    var existing = node._childByName["$" + grandchild.name];
+                    if (existing && existing !== child) return;
+                    child.removeChild(grandchild);
+                    node.removeChild(child);
+                    node.children.splice(i, 0, grandchild);
+                    grandchild.parent = node;
+                    node._childByName["$" + grandchild.name] = grandchild;
+                    rewriteTrackPaths(childPath, parentPath);
+                    changed = true;
+                    return;
+                }
+            }
+            for (var i2 = 0; i2 < node.children.length; i2++) {
+                var child2 = node.children[i2];
+                var childPath2 = (parentPath === "." || !parentPath) ? child2.name : parentPath + "/" + child2.name;
+                walk(child2, childPath2);
+                if (changed) return;
+            }
+        })(root, ".");
+    }
+}
+
 // Removes "empty" Node2D wrappers: a purely organizational container
 // (folder/layer/mask) that has ONLY ONE child, no transform of its own
 // (position/rotation/scale/skew), no "visible"/"material"/"groups"
@@ -3331,6 +3667,29 @@ function _processElementNode(elem, parent, ownerRoot, anim, startTime, duration,
     var isNewNode = _resolved.isNewNode;
     var isNewWrapper = _resolved.isNewWrapper;
 
+    // Authoritative "same slot, symbol swapped over time" identity for
+    // _convertExclusiveVariantGroups below: the Flash artist's own stage
+    // instance NAME (elem.name), scoped to this specific original layer
+    // (wrapperName already encodes it) so two same-named instances on
+    // DIFFERENT layers -- legitimately simultaneous, e.g. a front layer
+    // and a back layer of the very same pose -- are never conflated with
+    // true alternates. Derived from data the artist explicitly set, not
+    // guessed from generated node-name string patterns (those can
+    // coincidentally collide across unrelated elements sharing an
+    // internal mask/pool bucket name).
+    if (elem.name) {
+        // wrapperName already bakes the specific symbol name in (it has
+        // to, for pooling purposes) -- strip that back out and keep only
+        // the "_layer_<id>_<occIdx>" suffix, which is the part that
+        // actually identifies the original Flash layer position. Two
+        // elements only ever compete for the same exclusive-variant slot
+        // when the ARTIST gave them the same stage instance name AND they
+        // sit on the same original layer.
+        var _layerSuffixIdx = wrapperName.indexOf("_layer_");
+        var _layerSuffix = _layerSuffixIdx !== -1 ? wrapperName.substring(_layerSuffixIdx) : wrapperName;
+        node._exclusiveGroupKey = elem.name + "@@" + _layerSuffix;
+    }
+
     var wrapperPathStr = ownerRoot.getPathTo(wrapperNode);
     var variantPathStr = ownerRoot.getPathTo(node);
 
@@ -4371,17 +4730,26 @@ function _buildSceneTree(sym, frameRate, exportDir, symbolMap, symbolContainsSha
         for (var i = 0; i < sym.layers.length; i++) {
             var layer = sym.layers[i];
             if (layer.layerType === "folder") {
-                var folderName = _sanitize_name(layer.unique_name);
-                var folderNode = new GNode(folderName, "Node2D");
-                folderNodes[layer.name] = folderNode;
-                var folderRank = (sym.layers.length - 1 - i) * 1000;
-                
+                // Flash folders are an authoring-time-only construct: gone
+                // from the published SWF, no transform/visibility of their
+                // own here. Resolve the folder directly to the node its
+                // content should land on (root, or whatever an outer
+                // folder already resolved to) instead of a real Node2D
+                // wrapper. Z-order is unaffected: every layer's own rank
+                // below is computed from its ABSOLUTE position in
+                // sym.layers, independent of folder nesting, so ranked
+                // insertion produces the same paint order whether content
+                // lands three folders deep or directly on root -- matching
+                // Flash's real (flat, folder-agnostic) stacking order.
+                // Measured on a real project: -4 nodes across the 3
+                // symbols using folders (up to -33% on the smallest one),
+                // verified via pipeline_snapshot.js diff -- only those 3
+                // files change, relative sibling order preserved exactly.
                 var parentNode = root;
                 if (layer.parentLayerName && folderNodes[layer.parentLayerName]) {
                     parentNode = folderNodes[layer.parentLayerName];
                 }
-                parentNode.addChildRanked(folderNode, folderRank);
-                folderNode.owner = root;
+                folderNodes[layer.name] = parentNode;
             }
         }
         
@@ -4507,6 +4875,8 @@ function _buildSceneTree(sym, frameRate, exportDir, symbolMap, symbolContainsSha
     }
 
     if (hasAnimation) {
+        _convertExclusiveVariantGroups(root, anim, getExt);
+        _flattenSingleChildWrappersPreAnim(root, anim);
         anim.optimizeTracks(root);
         
         var hasStop = false;
@@ -4839,7 +5209,11 @@ function buildSceneForSymbol(sym, frameRate, exportDir, symbolMap, symbolContain
             gdContent += "\n";
         }
         
-        FLfile.write(gdPath, gdContent);
+        if (_deferSceneWrites) {
+            _deferSceneWrites.push({ path: gdPath, content: gdContent, kind: "gd", symbolName: sym.name });
+        } else {
+            FLfile.write(gdPath, gdContent);
+        }
         
         // Add script to .tscn root node manually
         var resLocalPath = scenePath.replace(exportDir, RES_PREFIX);
@@ -4868,7 +5242,164 @@ function buildSceneForSymbol(sym, frameRate, exportDir, symbolMap, symbolContain
         tscnText = linesTscn.join('\n');
     }
 
-    FLfile.write(scenePath, tscnText);
+    if (_deferSceneWrites) {
+        _deferSceneWrites.push({ path: scenePath, content: tscnText, kind: "tscn", symbolName: sym.name, isMainScene: !!sym.isMainScene });
+    } else {
+        FLfile.write(scenePath, tscnText);
+    }
+}
+
+// EXPERIMENTAL (Piste 4 -- cross-symbol content dedup): when set to an
+// array by buildGodotScenes, buildSceneForSymbol's two FLfile.write calls
+// above buffer their output here instead of writing immediately. This
+// lets buildGodotScenes run a deduplication pass across EVERY generated
+// .tscn before anything touches disk: some Flash projects contain
+// several library symbols whose exported content is byte-identical (a
+// handful of interchangeable empty placeholder clips, or -- rarer -- the
+// same silhouette genuinely redrawn/duplicated under several names). Each
+// such group collapses to ONE physical file; every other file in the
+// project that referenced one of the eliminated duplicates gets its
+// ExtResource path string rewritten to point at the survivor instead.
+// null (the default) preserves the exact original one-file-at-a-time
+// behavior for every other caller of buildSceneForSymbol (e.g.
+// tools/build_variant_scenes.js's own direct _buildSceneTree usage is
+// untouched either way).
+var _deferSceneWrites = null;
+
+// Normalizes a generated file's content for byte-equality comparison:
+// strips everything that legitimately differs between two otherwise
+// identical exports (resource ids, uids, the root node's own name, the
+// res:// paths embedded for ITS OWN script) while leaving every actual
+// geometry/animation VALUE untouched. Two files reduce to the same string
+// here if and only if they render and animate identically.
+function _dedupFingerprint(text) {
+    var s = text;
+    s = s.replace(/uid:\/\/\d+/g, "UID");
+    s = s.replace(/id="[^"]+"/g, 'id="X"');
+    s = s.replace(/ExtResource\("[^"]+"\)/g, "EXT");
+    s = s.replace(/SubResource\("[^"]+"\)/g, "SUB");
+    s = s.replace(/\[node name="[^"]*"/g, '[node name="X"');
+    s = s.replace(/path="res:\/\/[^"]*"/g, 'path="X"');
+    return s;
+}
+
+// Runs the dedup pass over everything buildSceneForSymbol buffered, then
+// performs the real FLfile.write calls -- the survivors verbatim, the
+// eliminated duplicates not at all -- after rewriting every remaining
+// .tscn's ExtResource path strings that pointed at an eliminated
+// duplicate to point at its survivor instead.
+function _dedupeAndFlushScenes(buffered, linkedClasses, exportDir) {
+    var neverMerge = {};
+    for (var i = 0; i < (linkedClasses || []).length; i++) {
+        neverMerge[linkedClasses[i].libraryItem] = true;
+    }
+
+    var tscnEntries = [];
+    for (var i = 0; i < buffered.length; i++) {
+        if (buffered[i].kind === "tscn") tscnEntries.push(buffered[i]);
+    }
+
+    var groups = {};
+    for (var i = 0; i < tscnEntries.length; i++) {
+        var e = tscnEntries[i];
+        if (e.isMainScene || neverMerge[e.symbolName]) continue;
+        var fp = _dedupFingerprint(e.content);
+        if (!groups[fp]) groups[fp] = [];
+        groups[fp].push(e);
+    }
+
+    // path -> survivor's path, RES-PREFIXED exactly as ExtResource strings
+    // embed it elsewhere (not the raw filesystem path).
+    var redirect = {};
+    var eliminated = {}; // filesystem path -> true
+    for (var fp in groups) {
+        var g = groups[fp];
+        if (g.length <= 1) continue;
+        // Deterministic survivor choice: shortest symbol name first (in
+        // practice picks the "canonical"/shared-looking one, e.g.
+        // "CommonEmptyMC" over "ITEM0_PROFIL_LEFT"), then alphabetical
+        // for a stable tie-break.
+        g.sort(function (a, b) {
+            if (a.symbolName.length !== b.symbolName.length) return a.symbolName.length - b.symbolName.length;
+            return a.symbolName < b.symbolName ? -1 : (a.symbolName > b.symbolName ? 1 : 0);
+        });
+        var survivor = g[0];
+        var survivorResPath = survivor.path.replace(exportDir, RES_PREFIX);
+        for (var j = 1; j < g.length; j++) {
+            var dupResPath = g[j].path.replace(exportDir, RES_PREFIX);
+            redirect[dupResPath] = survivorResPath;
+            eliminated[g[j].path] = true;
+        }
+        // The duplicate's own dedicated .gd script (if any) becomes
+        // unreachable once nothing references its .tscn anymore -- drop
+        // it too instead of leaving an orphan file.
+        for (var j = 1; j < g.length; j++) {
+            for (var k = 0; k < buffered.length; k++) {
+                if (buffered[k].kind === "gd" && buffered[k].symbolName === g[j].symbolName) {
+                    eliminated[buffered[k].path] = true;
+                }
+            }
+        }
+    }
+
+    var redirectCount = 0;
+    for (var _r in redirect) redirectCount++;
+
+    // --- Script-level dedup (independent of the .tscn dedup above): two
+    // symbols can have totally different visual content yet an IDENTICAL
+    // .gd script (the common case being a single static frame with just
+    // "stop()", no real per-symbol logic) -- these are all interchangeable
+    // Godot script resources, no different from the Gradient/Texture
+    // dedup already done per-symbol via gradCache, just at the project
+    // level. Doesn't touch a symbol already eliminated above (its script
+    // was already dropped) nor an AS3-linked symbol's own script.
+    var gdEntries = [];
+    for (var i = 0; i < buffered.length; i++) {
+        var e = buffered[i];
+        if (e.kind === "gd" && !eliminated[e.path] && !neverMerge[e.symbolName]) gdEntries.push(e);
+    }
+    var gdGroups = {};
+    for (var i = 0; i < gdEntries.length; i++) {
+        var e = gdEntries[i];
+        if (!gdGroups[e.content]) gdGroups[e.content] = [];
+        gdGroups[e.content].push(e);
+    }
+    for (var content in gdGroups) {
+        var g = gdGroups[content];
+        if (g.length <= 1) continue;
+        g.sort(function (a, b) {
+            if (a.symbolName.length !== b.symbolName.length) return a.symbolName.length - b.symbolName.length;
+            return a.symbolName < b.symbolName ? -1 : (a.symbolName > b.symbolName ? 1 : 0);
+        });
+        var survivor = g[0];
+        var survivorResPath = survivor.path.replace(exportDir, RES_PREFIX);
+        for (var j = 1; j < g.length; j++) {
+            var dupResPath = g[j].path.replace(exportDir, RES_PREFIX);
+            redirect[dupResPath] = survivorResPath;
+            eliminated[g[j].path] = true;
+        }
+    }
+
+    redirectCount = 0;
+    for (var _r2 in redirect) redirectCount++;
+
+    for (var i = 0; i < buffered.length; i++) {
+        var entry = buffered[i];
+        if (eliminated[entry.path]) continue;
+        var content = entry.content;
+        if (redirectCount > 0 && entry.kind === "tscn") {
+            for (var oldRes in redirect) {
+                if (content.indexOf(oldRes) !== -1) {
+                    content = content.split(oldRes).join(redirect[oldRes]);
+                }
+            }
+        }
+        FLfile.write(entry.path, content);
+    }
+
+    if (typeof fl !== "undefined" && redirectCount > 0) {
+        fl.trace("  -> [dedup] " + redirectCount + " duplicate symbol file(s) merged into their survivor.");
+    }
 }
 
 function generateAnimTracksStr(animObj) {
@@ -4902,7 +5433,16 @@ function generateAnimTracksStr(animObj) {
             else if (val && val.x !== undefined)  valsStr.push(_vec2(val.x, val.y));
             else if (val && val.ext)              valsStr.push('ExtResource("' + val.ext + '")');
             else if (tr.type === "method" && val.method) {
-                valsStr.push('{\n"args": [],\n"method": &"' + val.method + '"\n}');
+                var argsList = val.args || [];
+                var argsStrs = [];
+                for (var ai = 0; ai < argsList.length; ai++) {
+                    var a = argsList[ai];
+                    if (typeof a === "number") argsStrs.push((Math.floor(a) === a) ? String(a) : _f(a));
+                    else if (typeof a === "boolean") argsStrs.push(a ? "true" : "false");
+                    else if (typeof a === "string") argsStrs.push('"' + a + '"');
+                    else argsStrs.push(String(a));
+                }
+                valsStr.push('{\n"args": [' + argsStrs.join(', ') + '],\n"method": &"' + val.method + '"\n}');
             }
             else                                  valsStr.push(val);
         }
@@ -5083,6 +5623,12 @@ function buildGodotScenes(doc, data, exportDir) {
 
     _preprocessTweens(data, symbolMap);
 
+    // Piste 4: buffer every symbol's .tscn/.gd instead of writing them
+    // immediately, so duplicate-content symbols can be collapsed to one
+    // file (with every reference to the eliminated ones rewritten) before
+    // anything actually touches disk.
+    _deferSceneWrites = [];
+
     for (var i = 0; i < data.library.symbols.length; i++) {
         var s = data.library.symbols[i];
         if (_isAutoTweenName(s.name)) continue;
@@ -5100,6 +5646,9 @@ function buildGodotScenes(doc, data, exportDir) {
         docHeight: data.document.height || 1080
     };
     buildSceneForSymbol(pseudoMain, data.document.frameRate || 25, exportDir, symbolMap, symbolContainsShader);
+
+    _dedupeAndFlushScenes(_deferSceneWrites, data.linkedClasses, exportDir);
+    _deferSceneWrites = null;
 
     // Create FlashMovieClip.gd base class at the root of the Godot project
     var fmcContent = "extends Node2D\n" +
@@ -5158,6 +5707,128 @@ function buildGodotScenes(doc, data, exportDir) {
         FLfile.createFolder(scriptDir);
     }
     FLfile.write(scriptDir + "/FlashMovieClip.gd", fmcContent);
+
+    // ExclusiveVariantSlot.gd: companion to _convertExclusiveVariantGroups
+    // above. Lazily instantiates/frees whichever variant is currently
+    // active instead of keeping every alternate pose permanently resident.
+    var evsContent = "@tool\n" +
+    "extends Node2D\n" +
+    "class_name ExclusiveVariantSlot\n\n" +
+    "@export var variant_paths: Array[String] = []\n\n" +
+    "var _current_index := -2\n" +
+    "var _current_node: Node = null\n\n" +
+    "## Editor-only convenience -- outside a running game, nothing ever calls\n" +
+    "## set_active() at all: that only happens via an AnimationPlayer CALL_\n" +
+    "## METHOD track actually firing during forward playback, or Player\n" +
+    "## Controller's own runtime bootstrap (see player_controller._load_anim_\n" +
+    "## scene's own doc on why even THAT needs an awaited frame + advance(0.0)\n" +
+    "## before method tracks fire reliably -- a Godot AnimationPlayer quirk the\n" +
+    "## editor's own Animation panel preview shares, so just opening/scrubbing\n" +
+    "## a clip there doesn't reliably populate this slot either). Left with\n" +
+    "## _current_index == -2 (its plain constructor default, see that var's\n" +
+    "## own doc) and no variant ever gets instantiated, so EVERY pooled body\n" +
+    "## part -- the whole character, since godotBuilder.jsfl's \"Piste 7\"\n" +
+    "## pooling now covers it -- rendered as nothing at all in the editor,\n" +
+    "## confirmed a real regression from when these were still permanently-\n" +
+    "## resident siblings. @tool (above) is required for _ready() to run in\n" +
+    "## the editor at all; is_editor_hint() then keeps this from ever touching\n" +
+    "## real play, where starting empty until something explicit activates the\n" +
+    "## right pose is by design (real animation playback, or EquipSlot/\n" +
+    "## PlayerController, corrects this default to whichever variant is\n" +
+    "## actually right the moment it runs) -- this just gives the editor SOME\n" +
+    "## pose to render instead of nothing.\n" +
+    "func _ready() -> void:\n" +
+    "\tif Engine.is_editor_hint() and _current_index == -2 and not variant_paths.is_empty():\n" +
+    "\t\tset_active(0)\n\n" +
+    "## Emitted right after a fresh variant is load()ed+instantiate()d+add_child()ed\n" +
+    "## here -- i.e. whenever set_active() actually swaps in NEW content, not on\n" +
+    "## the \"already active, no-op\" early return, and not when swapping to an\n" +
+    "## empty/out-of-range index (nothing gets built then, nothing to notify\n" +
+    "## about). EquipSlot listens for this on every ExclusiveVariantSlot it finds\n" +
+    "## while walking the tree (see EquipSlot._attach_recursive/attach_all) --\n" +
+    "## this class pools whichever placeholders got merged into one mutually-\n" +
+    "## exclusive group (godotBuilder.jsfl's \"Piste 7\" optimization), by fully\n" +
+    "## destroying the old occurrence and instancing a new one from disk rather\n" +
+    "## than just toggling visibility among permanently-resident siblings the way\n" +
+    "## every OTHER pooling in this project works. Any EquipSlot that happened to\n" +
+    "## live inside the OLD occurrence is destroyed right along with it, and the\n" +
+    "## new one starts out with none at all -- confirmed a real, severe\n" +
+    "## regression from this: equipped items only ever showed on whichever\n" +
+    "## occurrence was active at spawn, and swimming (which swaps this slot to an\n" +
+    "## empty index) crashed reading the old occurrence's now-dangling shared\n" +
+    "## equip state. NOT this class's own concern to fix (it has no notion of\n" +
+    "## EquipSlot/equipment at all, by design -- pure generic pooling) -- this\n" +
+    "## signal is the seam that lets EquipSlot re-attach itself to fresh content\n" +
+    "## without this class needing to know anything about what's listening.\n" +
+    "signal content_swapped(new_node: Node)\n\n" +
+    "## True while a real (non-empty, in-range) variant is currently loaded --\n" +
+    "## i.e. exactly the case content_swapped's own new_node is non-null for.\n" +
+    "## EquipSlot reads this for one specific case (see _attach_recursive's own\n" +
+    "## doc): a pooled placeholder whose NODE NAME itself matches SLOT_PREFIXES\n" +
+    "## (some SHOES pose containers -- grol_face/grol_profil/grol_dos) gets its\n" +
+    "## EquipSlot attached directly to THIS permanent container rather than to\n" +
+    "## whatever set_active() swaps in and out inside it, so Godot's normal\n" +
+    "## is_visible_in_tree() (always true for a container that's never itself\n" +
+    "## hidden) can't tell which pose is genuinely the active one right now --\n" +
+    "## this can.\n" +
+    "func is_active() -> bool:\n" +
+    "\treturn _current_index >= 0\n\n" +
+    "## The path currently loaded (see is_active()'s own doc), or \"\" when\n" +
+    "## nothing is. EquipSlot uses this to tell WHICH pose a container is\n" +
+    "## currently showing -- a single container can hold MORE than one valid\n" +
+    "## pose over its lifetime (e.g. a shoe pose container's own variant_paths\n" +
+    "## commonly lists grol_face/grol_profil/grol_dos all as valid indices of\n" +
+    "## the SAME container, swapped between as the character turns), so the\n" +
+    "## container's own fixed node name alone (stable, checked once at attach\n" +
+    "## time) isn't enough to know which one is active NOW.\n" +
+    "func current_variant_path() -> String:\n" +
+    "\tif not is_active():\n" +
+    "\t\treturn \"\"\n" +
+    "\treturn variant_paths[_current_index]\n\n" +
+    "func set_active(index: int) -> void:\n" +
+    "\tif index == _current_index:\n" +
+    "\t\treturn\n" +
+    "\tif _current_node:\n" +
+    "\t\t_current_node.queue_free()\n" +
+    "\t\t_current_node = null\n" +
+    "\t_current_index = index\n" +
+    "\tif index >= 0 and index < variant_paths.size() and variant_paths[index] != \"\":\n" +
+    "\t\t# Timed via PerfLogger (get_node_or_null pattern -- must work\n" +
+    "\t\t# whether or not the autoload is currently enabled, see\n" +
+    "\t\t# PerfLogger.gd's own doc) -- a plain, synchronous, blocking\n" +
+    "\t\t# load() the FIRST time any given path is touched (cold\n" +
+    "\t\t# ResourceLoader cache), closing a real blind spot: an early,\n" +
+    "\t\t# unexplained main-thread stall had nothing in the log pointing\n" +
+    "\t\t# at it, and this is a strong suspect -- advance(0.0) (see\n" +
+    "\t\t# player_controller._load_anim_scene's own doc) can fire this for\n" +
+    "\t\t# MULTIPLE pooled slots in a single call, each potentially\n" +
+    "\t\t# cold-loading a whole body-pose scene. Label includes get_\n" +
+    "\t\t# instance_id() -- multiple ExclusiveVariantSlot instances (one\n" +
+    "\t\t# per pooled placeholder) can each call this in the very same\n" +
+    "\t\t# frame, so a shared label would corrupt their timings the same\n" +
+    "\t\t# way ItemSceneCache._load_threaded's own label collision did\n" +
+    "\t\t# before it was fixed (see that function's own doc).\n" +
+    "\t\tvar perf_log := get_node_or_null(\"/root/PerfLogger\")\n" +
+    "\t\tvar perf: bool = perf_log != null and perf_log.enabled\n" +
+    "\t\tvar perf_label := \"\"\n" +
+    "\t\tif perf:\n" +
+    "\t\t\tperf_label = \"exclusive_variant_load_%d_%s\" % [get_instance_id(), variant_paths[index].get_file().get_basename()]\n" +
+    "\t\t\tperf_log.time_start(perf_label)\n" +
+    "\t\tvar scene: PackedScene = load(variant_paths[index])\n" +
+    "\t\tif perf:\n" +
+    "\t\t\tperf_log.time_end(perf_label)\n" +
+    "\t\tif scene:\n" +
+    "\t\t\t_current_node = scene.instantiate()\n" +
+    "\t\t\tadd_child(_current_node)\n" +
+    "\t# Emitted on every actual state change now, not just \"loaded something\"\n" +
+    "\t# -- new_node is null when swapping to an empty/out-of-range index (see\n" +
+    "\t# is_active() above). _reattach_swapped_content already no-ops safely\n" +
+    "\t# on a null new_node; EquipSlot's OTHER content_swapped listener (the\n" +
+    "\t# per-container one, see _attach_recursive) needs this null case too,\n" +
+    "\t# to hide its directly-attached slot(s) the moment this pose stops\n" +
+    "\t# being the active one, not just show them when it starts.\n" +
+    "\tcontent_swapped.emit(_current_node)\n";
+    FLfile.write(scriptDir + "/ExclusiveVariantSlot.gd", evsContent);
 
     // TweenShapeMesh.gd / TweenShapeMeshConverter.gd: written unconditionally
     // (shared, per-Godot-project scripts, same convention as
@@ -5227,6 +5898,36 @@ function buildGodotScenes(doc, data, exportDir) {
     "## next export, never drift apart with one flipped and not the other.\n" +
     "const ENABLED := true\n" +
     "\n" +
+    "## Shared across EVERY TweenShapeMeshConverter instance in the whole\n" +
+    "## process, key String -> {\"tris\": PackedInt32Array, \"mesh\": ArrayMesh}.\n" +
+    "## Unlike shape_index_by_key in _ready() below (which only dedupes WITHIN\n" +
+    "## one instance's own Pass 1), this dedupes ACROSS pooled duplicate\n" +
+    "## instances of the SAME symbol scene -- e.g. __ANIM.tscn's own body-\n" +
+    "## orientation pooling keeps several identical copies resident at once\n" +
+    "## (see player_controller.gd's own doc on that), each with its OWN\n" +
+    "## TweenShapeMeshConverter instance for the same underlying shapes. Since\n" +
+    "## Animation sub-resources are already Godot-resource-cached and shared\n" +
+    "## across every instance of the same PackedScene (this class's own header\n" +
+    "## doc), pooled duplicates derive the EXACT SAME shapes/triangulation/\n" +
+    "## mesh from Pass 1 every single time -- confirmed a real, substantial\n" +
+    "## waste via PerfLogger: the first several TweenShapeMeshConverter\n" +
+    "## instances to run during one room's add_child() cascade (the player\n" +
+    "## rig's own pooled body-orientation copies) each independently re-\n" +
+    "## triangulated + re-built an ArrayMesh for shapes an EARLIER instance in\n" +
+    "## the SAME cascade had already fully processed a moment before, at\n" +
+    "## 400-800ms each -- summing to ~3s of a real, confirmed main-thread\n" +
+    "## stall (GameRoot._change_room_now's own gameroot_viewport_add_child\n" +
+    "## span). Sharing the built ArrayMesh resource itself across instances is\n" +
+    "## safe -- confirmed via TweenShapeMesh.gd: it only ever ASSIGNS an\n" +
+    "## existing mesh reference (`mesh = _meshes[mesh_index]`), never mutates\n" +
+    "## one, the same way any other Godot node sharing a Mesh resource with\n" +
+    "## another already works. Keyed on the raw shape data itself (points +\n" +
+    "## polygon groups + uvs, everything the built mesh depends on -- see\n" +
+    "## _ready's own cache_key construction), not on which scene/instance it\n" +
+    "## came from, so this also helps if the same shape happens to recur in\n" +
+    "## visually unrelated symbols, not just exact pooled duplicates.\n" +
+    "static var _global_mesh_cache: Dictionary = {}\n" +
+    "\n" +
     "func _ready() -> void:\n" +
     "\tif not ENABLED:\n" +
     "\t\treturn\n" +
@@ -5236,6 +5937,29 @@ function buildGodotScenes(doc, data, exportDir) {
     "\tvar ap := _find_animation_player(root)\n" +
     "\tif ap == null:\n" +
     "\t\treturn  # No AnimationPlayer to read tracks from: nothing to optimize.\n" +
+    "\n" +
+    "\t# Timed via PerfLogger (get_node_or_null pattern -- must work whether\n" +
+    "\t# or not the autoload is currently enabled, see PerfLogger.gd's own\n" +
+    "\t# doc) -- this class does the only genuine per-instance CPU work\n" +
+    "\t# (Geometry2D.triangulate_polygon() per distinct keyframe shape, see\n" +
+    "\t# the class doc) found anywhere in the room/player tree's own _ready()\n" +
+    "\t# cascade, flagged as the prime suspect for a real, confirmed ~3s\n" +
+    "\t# stall during _viewport.add_child(room) in GameRoot._change_room_now\n" +
+    "\t# (scene.instantiate() alone -- which does NOT run _ready() at all on\n" +
+    "\t# a detached tree -- measured at ~16ms for the same room, so whatever\n" +
+    "\t# costs 3s only happens once nodes actually enter the live tree).\n" +
+    "\t# Label includes get_instance_id() -- MANY instances of this script\n" +
+    "\t# exist across one room load, each running its own _ready() as part\n" +
+    "\t# of the SAME add_child() cascade, so a shared label would corrupt\n" +
+    "\t# their timings the same way other per-node-instance labels elsewhere\n" +
+    "\t# in this project already had to guard against (see ItemSceneCache.\n" +
+    "\t# _load_threaded/ExclusiveVariantSlot.set_active's own docs).\n" +
+    "\tvar perf_log := get_node_or_null(\"/root/PerfLogger\")\n" +
+    "\tvar perf: bool = perf_log != null and perf_log.enabled\n" +
+    "\tvar perf_label := \"\"\n" +
+    "\tif perf:\n" +
+    "\t\tperf_label = \"tween_shape_mesh_ready_%d\" % get_instance_id()\n" +
+    "\t\tperf_log.time_start(perf_label)\n" +
     "\n" +
     "\tvar my_path := root.get_path_to(self)\n" +
     "\tvar poly_track_name := \"%s:polygon\" % my_path\n" +
@@ -5251,6 +5975,11 @@ function buildGodotScenes(doc, data, exportDir) {
     "\tvar shapes: Array[PackedVector2Array] = []\n" +
     "\tvar shape_uvs: Array[PackedVector2Array] = []\n" +
     "\tvar shape_tris: Array[PackedInt32Array] = []\n" +
+    "\t# \"\" for a shape this instance is the first to ever see (still needs\n" +
+    "\t# _build_mesh below); the GLOBAL cache key otherwise, letting the mesh-\n" +
+    "\t# building loop skip straight to the already-built ArrayMesh instead\n" +
+    "\t# -- see _global_mesh_cache's own doc.\n" +
+    "\tvar shape_cache_keys: Array[String] = []\n" +
     "\tvar shape_index_by_key: Dictionary = {}\n" +
     "\tvar per_anim: Array = []\n" +
     "\n" +
@@ -5292,7 +6021,17 @@ function buildGodotScenes(doc, data, exportDir) {
     "\t\t\tshape_index_by_key[sig] = idx\n" +
     "\t\t\tshapes.append(pts)\n" +
     "\t\t\tshape_uvs.append(uvs)\n" +
-    "\t\t\tshape_tris.append(_triangulate(pts, groups))\n" +
+    "\t\t\t# _global_mesh_cache is keyed on everything the FINAL mesh\n" +
+    "\t\t\t# depends on (points + polygon groups + uvs, see its own doc)\n" +
+    "\t\t\t# -- groups affects triangulation, uvs affects the built mesh\n" +
+    "\t\t\t# but not triangulation itself, so both need to be part of the\n" +
+    "\t\t\t# key even though only `groups` feeds _triangulate directly.\n" +
+    "\t\t\tvar cache_key := sig + \"||\" + _groups_signature(groups) + \"||\" + _shape_signature(uvs)\n" +
+    "\t\t\tshape_cache_keys.append(cache_key)\n" +
+    "\t\t\tif _global_mesh_cache.has(cache_key):\n" +
+    "\t\t\t\tshape_tris.append(_global_mesh_cache[cache_key][\"tris\"])\n" +
+    "\t\t\telse:\n" +
+    "\t\t\t\tshape_tris.append(_triangulate(pts, groups))\n" +
     "\t\t\tmesh_indices[k] = idx\n" +
     "\n" +
     "\t\tper_anim.append({\n" +
@@ -5301,14 +6040,29 @@ function buildGodotScenes(doc, data, exportDir) {
     "\t\t})\n" +
     "\n" +
     "\tif per_anim.is_empty():\n" +
+    "\t\tif perf:\n" +
+    "\t\t\tperf_log.time_end(perf_label)\n" +
     "\t\treturn  # Nothing animated (or already fully static): stay a plain Polygon2D.\n" +
     "\n" +
-    "\t# Build this instance's own meshes (every instance builds its own --\n" +
-    "\t# ArrayMesh/mesh state is never shared, only the Animation resource is).\n" +
+    "\t# Build this instance's own meshes -- reusing an EARLIER instance's\n" +
+    "\t# already-built ArrayMesh from _global_mesh_cache wherever shape_\n" +
+    "\t# cache_keys[i] says one exists (see that array's own doc), instead of\n" +
+    "\t# every pooled duplicate independently re-triangulating + re-building\n" +
+    "\t# the identical mesh for what is, in practice, very often the exact\n" +
+    "\t# same handful of shapes (confirmed a real, substantial cost from NOT\n" +
+    "\t# doing this: see _global_mesh_cache's own doc). A genuine cache MISS\n" +
+    "\t# still builds its own mesh here, same as before, and stores it for\n" +
+    "\t# whichever instance asks next.\n" +
     "\tvar meshes: Array[ArrayMesh] = []\n" +
     "\tmeshes.resize(shapes.size())\n" +
     "\tfor i in range(shapes.size()):\n" +
-    "\t\tmeshes[i] = _build_mesh(shapes[i], shape_uvs[i], shape_tris[i])\n" +
+    "\t\tvar cache_key := shape_cache_keys[i]\n" +
+    "\t\tif _global_mesh_cache.has(cache_key):\n" +
+    "\t\t\tmeshes[i] = _global_mesh_cache[cache_key][\"mesh\"]\n" +
+    "\t\t\tcontinue\n" +
+    "\t\tvar built := _build_mesh(shapes[i], shape_uvs[i], shape_tris[i])\n" +
+    "\t\tmeshes[i] = built\n" +
+    "\t\t_global_mesh_cache[cache_key] = {\"tris\": shape_tris[i], \"mesh\": built}\n" +
     "\n" +
     "\t# Pass 2 (mutating, but idempotent): add the \":mesh_index\" track and\n" +
     "\t# disable the now-redundant source tracks, but only the FIRST time --\n" +
@@ -5357,6 +6111,8 @@ function buildGodotScenes(doc, data, exportDir) {
     "\t# against the still-present original -- which would break every\n" +
     "\t# NodePath the AnimationPlayer tracks above already point to.\n" +
     "\tcall_deferred(\"_finish_swap\", mesh_node, get_parent(), get_index(), owner)\n" +
+    "\tif perf:\n" +
+    "\t\tperf_log.time_end(perf_label)\n" +
     "\n" +
     "\n" +
     "func _finish_swap(mesh_node: Node, parent: Node, index: int, scene_owner: Node) -> void:\n" +
@@ -5477,6 +6233,19 @@ function buildGodotScenes(doc, data, exportDir) {
     "\tvar s := \"\"\n" +
     "\tfor p in pts:\n" +
     "\t\ts += \"%.2f,%.2f|\" % [p.x, p.y]\n" +
+    "\treturn s\n" +
+    "\n" +
+    "## Companion to _shape_signature, for _global_mesh_cache's own key (see\n" +
+    "## its own doc) -- `groups` (the raw \":polygons\" track value, one\n" +
+    "## PackedInt32Array of point indices per disjoint sub-polygon, see\n" +
+    "## _triangulate's own doc) affects triangulation, so two shapes with\n" +
+    "## identical points but different groupings must never collide in the\n" +
+    "## cache.\n" +
+    "static func _groups_signature(groups: Array) -> String:\n" +
+    "\tvar s := \"\"\n" +
+    "\tfor group in groups:\n" +
+    "\t\tvar indices: PackedInt32Array = group\n" +
+    "\t\ts += \",\".join(Array(indices).map(func(i): return str(i))) + \"|\"\n" +
     "\treturn s\n";
     FLfile.write(scriptDir + "/TweenShapeMeshConverter.gd", tweenConverterContent);
 }
