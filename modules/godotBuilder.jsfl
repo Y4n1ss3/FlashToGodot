@@ -5179,7 +5179,10 @@ function buildSceneForSymbol(sym, frameRate, exportDir, symbolMap, symbolContain
     if (actionScripts.length > 0) {
         // By path, not class_name: a class_name only resolves once the Godot 3 editor has
         // scanned the project (project.godot), and a fresh export must work without.
-        var gdContent = "extends \"" + RES_PREFIX + "scripts/FlashMovieClip.gd\"\n\n";
+        // Hardcoded res://scripts/, NOT RES_PREFIX: FlashMovieClip.gd is a shared file written
+        // at the Godot project ROOT (see buildGodotScenes), while RES_PREFIX is the export
+        // subfolder when the chosen folder isn't the project root itself.
+        var gdContent = "extends \"res://scripts/FlashMovieClip.gd\"\n\n";
         
         var methodsDone = {};
         for (var i = 0; i < actionScripts.length; i++) {
