@@ -5652,27 +5652,55 @@ function buildGodotScenes(doc, data, exportDir) {
 
     // Create FlashMovieClip.gd base class at the root of the Godot project
     var fmcContent = "extends Node2D\n" +
-    "class_name FlashMovieClip\n\n" +
+    "class_name FlashMovieClip\n" +
+    "\n" +
     "var _rng: RandomNumberGenerator\n" +
-    "var undefined = null\n\n" +
+    "var undefined = null\n" +
+    "\n" +
+    "## Aggregate fan-out cost tracking -- see AntialiasedPolygon2D.report_and_\n" +
+    "## reset's own doc for the full reasoning (same pattern). godotBuilder.jsfl\n" +
+    "## generates one .gd file `extends FlashMovieClip` per exported \"movie\n" +
+    "## clip\" symbol (44 distinct ones in this project) and attaches one of\n" +
+    "## them to every instanced symbol root -- this base _ready() runs for\n" +
+    "## every one of those instances (directly, or via a subclass's own\n" +
+    "## super._ready(), if any override even exists).\n" +
+    "static var _perf_ready_count := 0\n" +
+    "static var _perf_ready_usec := 0\n" +
+    "\n" +
+    "static func report_and_reset(perf_log: Node) -> void:\n" +
+    "\tif _perf_ready_count > 0:\n" +
+    "\t\tperf_log.log_action(\"FlashMovieClip _ready fan-out\", \"%d instances, %.3fms total\" % [_perf_ready_count, _perf_ready_usec / 1000.0])\n" +
+    "\t_perf_ready_count = 0\n" +
+    "\t_perf_ready_usec = 0\n" +
+    "\n" +
     "func _ready():\n" +
+    "\tvar _perf_t0 := Time.get_ticks_usec()\n" +
     "\t_rng = RandomNumberGenerator.new()\n" +
-    "\t_rng.seed = hash(Time.get_ticks_msec()) + hash(get_instance_id())\n\n" +
+    "\t_rng.seed = hash(Time.get_ticks_msec()) + hash(get_instance_id())\n" +
+    "\t_perf_ready_count += 1\n" +
+    "\t_perf_ready_usec += Time.get_ticks_usec() - _perf_t0\n" +
+    "\n" +
     "var _currentframe: int:\n" +
     "\tget:\n" +
     "\t\tif has_node(\"AnimationPlayer\") and $AnimationPlayer.current_animation != \"\":\n" +
     "\t\t\treturn int($AnimationPlayer.current_animation_position * 24.0)\n" +
-    "\t\treturn 0\n\n" +
+    "\t\treturn 0\n" +
+    "\n" +
+    "@warning_ignore(\"unused_private_class_variable\")  # used by exported symbol subclasses (extends FlashMovieClip), e.g. etoile.gd's gotoAndPlay(random(_totalframes)) -- Godot's own analysis only checks THIS file's body, not inheriting scripts\n" +
     "var _totalframes: int:\n" +
     "\tget:\n" +
     "\t\tif has_node(\"AnimationPlayer\") and $AnimationPlayer.current_animation != \"\":\n" +
     "\t\t\treturn int($AnimationPlayer.current_animation_length * 24.0)\n" +
-    "\t\treturn 1\n\n" +
+    "\t\treturn 1\n" +
+    "\n" +
+    "@warning_ignore(\"unused_private_class_variable\")  # used by exported symbol subclasses (extends FlashMovieClip), e.g. to_ballades/scripts/main.gd's _level0.profil.items -- see this same note on _totalframes above\n" +
     "var _level0: Node:\n" +
     "\tget:\n" +
-    "\t\treturn get_tree().root.get_child(0)\n\n" +
+    "\t\treturn get_tree().root.get_child(0)\n" +
+    "\n" +
     "func random(max_val: int) -> int:\n" +
-    "\treturn _rng.randi() % max_val\n\n" +
+    "\treturn _rng.randi() % max_val\n" +
+    "\n" +
     "func gotoAndPlay(frame_or_name):\n" +
     "\tif not has_node(\"AnimationPlayer\"): return\n" +
     "\tif typeof(frame_or_name) == TYPE_STRING:\n" +
@@ -5680,7 +5708,8 @@ function buildGodotScenes(doc, data, exportDir) {
     "\telse:\n" +
     "\t\tif $AnimationPlayer.current_animation != \"\":\n" +
     "\t\t\t$AnimationPlayer.seek(frame_or_name / 24.0, true)\n" +
-    "\t\t\t$AnimationPlayer.play($AnimationPlayer.current_animation)\n\n" +
+    "\t\t\t$AnimationPlayer.play($AnimationPlayer.current_animation)\n" +
+    "\n" +
     "func gotoAndStop(frame_or_name):\n" +
     "\tif not has_node(\"AnimationPlayer\"): return\n" +
     "\tif typeof(frame_or_name) == TYPE_STRING:\n" +
@@ -5691,14 +5720,18 @@ function buildGodotScenes(doc, data, exportDir) {
     "\t\tif $AnimationPlayer.current_animation != \"\":\n" +
     "\t\t\t$AnimationPlayer.play($AnimationPlayer.current_animation)\n" +
     "\t\t\t$AnimationPlayer.pause()\n" +
-    "\t\t\t$AnimationPlayer.seek(frame_or_name / 24.0, true)\n\n" +
+    "\t\t\t$AnimationPlayer.seek(frame_or_name / 24.0, true)\n" +
+    "\n" +
     "func nextFrame():\n" +
-    "\tgotoAndStop(_currentframe + 1)\n\n" +
+    "\tgotoAndStop(_currentframe + 1)\n" +
+    "\n" +
     "func prevFrame():\n" +
-    "\tgotoAndStop(_currentframe - 1)\n\n" +
+    "\tgotoAndStop(_currentframe - 1)\n" +
+    "\n" +
     "func stop():\n" +
     "\tif has_node(\"AnimationPlayer\"):\n" +
-    "\t\t$AnimationPlayer.pause()\n\n" +
+    "\t\t$AnimationPlayer.pause()\n" +
+    "\n" +
     "func play():\n" +
     "\tif has_node(\"AnimationPlayer\") and $AnimationPlayer.current_animation != \"\":\n" +
     "\t\t$AnimationPlayer.play($AnimationPlayer.current_animation)\n";
@@ -5713,10 +5746,13 @@ function buildGodotScenes(doc, data, exportDir) {
     // active instead of keeping every alternate pose permanently resident.
     var evsContent = "@tool\n" +
     "extends Node2D\n" +
-    "class_name ExclusiveVariantSlot\n\n" +
-    "@export var variant_paths: Array[String] = []\n\n" +
+    "class_name ExclusiveVariantSlot\n" +
+    "\n" +
+    "@export var variant_paths: Array[String] = []\n" +
+    "\n" +
     "var _current_index := -2\n" +
-    "var _current_node: Node = null\n\n" +
+    "var _current_node: Node = null\n" +
+    "\n" +
     "## Editor-only convenience -- outside a running game, nothing ever calls\n" +
     "## set_active() at all: that only happens via an AnimationPlayer CALL_\n" +
     "## METHOD track actually firing during forward playback, or Player\n" +
@@ -5739,7 +5775,103 @@ function buildGodotScenes(doc, data, exportDir) {
     "## pose to render instead of nothing.\n" +
     "func _ready() -> void:\n" +
     "\tif Engine.is_editor_hint() and _current_index == -2 and not variant_paths.is_empty():\n" +
-    "\t\tset_active(0)\n\n" +
+    "\t\tset_active(0)\n" +
+    "\n" +
+    "## Editor-only: compensates for the SAME Godot quirk _ready's own doc\n" +
+    "## names (a CALL_METHOD track -- which is exactly how real playback drives\n" +
+    "## set_active(), see its own doc -- does not reliably fire just from\n" +
+    "## scrubbing/selecting a clip in the editor's Animation panel). Without\n" +
+    "## this, _ready's own set_active(0) fallback is the only thing that would\n" +
+    "## EVER run in the editor: every pooled slot stays stuck showing variant 0\n" +
+    "## forever, regardless of which animation is actually selected/scrubbed\n" +
+    "## afterward -- confirmed a real repro (\"si je sélectionne inactive, je\n" +
+    "## devrais voir que inactive\"): plain :visible-tracked layers correctly\n" +
+    "## follow whichever clip is browsed, while every POOLED (Piste 7) slot's\n" +
+    "## content stays frozen on variant 0's pose, the two combining into a\n" +
+    "## visibly wrong mix of poses rather than one coherent one. Fixed by\n" +
+    "## manually replaying whichever set_active() call the CURRENTLY PREVIEWED\n" +
+    "## animation's own method track says should already have fired by the\n" +
+    "## current scrub position, every frame that position actually changes.\n" +
+    "## Never touches real play (Engine.is_editor_hint() guard) -- there, the\n" +
+    "## AnimationPlayer's own normal forward playback already fires these\n" +
+    "## tracks correctly on its own, and this would just be redundant, wasted\n" +
+    "## per-frame work on every pooled slot in the whole tree.\n" +
+    "var _last_scrubbed_anim: StringName = &\"\"\n" +
+    "var _last_scrubbed_pos: float = -1.0\n" +
+    "var _cached_anim_player: AnimationPlayer = null\n" +
+    "\n" +
+    "func _process(_delta: float) -> void:\n" +
+    "\tif not Engine.is_editor_hint():\n" +
+    "\t\treturn\n" +
+    "\tvar anim_player := _find_anim_player()\n" +
+    "\tif not anim_player:\n" +
+    "\t\treturn\n" +
+    "\t# assigned_animation, NOT current_animation -- confirmed via Godot's own\n" +
+    "\t# source (AnimationPlayer::get_current_animation): that one returns \"\"\n" +
+    "\t# whenever is_playing() is false, which is exactly the \"merely selected\n" +
+    "\t# a clip in the panel, haven't pressed Play\" case this whole _process\n" +
+    "\t# exists for. assigned_animation (AnimationPlayer::get_assigned_\n" +
+    "\t# animation, backed by the SAME playback.assigned the editor's own\n" +
+    "\t# _animation_selected sets via set_assigned_animation) reflects the\n" +
+    "\t# panel's current selection unconditionally, play state or not -- this\n" +
+    "\t# was the actual reason a just-selected clip stayed stuck on whatever\n" +
+    "\t# an EARLIER one had left active until Play was actually pressed\n" +
+    "\t# (real playback happens to also update current_animation, masking\n" +
+    "\t# this from ever showing up there).\n" +
+    "\tvar anim_name: StringName = anim_player.assigned_animation\n" +
+    "\tif anim_name == \"\":\n" +
+    "\t\treturn\n" +
+    "\tvar pos: float = anim_player.current_animation_position\n" +
+    "\tif anim_name == _last_scrubbed_anim and is_equal_approx(pos, _last_scrubbed_pos):\n" +
+    "\t\treturn\n" +
+    "\t_last_scrubbed_anim = anim_name\n" +
+    "\t_last_scrubbed_pos = pos\n" +
+    "\tvar anim: Animation = anim_player.get_animation(anim_name)\n" +
+    "\tif not anim:\n" +
+    "\t\treturn\n" +
+    "\tvar root: Node = anim_player.get_node(anim_player.root_node)\n" +
+    "\tif not root:\n" +
+    "\t\treturn\n" +
+    "\tvar rel_path: NodePath = root.get_path_to(self)\n" +
+    "\tvar track_idx := anim.find_track(rel_path, Animation.TYPE_METHOD)\n" +
+    "\t# No method track at all for this slot in the CURRENTLY previewed clip\n" +
+    "\t# -- same meaning, same fix, as player_controller._change_animation's\n" +
+    "\t# own identical find_track/set_active(-1) pair at runtime (see its own\n" +
+    "\t# doc): this pose simply doesn't use this pooled container, and Godot's\n" +
+    "\t# AnimationPlayer only ever updates what a clip's own tracks target, so\n" +
+    "\t# without this it keeps showing whatever an EARLIER clip left active --\n" +
+    "\t# the actual cause of \"the character shows up several times at once\"\n" +
+    "\t# when browsing between animations, not just a mismatched single part.\n" +
+    "\tif track_idx == -1:\n" +
+    "\t\tset_active(-1)\n" +
+    "\t\treturn\n" +
+    "\t# Keys are stored time-sorted -- the LAST one at-or-before `pos` is\n" +
+    "\t# whichever set_active() call would already have fired by now.\n" +
+    "\tvar last_key := -1\n" +
+    "\tfor k in anim.track_get_key_count(track_idx):\n" +
+    "\t\tif anim.track_get_key_time(track_idx, k) <= pos:\n" +
+    "\t\t\tlast_key = k\n" +
+    "\t\telse:\n" +
+    "\t\t\tbreak\n" +
+    "\tif last_key != -1:\n" +
+    "\t\tvar params: Array = anim.method_track_get_params(track_idx, last_key)\n" +
+    "\t\tif not params.is_empty():\n" +
+    "\t\t\tset_active(int(params[0]))\n" +
+    "\n" +
+    "## Searches from the edited scene's own root (`owner` -- see the class doc\n" +
+    "## on `self` never being the scene root here) rather than upward from\n" +
+    "## `self`: the AnimationPlayer driving this slot is a SIBLING somewhere\n" +
+    "## up the tree, not necessarily a direct ancestor. Cached (invalidated via\n" +
+    "## is_instance_valid, not just a null check -- the found node can be freed\n" +
+    "## out from under this reference if the scene is edited) since this is\n" +
+    "## called every _process frame.\n" +
+    "func _find_anim_player() -> AnimationPlayer:\n" +
+    "\tif _cached_anim_player and is_instance_valid(_cached_anim_player):\n" +
+    "\t\treturn _cached_anim_player\n" +
+    "\tvar root: Node = owner if owner else self\n" +
+    "\t_cached_anim_player = root.find_child(\"AnimationPlayer\", true, false)\n" +
+    "\treturn _cached_anim_player\n" +
+    "\n" +
     "## Emitted right after a fresh variant is load()ed+instantiate()d+add_child()ed\n" +
     "## here -- i.e. whenever set_active() actually swaps in NEW content, not on\n" +
     "## the \"already active, no-op\" early return, and not when swapping to an\n" +
@@ -5760,7 +5892,8 @@ function buildGodotScenes(doc, data, exportDir) {
     "## EquipSlot/equipment at all, by design -- pure generic pooling) -- this\n" +
     "## signal is the seam that lets EquipSlot re-attach itself to fresh content\n" +
     "## without this class needing to know anything about what's listening.\n" +
-    "signal content_swapped(new_node: Node)\n\n" +
+    "signal content_swapped(new_node: Node)\n" +
+    "\n" +
     "## True while a real (non-empty, in-range) variant is currently loaded --\n" +
     "## i.e. exactly the case content_swapped's own new_node is non-null for.\n" +
     "## EquipSlot reads this for one specific case (see _attach_recursive's own\n" +
@@ -5772,7 +5905,8 @@ function buildGodotScenes(doc, data, exportDir) {
     "## hidden) can't tell which pose is genuinely the active one right now --\n" +
     "## this can.\n" +
     "func is_active() -> bool:\n" +
-    "\treturn _current_index >= 0\n\n" +
+    "\treturn _current_index >= 0\n" +
+    "\n" +
     "## The path currently loaded (see is_active()'s own doc), or \"\" when\n" +
     "## nothing is. EquipSlot uses this to tell WHICH pose a container is\n" +
     "## currently showing -- a single container can hold MORE than one valid\n" +
@@ -5784,7 +5918,8 @@ function buildGodotScenes(doc, data, exportDir) {
     "func current_variant_path() -> String:\n" +
     "\tif not is_active():\n" +
     "\t\treturn \"\"\n" +
-    "\treturn variant_paths[_current_index]\n\n" +
+    "\treturn variant_paths[_current_index]\n" +
+    "\n" +
     "func set_active(index: int) -> void:\n" +
     "\tif index == _current_index:\n" +
     "\t\treturn\n" +
@@ -5899,7 +6034,8 @@ function buildGodotScenes(doc, data, exportDir) {
     "const ENABLED := true\n" +
     "\n" +
     "## Shared across EVERY TweenShapeMeshConverter instance in the whole\n" +
-    "## process, key String -> {\"tris\": PackedInt32Array, \"mesh\": ArrayMesh}.\n" +
+    "## process, key PackedInt32Array (see _shape_signature's own doc for why\n" +
+    "## numeric, not String) -> {\"tris\": PackedInt32Array, \"mesh\": ArrayMesh}.\n" +
     "## Unlike shape_index_by_key in _ready() below (which only dedupes WITHIN\n" +
     "## one instance's own Pass 1), this dedupes ACROSS pooled duplicate\n" +
     "## instances of the SAME symbol scene -- e.g. __ANIM.tscn's own body-\n" +
@@ -5928,9 +6064,70 @@ function buildGodotScenes(doc, data, exportDir) {
     "## visually unrelated symbols, not just exact pooled duplicates.\n" +
     "static var _global_mesh_cache: Dictionary = {}\n" +
     "\n" +
+    "## Where build_tween_mesh_cache.gd (a dev-only, offline headless pass --\n" +
+    "## see its own doc) writes every shape it triangulated across the WHOLE\n" +
+    "## project, as a TweenMeshCacheResource. Loaded once per process (see\n" +
+    "## _disk_cache_loaded below) into _global_mesh_cache itself, so an\n" +
+    "## instance whose shape was already covered by that offline pass pays\n" +
+    "## NO triangulation cost at all, not even the first time -- unlike\n" +
+    "## _global_mesh_cache on its own (in-memory, empty at boot), which only\n" +
+    "## ever helps the SECOND+ instance of a given shape within one process\n" +
+    "## run. Deliberately does not change what gets exported to .tscn: every\n" +
+    "## Polygon2D/track this converter reads stays exactly as authored, fully\n" +
+    "## visible and editable in the Godot editor -- this is a purely additional\n" +
+    "## side-car file the runtime consults, not a replacement for the source\n" +
+    "## data (a shape not yet covered here, e.g. new art since the last offline\n" +
+    "## build, still falls back to computing it live below, exactly as if this\n" +
+    "## file didn't exist).\n" +
+    "const CACHE_RES_PATH := \"res://cache/tween_shape_mesh_cache.res\"\n" +
+    "\n" +
+    "## Guards _ensure_disk_cache_loaded so the (possibly large) disk cache is\n" +
+    "## only ever read once per process, not once per instance -- every\n" +
+    "## TweenShapeMeshConverter in the whole tree shares the one static\n" +
+    "## _global_mesh_cache it feeds into anyway (see that var's own doc).\n" +
+    "static var _disk_cache_loaded := false\n" +
+    "\n" +
+    "## Merges CACHE_RES_PATH's entries (if that file exists -- it won't in the\n" +
+    "## editor or in a build that never ran build_tween_mesh_cache.gd, both\n" +
+    "## silently fine, see this class's own doc) into _global_mesh_cache. Only\n" +
+    "## FILLS missing keys, never overwrites one _global_mesh_cache already has\n" +
+    "## -- a key is derived from the actual shape data itself (see the cache_key\n" +
+    "## construction below), so a shape edited since the offline cache was last\n" +
+    "## built simply gets a different key and safely misses here, falling\n" +
+    "## through to a live, correct (re-)triangulation instead of ever reading\n" +
+    "## stale mesh data under a key that no longer matches what's on screen.\n" +
+    "static func _ensure_disk_cache_loaded() -> void:\n" +
+    "\tif _disk_cache_loaded:\n" +
+    "\t\treturn\n" +
+    "\t_disk_cache_loaded = true\n" +
+    "\tif not ResourceLoader.exists(CACHE_RES_PATH):\n" +
+    "\t\treturn\n" +
+    "\tvar res: TweenMeshCacheResource = load(CACHE_RES_PATH)\n" +
+    "\tif res == null:\n" +
+    "\t\treturn\n" +
+    "\tfor key in res.entries:\n" +
+    "\t\tif not _global_mesh_cache.has(key):\n" +
+    "\t\t\t_global_mesh_cache[key] = res.entries[key]\n" +
+    "\n" +
+    "## Called by build_tween_mesh_cache.gd once it's finished sweeping every\n" +
+    "## scene in the project (see that script's own doc) -- writes the now-\n" +
+    "## fully-populated _global_mesh_cache straight to CACHE_RES_PATH so future\n" +
+    "## runs' _ensure_disk_cache_loaded can pick it back up. Not something\n" +
+    "## normal gameplay ever calls.\n" +
+    "static func save_global_cache_to_disk() -> void:\n" +
+    "\tvar dir := CACHE_RES_PATH.get_base_dir()\n" +
+    "\tif not DirAccess.dir_exists_absolute(dir):\n" +
+    "\t\tDirAccess.make_dir_recursive_absolute(dir)\n" +
+    "\tvar res := TweenMeshCacheResource.new()\n" +
+    "\tres.entries = _global_mesh_cache\n" +
+    "\tvar err := ResourceSaver.save(res, CACHE_RES_PATH)\n" +
+    "\tif err != OK:\n" +
+    "\t\tpush_error(\"TweenShapeMeshConverter.save_global_cache_to_disk: ResourceSaver.save failed with error %d\" % err)\n" +
+    "\n" +
     "func _ready() -> void:\n" +
     "\tif not ENABLED:\n" +
     "\t\treturn\n" +
+    "\t_ensure_disk_cache_loaded()\n" +
     "\tvar root: Node = get_owner()\n" +
     "\tif root == null:\n" +
     "\t\troot = self\n" +
@@ -5975,11 +6172,11 @@ function buildGodotScenes(doc, data, exportDir) {
     "\tvar shapes: Array[PackedVector2Array] = []\n" +
     "\tvar shape_uvs: Array[PackedVector2Array] = []\n" +
     "\tvar shape_tris: Array[PackedInt32Array] = []\n" +
-    "\t# \"\" for a shape this instance is the first to ever see (still needs\n" +
-    "\t# _build_mesh below); the GLOBAL cache key otherwise, letting the mesh-\n" +
-    "\t# building loop skip straight to the already-built ArrayMesh instead\n" +
-    "\t# -- see _global_mesh_cache's own doc.\n" +
-    "\tvar shape_cache_keys: Array[String] = []\n" +
+    "\t# The GLOBAL cache key (a PackedInt32Array, see _shape_signature's own\n" +
+    "\t# doc for why numeric, not String) for each entry in `shapes` above,\n" +
+    "\t# letting the mesh-building loop skip straight to the already-built\n" +
+    "\t# ArrayMesh instead -- see _global_mesh_cache's own doc.\n" +
+    "\tvar shape_cache_keys: Array[PackedInt32Array] = []\n" +
     "\tvar shape_index_by_key: Dictionary = {}\n" +
     "\tvar per_anim: Array = []\n" +
     "\n" +
@@ -5996,6 +6193,16 @@ function buildGodotScenes(doc, data, exportDir) {
     "\t\tvar polys_idx := anim.find_track(polys_track_name, Animation.TYPE_VALUE)\n" +
     "\t\tvar mesh_indices: Array[int] = []\n" +
     "\t\tmesh_indices.resize(key_count)\n" +
+    "\t\t# Fetched ONCE per (anim, track) here, not once per keyframe below --\n" +
+    "\t\t# _value_at_time's own binary search still needs each track's key\n" +
+    "\t\t# times, but re-deriving them from `anim` on every one of key_count\n" +
+    "\t\t# keyframe iterations turned an already-cheap lookup into an\n" +
+    "\t\t# accidental O(n^2) pass overall for any heavily keyframed animation\n" +
+    "\t\t# (a real, if secondary, cost -- see _shape_signature's own doc for\n" +
+    "\t\t# the actual DOMINANT cost this loop used to have, found right next\n" +
+    "\t\t# to this one while investigating the same stall).\n" +
+    "\t\tvar uv_times := _key_times(anim, uv_idx)\n" +
+    "\t\tvar polys_times := _key_times(anim, polys_idx)\n" +
     "\n" +
     "\t\tfor k in range(key_count):\n" +
     "\t\t\tvar pts: PackedVector2Array = anim.track_get_key_value(poly_idx, k)\n" +
@@ -6009,8 +6216,8 @@ function buildGodotScenes(doc, data, exportDir) {
     "\t\t\t# keyframe. Look up by time instead: whichever key was most\n" +
     "\t\t\t# recently in effect at this exact keyframe's own time, matching\n" +
     "\t\t\t# how discrete tracks are actually applied during playback.\n" +
-    "\t\t\tvar uvs: PackedVector2Array = _value_at_time(anim, uv_idx, key_time, PackedVector2Array())\n" +
-    "\t\t\tvar groups: Array = _value_at_time(anim, polys_idx, key_time, [])\n" +
+    "\t\t\tvar uvs: PackedVector2Array = _value_at_time(anim, uv_idx, uv_times, key_time, PackedVector2Array())\n" +
+    "\t\t\tvar groups: Array = _value_at_time(anim, polys_idx, polys_times, key_time, [])\n" +
     "\n" +
     "\t\t\tvar sig := _shape_signature(pts)\n" +
     "\t\t\tif shape_index_by_key.has(sig):\n" +
@@ -6026,7 +6233,17 @@ function buildGodotScenes(doc, data, exportDir) {
     "\t\t\t# -- groups affects triangulation, uvs affects the built mesh\n" +
     "\t\t\t# but not triangulation itself, so both need to be part of the\n" +
     "\t\t\t# key even though only `groups` feeds _triangulate directly.\n" +
-    "\t\t\tvar cache_key := sig + \"||\" + _groups_signature(groups) + \"||\" + _shape_signature(uvs)\n" +
+    "\t\t\t# INT32_MIN as a separator between the 3 segments -- never a\n" +
+    "\t\t\t# value round(coord * 100.0)/a group index could actually\n" +
+    "\t\t\t# produce, so the 3 segments can never bleed into each other\n" +
+    "\t\t\t# (see _shape_signature's own doc for why this is numeric, not\n" +
+    "\t\t\t# a String, in the first place).\n" +
+    "\t\t\tvar cache_key := PackedInt32Array()\n" +
+    "\t\t\tcache_key.append_array(sig)\n" +
+    "\t\t\tcache_key.append(-2147483648)\n" +
+    "\t\t\tcache_key.append_array(_groups_signature(groups))\n" +
+    "\t\t\tcache_key.append(-2147483648)\n" +
+    "\t\t\tcache_key.append_array(_shape_signature(uvs))\n" +
     "\t\t\tshape_cache_keys.append(cache_key)\n" +
     "\t\t\tif _global_mesh_cache.has(cache_key):\n" +
     "\t\t\t\tshape_tris.append(_global_mesh_cache[cache_key][\"tris\"])\n" +
@@ -6115,7 +6332,15 @@ function buildGodotScenes(doc, data, exportDir) {
     "\t\tperf_log.time_end(perf_label)\n" +
     "\n" +
     "\n" +
-    "func _finish_swap(mesh_node: Node, parent: Node, index: int, scene_owner: Node) -> void:\n" +
+    "func _finish_swap(mesh_node: Node, parent: Node, index: int, scene_owner: Node) -> void: ##LOCK_SYMBOLS\n" +
+    "\t# LOCK_SYMBOLS: called only by name, via call_deferred(\"_finish_swap\",\n" +
+    "\t# ...) above -- GDMaim renaming this declaration without also rewriting\n" +
+    "\t# that string literal made the deferred call fail in the obfuscated web\n" +
+    "\t# export (\"Method not found\" for every single instance, no error at all\n" +
+    "\t# in the editor since nothing there renames anything -- confirmed a\n" +
+    "\t# real repro). Locking it keeps the declaration and the string-based\n" +
+    "\t# call in sync trivially by never renaming it. Same fix, same reason,\n" +
+    "\t# as GameRoot._change_room_now's own doc.\n" +
     "\t# A shape with more than one fill color, or any stroke, gets those\n" +
     "\t# as Poly_N/Line_N CHILDREN of self (a real, separate fill region or\n" +
     "\t# outline). Only self's OWN \":polygon\" track feeds the mesh built\n" +
@@ -6192,25 +6417,45 @@ function buildGodotScenes(doc, data, exportDir) {
     "\n" +
     "func _key_times(anim: Animation, track_idx: int) -> Array[float]:\n" +
     "\tvar times: Array[float] = []\n" +
+    "\t# -1 means \"this track doesn't exist on this anim\" (see this\n" +
+    "\t# function's own call sites -- uv_idx/polys_idx come straight from\n" +
+    "\t# find_track, which returns -1 on no match) -- track_get_key_count/\n" +
+    "\t# _get_key_time reject that index outright (an ERROR, not just a\n" +
+    "\t# false/0 return), so this must bail BEFORE ever calling them, not\n" +
+    "\t# rely on the loop below simply not iterating.\n" +
+    "\tif track_idx == -1:\n" +
+    "\t\treturn times\n" +
     "\tfor k in range(anim.track_get_key_count(track_idx)):\n" +
     "\t\ttimes.append(anim.track_get_key_time(track_idx, k))\n" +
     "\treturn times\n" +
     "\n" +
     "\n" +
     "# The value in effect on `track_idx` at `time` -- i.e. the LAST key at or\n" +
-    "# before `time` (keys are always stored in ascending time order by the\n" +
-    "# exporter) -- or `default_value` if the track doesn't exist, has no keys\n" +
-    "# yet at `time`, or `track_idx` is -1.\n" +
-    "func _value_at_time(anim: Animation, track_idx: int, time: float, default_value):\n" +
-    "\tif track_idx == -1:\n" +
+    "# before `time` -- or `default_value` if the track doesn't exist, has no\n" +
+    "# keys yet at `time`, or `track_idx` is -1. `times` is `track_idx`'s own\n" +
+    "# key times, pre-fetched ONCE per track by the caller (see its own call\n" +
+    "# site doc) -- keys are always stored in ascending time order by the\n" +
+    "# exporter, so a binary search over this array finds the same answer a\n" +
+    "# linear scan would, without re-walking every earlier key on every call.\n" +
+    "func _value_at_time(anim: Animation, track_idx: int, times: Array[float], time: float, default_value):\n" +
+    "\tif track_idx == -1 or times.is_empty():\n" +
     "\t\treturn default_value\n" +
-    "\tvar result = default_value\n" +
-    "\tfor k in range(anim.track_get_key_count(track_idx)):\n" +
-    "\t\tif anim.track_get_key_time(track_idx, k) <= time + 0.0005:\n" +
-    "\t\t\tresult = anim.track_get_key_value(track_idx, k)\n" +
+    "\t# Upper bound: first index whose time exceeds time+EPS (same tie-break\n" +
+    "\t# margin the original linear scan used) -- the answer is the key right\n" +
+    "\t# before it, or `default_value` if even the very first key is already\n" +
+    "\t# past `time`.\n" +
+    "\tvar lo := 0\n" +
+    "\tvar hi := times.size()\n" +
+    "\twhile lo < hi:\n" +
+    "\t\t@warning_ignore(\"integer_division\")  # intentional: lo/hi/mid are all indices\n" +
+    "\t\tvar mid := (lo + hi) / 2\n" +
+    "\t\tif times[mid] <= time + 0.0005:\n" +
+    "\t\t\tlo = mid + 1\n" +
     "\t\telse:\n" +
-    "\t\t\tbreak\n" +
-    "\treturn result\n" +
+    "\t\t\thi = mid\n" +
+    "\tif lo == 0:\n" +
+    "\t\treturn default_value\n" +
+    "\treturn anim.track_get_key_value(track_idx, lo - 1)\n" +
     "\n" +
     "\n" +
     "# AnimationPlayer is always a direct child of the symbol scene's own root\n" +
@@ -6229,24 +6474,51 @@ function buildGodotScenes(doc, data, exportDir) {
     "\treturn null\n" +
     "\n" +
     "\n" +
-    "static func _shape_signature(pts: PackedVector2Array) -> String:\n" +
-    "\tvar s := \"\"\n" +
-    "\tfor p in pts:\n" +
-    "\t\ts += \"%.2f,%.2f|\" % [p.x, p.y]\n" +
-    "\treturn s\n" +
+    "## A purely-numeric identity key for `pts` -- each point rounded to the\n" +
+    "## nearest 1/100th of a unit (matching an earlier %.2f-formatted String\n" +
+    "## signature's own precision, kept since near-identical-but-not-bit-\n" +
+    "## identical keyframes should still count as the same shape) and packed\n" +
+    "## two ints (x, y) per point. Called unconditionally for EVERY keyframe of\n" +
+    "## every animated shape (see this function's own call sites), so it needs\n" +
+    "## to be genuinely cheap in point count. Confirmed a real, substantial\n" +
+    "## cost from an earlier String-based form (both a naive String += one and\n" +
+    "## a join()-based one after it): formatting each point as text, even\n" +
+    "## efficiently concatenated, is far more work than just rounding a float\n" +
+    "## to an int -- a shape with several thousand points (the common case for\n" +
+    "## an organic, densely-subdivided Flash tween curve) cost several ms PER\n" +
+    "## CALL either way, summing to hundreds of ms for one heavily keyframed\n" +
+    "## shape and dwarfing the actual triangulation work this whole file exists\n" +
+    "## to cache away (see _global_mesh_cache's own doc) once THAT part was no\n" +
+    "## longer the bottleneck. This form measured under 0.4ms for 2000 points\n" +
+    "## in isolation. Godot's Dictionary compares/hashes Packed*Array keys\n" +
+    "## STRUCTURALLY (by content, not instance identity -- confirmed via a real\n" +
+    "## test: two separately-built arrays with the same ints correctly collide\n" +
+    "## as the same key), so this works as a Dictionary key exactly like the\n" +
+    "## String it replaces did.\n" +
+    "static func _shape_signature(pts: PackedVector2Array) -> PackedInt32Array:\n" +
+    "\tvar out := PackedInt32Array()\n" +
+    "\tout.resize(pts.size() * 2)\n" +
+    "\tfor i in range(pts.size()):\n" +
+    "\t\tvar p := pts[i]\n" +
+    "\t\tout[i * 2] = int(round(p.x * 100.0))\n" +
+    "\t\tout[i * 2 + 1] = int(round(p.y * 100.0))\n" +
+    "\treturn out\n" +
     "\n" +
-    "## Companion to _shape_signature, for _global_mesh_cache's own key (see\n" +
-    "## its own doc) -- `groups` (the raw \":polygons\" track value, one\n" +
-    "## PackedInt32Array of point indices per disjoint sub-polygon, see\n" +
-    "## _triangulate's own doc) affects triangulation, so two shapes with\n" +
-    "## identical points but different groupings must never collide in the\n" +
-    "## cache.\n" +
-    "static func _groups_signature(groups: Array) -> String:\n" +
-    "\tvar s := \"\"\n" +
+    "## Companion to _shape_signature (see its own doc, including for why this\n" +
+    "## is a numeric array, not a String), for _global_mesh_cache's own key --\n" +
+    "## `groups` (the raw \":polygons\" track value, one PackedInt32Array of\n" +
+    "## point indices per disjoint sub-polygon, see _triangulate's own doc)\n" +
+    "## affects triangulation, so two shapes with identical points but\n" +
+    "## different groupings must never collide in the cache. -1 (never a valid\n" +
+    "## point index) separates each group's own indices so e.g. [[0,1],[2]]\n" +
+    "## and [[0],[1,2]] can never flatten to the same array.\n" +
+    "static func _groups_signature(groups: Array) -> PackedInt32Array:\n" +
+    "\tvar out := PackedInt32Array()\n" +
     "\tfor group in groups:\n" +
     "\t\tvar indices: PackedInt32Array = group\n" +
-    "\t\ts += \",\".join(Array(indices).map(func(i): return str(i))) + \"|\"\n" +
-    "\treturn s\n";
+    "\t\tout.append_array(indices)\n" +
+    "\t\tout.append(-1)\n" +
+    "\treturn out\n";
     FLfile.write(scriptDir + "/TweenShapeMeshConverter.gd", tweenConverterContent);
 }
 
