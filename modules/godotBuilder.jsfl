@@ -74,6 +74,19 @@ var MIN_TWEEN_MESH_DURATION_SEC = 3.0;
 // this addon and already fixed there -- confirmed via a Node.js repro
 // against the real extracted geometry (zero divergence across every
 // keyframe once fixed).
+// How Polygon2D that nothing animates are drawn in Godot 3's GLES2 renderer
+// (its batcher re-transforms every vertex on the CPU each frame; a mesh keeps
+// them on the GPU, ~3x cheaper on a real room, pixel-identical):
+//   "runtime" -- the scene keeps plain, fully editable Polygon2D; the
+//                StaticPolygonMesh.gd script attached to each swaps its
+//                drawing for a MeshInstance2D child when the GAME runs
+//                (does nothing in the editor). Default.
+//   "export"  -- the exporter replaces them by MeshInstance2D with a baked
+//                ArrayMesh (not editable as polygons, see
+//                _convertStaticPolygonsToMeshes).
+//   "off"     -- plain Polygon2D.
+var STATIC_POLYGON_MESH_MODE = "runtime";
+
 var ENABLE_ANTIALIASED_SHAPES = true;
 
 function _sanitize_name(name) {
@@ -2501,6 +2514,10 @@ function _markBakeableShapes(root, anim) {
             node._mergeSafe = true;
             markedAny = true;
         }
+        // Any Polygon2D no AnimationPlayer track touches (material or not):
+        // eligible for the runtime mesh swap (StaticPolygonMesh.gd), which
+        // copes with materials through use_parent_material.
+        if (!nodeAnimated && node !== root && node.type === "Polygon2D") node._staticPoly = true;
         var childMaterialAncestor = materialAncestor || hasOwnMaterial;
         for (var i = 0; i < node.children.length; i++) {
             walk(node.children[i], nodeAnimated, childMaterialAncestor);
@@ -4066,6 +4083,15 @@ function _processElementNode(elem, parent, ownerRoot, anim, startTime, duration,
                             texStr += 'fill = 1\n';
                             texStr += 'fill_from = Vector2(0.5, 0.5)\n';
                             texStr += 'fill_to = Vector2(1, 0.5)\n';
+                            // The UVs above are in pixels of a 64x64 texture.
+                            texStr += 'width = 64\n';
+                            texStr += 'height = 64\n';
+                        } else {
+                            // ... and of a 256 px wide one for a linear gradient
+                            // (u *= 256 above). Explicit: Godot 3's GradientTexture
+                            // defaults to 2048 px, which squashed every gradient
+                            // into the first eighth of its length.
+                            texStr += 'width = 256\n';
                         }
                         subResources.push(texStr);
                         if (gradCache) gradCache[gSig] = texIdStr;
@@ -5067,9 +5093,305 @@ function _buildSceneTree(sym, frameRate, exportDir, symbolMap, symbolContainsSha
     // "AntialiasedLine2D" directly. Needs getExt (a closure over this
     // function's own extResources/extIdMap), so it has to run here, inside
     // _buildSceneTree, rather than later in serializeTscn/buildSceneForSymbol.
+    if (STATIC_POLYGON_MESH_MODE === "export") _convertStaticPolygonsToMeshes(root, subResources);
+    else if (STATIC_POLYGON_MESH_MODE === "runtime") _attachStaticPolygonMeshScripts(root, getExt);
+
     if (ENABLE_ANTIALIASED_SHAPES) _attachAntialiasedScripts(root, getExt);
 
     return { root: root, extResources: extResources, subResources: subResources, actionScripts: actionScripts };
+}
+
+// "runtime" mode of STATIC_POLYGON_MESH_MODE: attaches StaticPolygonMesh.gd to
+// every static Polygon2D (before _attachAntialiasedScripts, which then skips
+// nodes that already have a script -- the antialiasing script is a no-op on
+// these anyway: stroke_width is always 0).
+function _attachStaticPolygonMeshScripts(node, getExt) {
+    if (node.type === "Polygon2D" && node._staticPoly && !node.properties["instance"] && !node.properties["script"]) {
+        node.properties["script"] = "ExtResource(\"" + getExt("res://scripts/StaticPolygonMesh.gd", "Script") + "\")";
+    }
+    for (var i = 0; i < node.children.length; i++) _attachStaticPolygonMeshScripts(node.children[i], getExt);
+}
+
+// ---------------------------------------------------------------------
+// Static Polygon2D -> MeshInstance2D (STATIC_POLYGON_MESH_MODE = "export")
+//
+// Godot 3's GLES2 batcher re-transforms every vertex of every batched
+// Polygon2D on the CPU each frame; a MeshInstance2D keeps its vertices
+// on the GPU. Measured on a real room (~1900 static Polygon2D): 2.1 ms ->
+// 0.6 ms per frame, pixel-identical. So every Polygon2D that nothing
+// animates (_mergeSafe, see _markBakeableShapes) is turned into a
+// MeshInstance2D carrying an ArrayMesh sub-resource, triangulated HERE
+// with a port of Godot 3.6's own core/math/triangulate.cpp (same ear
+// clipping, same relaxed retry, float32 arithmetic emulated) so the mesh
+// is exactly the triangulation Polygon2D would have computed at runtime.
+// Any shape this port fails to triangulate stays a Polygon2D (it then
+// behaves exactly as before).
+// ---------------------------------------------------------------------
+var _stFr = (function () {
+    // Bound ONCE: this is called tens of millions of times per export, so
+    // no per-call feature test.
+    if (typeof Math.fround === "function") return Math.fround;
+    if (typeof Float32Array !== "undefined") {
+        var buf = new Float32Array(1);
+        return function (x) { buf[0] = x; return buf[0]; };
+    }
+    return function (x) { return x; };
+})();
+var _ST_CMP_EPSILON = _stFr(0.00001);
+
+function _stArea(c) {
+    var n = c.length, A = 0;
+    for (var p = n - 1, q = 0; q < n; p = q++) {
+        var cr = _stFr(_stFr(c[p][0] * c[q][1]) - _stFr(c[p][1] * c[q][0]));
+        A = _stFr(A + cr);
+    }
+    return _stFr(A * 0.5);
+}
+
+// Godot's Triangulate::snip + is_inside_triangle, fused: the triangle's own
+// edge vectors are constant across the point loop, and each cross product
+// is only evaluated if the previous ones passed (same boolean result as
+// the original && chain, just without the wasted float32 roundings).
+function _stSnip(c, u, v, w, n, V, relaxed) {
+    var Ax = c[V[u]][0], Ay = c[V[u]][1];
+    var Bx = c[V[v]][0], By = c[V[v]][1];
+    var Cx = c[V[w]][0], Cy = c[V[w]][1];
+    var threshold = relaxed ? -_ST_CMP_EPSILON : _ST_CMP_EPSILON;
+    var area = _stFr(_stFr(_stFr(Bx - Ax) * _stFr(Cy - Ay)) - _stFr(_stFr(By - Ay) * _stFr(Cx - Ax)));
+    if (threshold > area) return false;
+    var fr = _stFr;
+    var ax = fr(Cx - Bx), ay = fr(Cy - By);
+    var bx = fr(Ax - Cx), by = fr(Ay - Cy);
+    var cx = fr(Bx - Ax), cy = fr(By - Ay);
+    for (var p = 0; p < n; p++) {
+        if (p === u || p === v || p === w) continue;
+        var Px = c[V[p]][0], Py = c[V[p]][1];
+        var bpx = fr(Px - Bx), bpy = fr(Py - By);
+        var aCROSSbp = fr(fr(ax * bpy) - fr(ay * bpx));
+        if (relaxed ? !(aCROSSbp > 0) : !(aCROSSbp >= 0)) continue;
+        var cpx = fr(Px - Cx), cpy = fr(Py - Cy);
+        var bCROSScp = fr(fr(bx * cpy) - fr(by * cpx));
+        if (relaxed ? !(bCROSScp > 0) : !(bCROSScp >= 0)) continue;
+        var apx = fr(Px - Ax), apy = fr(Py - Ay);
+        var cCROSSap = fr(fr(cx * apy) - fr(cy * apx));
+        if (relaxed ? !(cCROSSap > 0) : !(cCROSSap >= 0)) continue;
+        return false;
+    }
+    return true;
+}
+
+// contour: array of [x, y] (already float32-rounded). Returns an array of
+// indices (3 per triangle), or null where Godot's own function fails.
+function _stTriangulate(contour) {
+    var n = contour.length;
+    if (n < 3) return null;
+    var V = [];
+    var v;
+    if (0 < _stArea(contour)) { for (v = 0; v < n; v++) V.push(v); }
+    else { for (v = 0; v < n; v++) V.push((n - 1) - v); }
+    var relaxed = false;
+    var nv = n;
+    var count = 2 * nv;
+    var result = [];
+    for (v = nv - 1; nv > 2;) {
+        if (0 >= (count--)) {
+            if (relaxed) return null;
+            count = 2 * nv;
+            relaxed = true;
+        }
+        var u = v;
+        if (nv <= u) u = 0;
+        v = u + 1;
+        if (nv <= v) v = 0;
+        var w = v + 1;
+        if (nv <= w) w = 0;
+        if (_stSnip(contour, u, v, w, nv, V, relaxed)) {
+            result.push(V[u], V[v], V[w]);
+            for (var s = v, t = v + 1; t < nv; s++, t++) V[s] = V[t];
+            nv--;
+            count = 2 * nv;
+        }
+    }
+    return result;
+}
+
+function _stNumbers(str) {
+    str = str.replace(/^[A-Za-z0-9_]+\(/, "");
+    var m = str.match(/-?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?/g);
+    var out = [];
+    if (m) for (var i = 0; i < m.length; i++) out.push(parseFloat(m[i]));
+    return out;
+}
+
+// Same triangulation Polygon2D does in _notification(NOTIFICATION_DRAW):
+// the whole polygon when there is no "polygons" entry, otherwise each
+// index group on its own, mapped back to the global point indices.
+// Returns null when Godot would draw nothing / when anything is unusual.
+function _stTriangulatePolygon2D(pts, groups) {
+    var i, j;
+    var pf = [];
+    for (i = 0; i < pts.length; i++) pf.push([_stFr(pts[i][0]), _stFr(pts[i][1])]);
+    if (groups.length === 0) return _stTriangulate(pf);
+    var total = [];
+    for (i = 0; i < groups.length; i++) {
+        var g = groups[i];
+        if (g.length < 3) continue;
+        var sub = [];
+        for (j = 0; j < g.length; j++) {
+            if (g[j] < 0 || g[j] >= pts.length) return null;
+            sub.push(pf[g[j]]);
+        }
+        var idx = _stTriangulate(sub);
+        if (idx === null) {
+            // Godot's triangulate_polygon returns an EMPTY array on failure
+            // and Polygon2D then just draws nothing for that group -- keep
+            // that exact behaviour.
+            continue;
+        }
+        for (j = 0; j < idx.length; j++) total.push(g[idx[j]]);
+    }
+    return total;
+}
+
+// Size Godot 3.6 reports for a texture sub-resource this exporter emits
+// (Polygon2D divides pixel-space UVs by it). null = unknown -> don't convert.
+function _stTextureSize(texRef, subResources) {
+    var m = texRef.match(/SubResource\("([^"]+)"\)/);
+    if (!m) return null;
+    var block = null;
+    for (var i = 0; i < subResources.length; i++) {
+        if (subResources[i].indexOf('id="' + m[1] + '"') !== -1) { block = subResources[i]; break; }
+    }
+    if (!block) return null;
+    var wM = block.match(/^width = (\d+)/m);
+    var hM = block.match(/^height = (\d+)/m);
+    if (block.indexOf('type="GradientTexture1D"') !== -1) {
+        return [wM ? parseInt(wM[1], 10) : 2048, 1];
+    }
+    if (block.indexOf('type="GradientTexture2D"') !== -1) {
+        return [wM ? parseInt(wM[1], 10) : 64, hM ? parseInt(hM[1], 10) : 64];
+    }
+    return null;
+}
+
+var _ST_ALLOWED_PROPS = {
+    "color": 1, "position": 1, "rotation": 1, "scale": 1, "modulate": 1,
+    "polygon": 1, "polygons": 1, "texture": 1, "uv": 1, "visible": 1,
+    "process_mode": 1, "skew": 1, "use_parent_material": 1, "z_index": 1,
+    "z_as_relative": 1, "self_modulate": 1
+};
+var _ST_COPIED_PROPS = ["position", "rotation", "scale", "skew", "modulate", "self_modulate",
+    "visible", "process_mode", "use_parent_material", "z_index", "z_as_relative", "texture"];
+
+function _stIsWhite(colorStr) {
+    var n = _stNumbers(colorStr);
+    return n.length >= 4 && n[0] === 1 && n[1] === 1 && n[2] === 1 && n[3] === 1;
+}
+
+// float32 values printed with enough digits to round-trip exactly.
+function _stFmt(v) {
+    return String(parseFloat(_stFr(v).toPrecision(9)));
+}
+
+// Returns the converted node (already swapped into the tree), or null.
+function _stConvertNode(node, subResources) {
+    var props = node.properties;
+    for (var k in props) {
+        if (!_ST_ALLOWED_PROPS[k]) return null;
+    }
+    if (!props["polygon"]) return null;
+    // `color` tints the whole fill: it becomes self_modulate, so it can't
+    // coexist with the node's own self_modulate.
+    var hasColor = props["color"] && !_stIsWhite(props["color"]);
+    if (hasColor && props["self_modulate"]) return null;
+
+    var pn = _stNumbers(props["polygon"]);
+    if (pn.length < 6 || (pn.length % 2) !== 0) return null;
+    var pts = [];
+    for (var i = 0; i < pn.length; i += 2) pts.push([pn[i], pn[i + 1]]);
+
+    var groups = [];
+    if (props["polygons"]) {
+        var gm = props["polygons"].match(/PackedInt32Array\(([^)]*)\)/g);
+        if (!gm) return null;
+        for (var gi = 0; gi < gm.length; gi++) groups.push(_stNumbers(gm[gi].replace(/^PackedInt32Array/, "")));
+    }
+
+    var indices = _stTriangulatePolygon2D(pts, groups);
+    if (indices === null || indices.length < 3) return null;
+
+    // UVs, exactly as Polygon2D computes them: uv (or the point itself when
+    // the counts differ) divided by the texture size.
+    var uvArr = null;
+    if (props["texture"]) {
+        var size = _stTextureSize(props["texture"], subResources);
+        if (!size) return null;
+        var un = props["uv"] ? _stNumbers(props["uv"]) : [];
+        var useUv = (un.length === pn.length);
+        uvArr = [];
+        for (var u = 0; u < pts.length; u++) {
+            var ux = useUv ? un[u * 2] : pts[u][0];
+            var uy = useUv ? un[u * 2 + 1] : pts[u][1];
+            uvArr.push([_stFr(_stFr(ux) / _stFr(size[0])), _stFr(_stFr(uy) / _stFr(size[1]))]);
+        }
+    }
+
+    var vParts = [], uParts = [], iParts = [];
+    for (var v = 0; v < pts.length; v++) {
+        vParts.push(pn[v * 2] + ", " + pn[v * 2 + 1]);
+        if (uvArr) uParts.push(_stFmt(uvArr[v][0]) + ", " + _stFmt(uvArr[v][1]));
+    }
+    for (var t = 0; t < indices.length; t++) iParts.push(String(indices[t]));
+
+    var meshId = "Mesh_" + nextId();
+    var meshStr = '[sub_resource type="ArrayMesh" id="' + meshId + '"]\n'
+        + 'surfaces/0 = {\n'
+        + '"arrays": [PackedVector2Array(' + vParts.join(", ") + '), null, null, null, '
+        + (uvArr ? 'PackedVector2Array(' + uParts.join(", ") + ')' : 'null')
+        + ', null, null, null, PackedInt32Array(' + iParts.join(", ") + ')],\n'
+        + '"morph_arrays": [],\n'
+        + '"primitive": 4\n'
+        + '}\n';
+    subResources.push(meshStr);
+
+    var mi = new GNode(node.name, "MeshInstance2D");
+    mi._mergeSafe = node._mergeSafe;
+    mi._renderRank = node._renderRank;
+    for (var c = 0; c < _ST_COPIED_PROPS.length; c++) {
+        var key = _ST_COPIED_PROPS[c];
+        if (props[key] !== undefined) mi.properties[key] = props[key];
+    }
+    if (hasColor) mi.properties["self_modulate"] = props["color"];
+    mi.properties["mesh"] = 'SubResource("' + meshId + '")';
+    return mi;
+}
+
+function _convertStaticPolygonsToMeshes(node, subResources) {
+    var converted = 0;
+    for (var i = 0; i < node.children.length; i++) {
+        var child = node.children[i];
+        if (child._mergeSafe && child.type === "Polygon2D" && !child.properties["instance"] && !child.properties["script"]) {
+            var mi = _stConvertNode(child, subResources);
+            if (mi) {
+                // Same slot, same name, same descendants.
+                var kids = child.children.slice(0);
+                node.children[i] = mi;
+                mi.parent = node;
+                delete node._childByName["$" + child.name];
+                node._childByName["$" + mi.name] = mi;
+                child.parent = null;
+                for (var k = 0; k < kids.length; k++) {
+                    kids[k].parent = mi;
+                    mi.children.push(kids[k]);
+                    mi._childByName["$" + kids[k].name] = kids[k];
+                }
+                child = mi;
+                converted++;
+            }
+        }
+        converted += _convertStaticPolygonsToMeshes(child, subResources);
+    }
+    return converted;
 }
 
 // Attaches the antialiased_line2d addon's own Polygon2D/Line2D subclass
@@ -6084,6 +6406,219 @@ function buildGodotScenes(doc, data, exportDir) {
     "\t\tmesh = _meshes[mesh_index]\n";
     FLfile.write(scriptDir + "/TweenShapeMesh.gd", tweenMeshContent);
 
+    var staticPolygonMeshContent = "extends Polygon2D\n" +
+    "class_name StaticPolygonMesh\n" +
+    "\n" +
+    "## Attached (by godotBuilder.jsfl) to every Polygon2D nothing animates. In the\n" +
+    "## EDITOR this script does nothing (no `tool`): the node stays a plain,\n" +
+    "## fully editable Polygon2D. At RUNTIME it draws the fill through a child\n" +
+    "## MeshInstance2D instead: Godot 3's GLES2 batcher re-transforms every vertex\n" +
+    "## of every Polygon2D on the CPU each frame, a mesh keeps its vertices on the\n" +
+    "## GPU (~3x cheaper on a real room, pixel-identical).\n" +
+    "##\n" +
+    "## The Polygon2D keeps behaving like one for the rest of the game:\n" +
+    "##  - `polygon` still READS back its real points (_get below), while the\n" +
+    "##    node's own drawing is emptied so nothing is drawn twice;\n" +
+    "##  - `color`, `self_modulate`, `texture`, `polygon`, `uv`, `polygons` set at\n" +
+    "##    runtime are mirrored onto the mesh (_set below);\n" +
+    "##  - anything this can't reproduce exactly (offset, texture transform,\n" +
+    "##    invert, vertex colors, antialiased, skeleton) leaves the node alone.\n" +
+    "##\n" +
+    "## Meshes are shared between every node with the same shape (in-memory cache\n" +
+    "## keyed on a native hash, verified by content) and can be pre-built offline\n" +
+    "## into res://cache/static_polygon_mesh_cache.dat by BuildTweenMeshCache.gd.\n" +
+    "\n" +
+    "const ENABLED = true\n" +
+    "\n" +
+    "const CACHE_RES_PATH = \"res://cache/static_polygon_mesh_cache.dat\"\n" +
+    "\n" +
+    "## hash -> Array of {\"p\",\"g\",\"u\",\"s\",\"mesh\"}; a const Dictionary is shared by\n" +
+    "## every instance and stays mutable (GDScript 3 has no static vars).\n" +
+    "const _cache = {}\n" +
+    "const _disk_cache_loaded = [false]\n" +
+    "\n" +
+    "var _mi = null          # the child MeshInstance2D once converted\n" +
+    "var _orig_polygon = PoolVector2Array()\n" +
+    "var _rebuild_pending = false\n" +
+    "\n" +
+    "static func _key(pts, groups, uvs, size):\n" +
+    "\treturn hash([pts, groups, uvs, size])\n" +
+    "\n" +
+    "## Returns the cached ArrayMesh for this exact shape, building (and caching) it\n" +
+    "## when missing. null when Godot's triangulation fails (Polygon2D then draws\n" +
+    "## nothing for it, so the caller leaves the node alone).\n" +
+    "static func _get_mesh(pts, groups, uvs, size, has_texture):\n" +
+    "\tvar key = _key(pts, groups, uvs, size)\n" +
+    "\tvar bucket = _cache.get(key)\n" +
+    "\tif bucket != null:\n" +
+    "\t\tfor e in bucket:\n" +
+    "\t\t\tif e[\"p\"] == pts and e[\"g\"] == groups and e[\"u\"] == uvs and e[\"s\"] == size:\n" +
+    "\t\t\t\treturn e[\"mesh\"]\n" +
+    "\tvar mesh = _build_mesh(pts, groups, uvs, size, has_texture)\n" +
+    "\tif mesh == null:\n" +
+    "\t\treturn null\n" +
+    "\tif bucket == null:\n" +
+    "\t\tbucket = []\n" +
+    "\t\t_cache[key] = bucket\n" +
+    "\tbucket.append({\"p\": pts, \"g\": groups, \"u\": uvs, \"s\": size, \"mesh\": mesh})\n" +
+    "\treturn mesh\n" +
+    "\n" +
+    "# The triangulation Polygon2D itself does in NOTIFICATION_DRAW.\n" +
+    "static func _build_mesh(pts, groups, uvs, size, has_texture):\n" +
+    "\tvar idx = PoolIntArray()\n" +
+    "\tif groups.size() == 0:\n" +
+    "\t\tidx = Geometry.triangulate_polygon(pts)\n" +
+    "\telse:\n" +
+    "\t\tfor g in groups:\n" +
+    "\t\t\tif g.size() < 3:\n" +
+    "\t\t\t\tcontinue\n" +
+    "\t\t\tvar sub = PoolVector2Array()\n" +
+    "\t\t\tfor i in g:\n" +
+    "\t\t\t\tif i < 0 or i >= pts.size():\n" +
+    "\t\t\t\t\treturn null\n" +
+    "\t\t\t\tsub.append(pts[i])\n" +
+    "\t\t\tvar t = Geometry.triangulate_polygon(sub)\n" +
+    "\t\t\tfor k in t:\n" +
+    "\t\t\t\tidx.append(g[k])\n" +
+    "\tif idx.size() < 3:\n" +
+    "\t\treturn null\n" +
+    "\tvar arrays = []\n" +
+    "\tarrays.resize(ArrayMesh.ARRAY_MAX)\n" +
+    "\tarrays[ArrayMesh.ARRAY_VERTEX] = pts\n" +
+    "\tarrays[ArrayMesh.ARRAY_INDEX] = idx\n" +
+    "\tif has_texture:\n" +
+    "\t\tvar n = pts.size()\n" +
+    "\t\tvar out = PoolVector2Array()\n" +
+    "\t\tout.resize(n)\n" +
+    "\t\tvar use_uv = uvs.size() == n\n" +
+    "\t\tfor i in range(n):\n" +
+    "\t\t\tvar p = uvs[i] if use_uv else pts[i]\n" +
+    "\t\t\tout[i] = Vector2(p.x / size.x, p.y / size.y)\n" +
+    "\t\tarrays[ArrayMesh.ARRAY_TEX_UV] = out\n" +
+    "\tvar mesh = ArrayMesh.new()\n" +
+    "\tmesh.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, arrays)\n" +
+    "\treturn mesh\n" +
+    "\n" +
+    "static func _ensure_disk_cache_loaded():\n" +
+    "\tif _disk_cache_loaded[0]:\n" +
+    "\t\treturn\n" +
+    "\t_disk_cache_loaded[0] = true\n" +
+    "\tvar f = File.new()\n" +
+    "\tif not f.file_exists(CACHE_RES_PATH):\n" +
+    "\t\treturn\n" +
+    "\tif f.open(CACHE_RES_PATH, File.READ) != OK:\n" +
+    "\t\treturn\n" +
+    "\tvar loaded = bytes2var(f.get_buffer(f.get_len()), true)\n" +
+    "\tf.close()\n" +
+    "\tif typeof(loaded) != TYPE_DICTIONARY:\n" +
+    "\t\treturn\n" +
+    "\tfor key in loaded:\n" +
+    "\t\tif not _cache.has(key):\n" +
+    "\t\t\t_cache[key] = loaded[key]\n" +
+    "\n" +
+    "## Called by BuildTweenMeshCache.gd after sweeping every scene.\n" +
+    "static func save_cache_to_disk():\n" +
+    "\tvar dir = Directory.new()\n" +
+    "\tvar base = CACHE_RES_PATH.get_base_dir()\n" +
+    "\tif not dir.dir_exists(base):\n" +
+    "\t\tdir.make_dir_recursive(base)\n" +
+    "\tvar f = File.new()\n" +
+    "\tif f.open(CACHE_RES_PATH, File.WRITE) != OK:\n" +
+    "\t\tpush_error(\"StaticPolygonMesh.save_cache_to_disk: cannot open \" + CACHE_RES_PATH)\n" +
+    "\t\treturn\n" +
+    "\tf.store_buffer(var2bytes(_cache, true))\n" +
+    "\tf.close()\n" +
+    "\n" +
+    "func _ready():\n" +
+    "\tif not ENABLED or Engine.editor_hint:\n" +
+    "\t\treturn\n" +
+    "\t_ensure_disk_cache_loaded()\n" +
+    "\t_convert()\n" +
+    "\n" +
+    "func _can_convert():\n" +
+    "\treturn polygon.size() >= 3 \\\n" +
+    "\t\tand offset == Vector2.ZERO \\\n" +
+    "\t\tand texture_offset == Vector2.ZERO \\\n" +
+    "\t\tand texture_scale == Vector2.ONE \\\n" +
+    "\t\tand texture_rotation == 0.0 \\\n" +
+    "\t\tand not invert_enable \\\n" +
+    "\t\tand vertex_colors.size() == 0 \\\n" +
+    "\t\tand not antialiased \\\n" +
+    "\t\tand internal_vertex_count == 0 \\\n" +
+    "\t\tand skeleton == NodePath()\n" +
+    "\n" +
+    "func _convert():\n" +
+    "\tif _mi != null or not _can_convert():\n" +
+    "\t\treturn\n" +
+    "\tvar mesh = _mesh_for(polygon)\n" +
+    "\tif mesh == null:\n" +
+    "\t\treturn\n" +
+    "\t_orig_polygon = polygon\n" +
+    "\tvar mi = MeshInstance2D.new()\n" +
+    "\tmi.name = \"_static_mesh\"\n" +
+    "\tmi.use_parent_material = true\n" +
+    "\tmi.mesh = mesh\n" +
+    "\tmi.texture = texture\n" +
+    "\tmi.self_modulate = color * self_modulate\n" +
+    "\tadd_child(mi)\n" +
+    "\tmove_child(mi, 0)\n" +
+    "\t# Empty the node's own drawing (its real points stay readable, see _get).\n" +
+    "\t# _mi is still null here, so _set doesn't treat this as a user edit.\n" +
+    "\tpolygon = PoolVector2Array()\n" +
+    "\t_mi = mi\n" +
+    "\n" +
+    "func _mesh_for(pts):\n" +
+    "\tvar size = Vector2.ONE\n" +
+    "\tif texture != null:\n" +
+    "\t\tsize = texture.get_size()\n" +
+    "\treturn _get_mesh(pts, polygons, uv, size, texture != null)\n" +
+    "\n" +
+    "func _get(property):\n" +
+    "\tif _mi != null and property == \"polygon\":\n" +
+    "\t\treturn _orig_polygon\n" +
+    "\treturn null\n" +
+    "\n" +
+    "func _set(property, value):\n" +
+    "\tif _mi == null:\n" +
+    "\t\treturn false\n" +
+    "\tmatch property:\n" +
+    "\t\t\"polygon\":\n" +
+    "\t\t\t# Keep the node's own drawing empty; rebuild the mesh from the new points.\n" +
+    "\t\t\t_orig_polygon = value\n" +
+    "\t\t\t_queue_rebuild()\n" +
+    "\t\t\treturn true\n" +
+    "\t\t\"color\":\n" +
+    "\t\t\t_mi.self_modulate = value * self_modulate\n" +
+    "\t\t\"self_modulate\":\n" +
+    "\t\t\t_mi.self_modulate = color * value\n" +
+    "\t\t\"texture\", \"uv\", \"polygons\":\n" +
+    "\t\t\t_queue_rebuild()\n" +
+    "\treturn false\n" +
+    "\n" +
+    "func _queue_rebuild():\n" +
+    "\tif not _rebuild_pending:\n" +
+    "\t\t_rebuild_pending = true\n" +
+    "\t\tcall_deferred(\"_rebuild\")\n" +
+    "\n" +
+    "func _rebuild():\n" +
+    "\t_rebuild_pending = false\n" +
+    "\tif _mi == null:\n" +
+    "\t\treturn\n" +
+    "\tvar mesh = null\n" +
+    "\tif _orig_polygon.size() >= 3:\n" +
+    "\t\tmesh = _mesh_for(_orig_polygon)\n" +
+    "\tif mesh == null:\n" +
+    "\t\t# Can't build it: give the drawing back to the Polygon2D itself.\n" +
+    "\t\tvar pts = _orig_polygon\n" +
+    "\t\t_mi.queue_free()\n" +
+    "\t\t_mi = null\n" +
+    "\t\tpolygon = pts\n" +
+    "\t\treturn\n" +
+    "\t_mi.mesh = mesh\n" +
+    "\t_mi.texture = texture\n" +
+    "\t_mi.self_modulate = color * self_modulate\n";
+    FLfile.write(scriptDir + "/StaticPolygonMesh.gd", staticPolygonMeshContent);
+
     var tweenConverterContent = "extends Polygon2D\n" +
     "class_name TweenShapeMeshConverter\n" +
     "## Attached (by godotBuilder.jsfl) to any Polygon2D whose \"polygon\" fill is\n" +
@@ -6271,10 +6806,94 @@ function buildGodotScenes(doc, data, exportDir) {
     "\t\tperf_log.time_start(perf_label)\n" +
     "\n" +
     "\tvar my_path = root.get_path_to(self)\n" +
+    "\tvar mesh_index_track_name = \"%s:mesh_index\" % my_path\n" +
+    "\n" +
+    "\t# Pass 1 + mesh build are identical for every instance of the same scene (they\n" +
+    "\t# only read the shared Animation resources), so they run once per (animations,\n" +
+    "\t# node path) and are cached -- see _conversion_cache. Only Pass 2 below (idempotent)\n" +
+    "\t# and the node swap run per instance.\n" +
+    "\tvar conv_key = _conversion_key(ap, my_path)\n" +
+    "\tvar conv = _conversion_cache.get(conv_key)\n" +
+    "\tif conv == null:\n" +
+    "\t\tconv = _derive_conversion(ap, my_path)\n" +
+    "\t\t_conversion_cache[conv_key] = conv\n" +
+    "\tvar per_anim: Array = conv[\"per_anim\"]\n" +
+    "\tvar meshes: Array = conv[\"meshes\"]\n" +
+    "\tif per_anim.empty():\n" +
+    "\t\tif perf:\n" +
+    "\t\t\tperf_log.time_end(perf_label)\n" +
+    "\t\treturn  # Nothing animated (or already fully static): stay a plain Polygon2D.\n" +
+    "\n" +
+    "\t# Pass 2 (mutating, but idempotent): add the \":mesh_index\" track and\n" +
+    "\t# disable the now-redundant source tracks, but only the FIRST time --\n" +
+    "\t# later instances sharing this same Animation resource see it already\n" +
+    "\t# converted and skip straight past.\n" +
+    "\tfor entry in per_anim:\n" +
+    "\t\tvar anim: Animation = entry[\"anim\"]\n" +
+    "\t\tif anim.find_track(NodePath(mesh_index_track_name)) == -1:\n" +
+    "\t\t\tvar mi_idx = anim.add_track(Animation.TYPE_VALUE)\n" +
+    "\t\t\tanim.track_set_path(mi_idx, mesh_index_track_name)\n" +
+    "\t\t\tanim.value_track_set_update_mode(mi_idx, Animation.UPDATE_DISCRETE)\n" +
+    "\t\t\tvar times: Array = entry[\"times\"]\n" +
+    "\t\t\tvar mesh_indices: Array = entry[\"mesh_indices\"]\n" +
+    "\t\t\tfor k in range(times.size()):\n" +
+    "\t\t\t\tanim.track_insert_key(mi_idx, times[k], mesh_indices[k])\n" +
+    "\n" +
+    "\t\t\tanim.track_set_enabled(entry[\"poly_idx\"], false)\n" +
+    "\t\t\tvar uv_idx: int = entry[\"uv_idx\"]\n" +
+    "\t\t\tif uv_idx != -1:\n" +
+    "\t\t\t\tanim.track_set_enabled(uv_idx, false)\n" +
+    "\t\t\tvar polys_idx: int = entry[\"polys_idx\"]\n" +
+    "\t\t\tif polys_idx != -1:\n" +
+    "\t\t\t\tanim.track_set_enabled(polys_idx, false)\n" +
+    "\n" +
+    "\t# Swap self for a TweenShapeMesh carrying the same transform/visuals --\n" +
+    "\t# every instance does this, unconditionally, since nodes are never\n" +
+    "\t# shared across instances the way the Animation resource above is.\n" +
+    "\tvar mesh_node = TweenShapeMeshScript.new()\n" +
+    "\tmesh_node.name = name\n" +
+    "\tmesh_node.position = position\n" +
+    "\tmesh_node.rotation = rotation\n" +
+    "\tmesh_node.scale = scale\n" +
+    "\tmesh_node.skew = skew\n" +
+    "\tmesh_node.z_index = z_index\n" +
+    "\tmesh_node.z_as_relative = z_as_relative\n" +
+    "\tmesh_node.visible = visible\n" +
+    "\tmesh_node.modulate = color\n" +
+    "\tmesh_node.texture = texture\n" +
+    "\tmesh_node.set_meshes(meshes)\n" +
+    "\n" +
+    "\t# The tree is still mid-setup while sibling _ready() calls are firing\n" +
+    "\t# (this is one of them): add_child()/move_child()/owner all reject\n" +
+    "\t# synchronous calls here (\"Parent node is busy setting up children\").\n" +
+    "\t# Defer the whole swap to run once that batch finishes, and remove self\n" +
+    "\t# BEFORE adding mesh_node (same name) so Godot never has to uniquify it\n" +
+    "\t# against the still-present original -- which would break every\n" +
+    "\t# NodePath the AnimationPlayer tracks above already point to.\n" +
+    "\tcall_deferred(\"_finish_swap\", mesh_node, get_parent(), get_index(), owner)\n" +
+    "\tif perf:\n" +
+    "\t\tperf_log.time_end(perf_label)\n" +
+    "\n" +
+    "\n" +
+    "## (animation resource ids + node path) -> {\"per_anim\", \"meshes\"}, see _ready.\n" +
+    "## Holding the Animations in per_anim keeps them alive, so an id can never be reused\n" +
+    "## by another resource while its entry exists.\n" +
+    "const _conversion_cache = {}\n" +
+    "\n" +
+    "static func _conversion_key(ap, my_path) -> String:\n" +
+    "\tvar key = str(my_path)\n" +
+    "\tfor anim_name in ap.get_animation_list():\n" +
+    "\t\tkey += \"|%d\" % ap.get_animation(anim_name).get_instance_id()\n" +
+    "\treturn key\n" +
+    "\n" +
+    "## Pass 1 + this instance-independent mesh build, split out of _ready() so its\n" +
+    "## RESULT can be cached per (AnimationPlayer's Animation resources, node path), see\n" +
+    "## _conversion_cache. Everything here is derived from the shared, untouched source\n" +
+    "## tracks only, so every instance of the same PackedScene gets the same answer.\n" +
+    "func _derive_conversion(ap, my_path) -> Dictionary:\n" +
     "\tvar poly_track_name = \"%s:polygon\" % my_path\n" +
     "\tvar uv_track_name = \"%s:uv\" % my_path\n" +
     "\tvar polys_track_name = \"%s:polygons\" % my_path\n" +
-    "\tvar mesh_index_track_name = \"%s:mesh_index\" % my_path\n" +
     "\n" +
     "\t# Pass 1 (read-only, deterministic): derive every distinct keyframe\n" +
     "\t# shape -- across every animation touching this node path, RESET\n" +
@@ -6369,9 +6988,7 @@ function buildGodotScenes(doc, data, exportDir) {
     "\t\t})\n" +
     "\n" +
     "\tif per_anim.empty():\n" +
-    "\t\tif perf:\n" +
-    "\t\t\tperf_log.time_end(perf_label)\n" +
-    "\t\treturn  # Nothing animated (or already fully static): stay a plain Polygon2D.\n" +
+    "\t\treturn {\"per_anim\": [], \"meshes\": []}\n" +
     "\n" +
     "\t# Build this instance's own meshes -- reusing an EARLIER instance's\n" +
     "\t# already-built ArrayMesh from _global_mesh_cache wherever shape_\n" +
@@ -6393,55 +7010,7 @@ function buildGodotScenes(doc, data, exportDir) {
     "\t\tmeshes[i] = built\n" +
     "\t\t_global_mesh_cache[cache_key] = {\"tris\": shape_tris[i], \"mesh\": built}\n" +
     "\n" +
-    "\t# Pass 2 (mutating, but idempotent): add the \":mesh_index\" track and\n" +
-    "\t# disable the now-redundant source tracks, but only the FIRST time --\n" +
-    "\t# later instances sharing this same Animation resource see it already\n" +
-    "\t# converted and skip straight past.\n" +
-    "\tfor entry in per_anim:\n" +
-    "\t\tvar anim: Animation = entry[\"anim\"]\n" +
-    "\t\tif anim.find_track(NodePath(mesh_index_track_name)) == -1:\n" +
-    "\t\t\tvar mi_idx = anim.add_track(Animation.TYPE_VALUE)\n" +
-    "\t\t\tanim.track_set_path(mi_idx, mesh_index_track_name)\n" +
-    "\t\t\tanim.value_track_set_update_mode(mi_idx, Animation.UPDATE_DISCRETE)\n" +
-    "\t\t\tvar times: Array = entry[\"times\"]\n" +
-    "\t\t\tvar mesh_indices: Array = entry[\"mesh_indices\"]\n" +
-    "\t\t\tfor k in range(times.size()):\n" +
-    "\t\t\t\tanim.track_insert_key(mi_idx, times[k], mesh_indices[k])\n" +
-    "\n" +
-    "\t\t\tanim.track_set_enabled(entry[\"poly_idx\"], false)\n" +
-    "\t\t\tvar uv_idx: int = entry[\"uv_idx\"]\n" +
-    "\t\t\tif uv_idx != -1:\n" +
-    "\t\t\t\tanim.track_set_enabled(uv_idx, false)\n" +
-    "\t\t\tvar polys_idx: int = entry[\"polys_idx\"]\n" +
-    "\t\t\tif polys_idx != -1:\n" +
-    "\t\t\t\tanim.track_set_enabled(polys_idx, false)\n" +
-    "\n" +
-    "\t# Swap self for a TweenShapeMesh carrying the same transform/visuals --\n" +
-    "\t# every instance does this, unconditionally, since nodes are never\n" +
-    "\t# shared across instances the way the Animation resource above is.\n" +
-    "\tvar mesh_node = TweenShapeMeshScript.new()\n" +
-    "\tmesh_node.name = name\n" +
-    "\tmesh_node.position = position\n" +
-    "\tmesh_node.rotation = rotation\n" +
-    "\tmesh_node.scale = scale\n" +
-    "\tmesh_node.skew = skew\n" +
-    "\tmesh_node.z_index = z_index\n" +
-    "\tmesh_node.z_as_relative = z_as_relative\n" +
-    "\tmesh_node.visible = visible\n" +
-    "\tmesh_node.modulate = color\n" +
-    "\tmesh_node.texture = texture\n" +
-    "\tmesh_node.set_meshes(meshes)\n" +
-    "\n" +
-    "\t# The tree is still mid-setup while sibling _ready() calls are firing\n" +
-    "\t# (this is one of them): add_child()/move_child()/owner all reject\n" +
-    "\t# synchronous calls here (\"Parent node is busy setting up children\").\n" +
-    "\t# Defer the whole swap to run once that batch finishes, and remove self\n" +
-    "\t# BEFORE adding mesh_node (same name) so Godot never has to uniquify it\n" +
-    "\t# against the still-present original -- which would break every\n" +
-    "\t# NodePath the AnimationPlayer tracks above already point to.\n" +
-    "\tcall_deferred(\"_finish_swap\", mesh_node, get_parent(), get_index(), owner)\n" +
-    "\tif perf:\n" +
-    "\t\tperf_log.time_end(perf_label)\n" +
+    "\treturn {\"per_anim\": per_anim, \"meshes\": meshes}\n" +
     "\n" +
     "\n" +
     "func _finish_swap(mesh_node: Node, parent: Node, index: int, scene_owner: Node) -> void: ##LOCK_SYMBOLS\n" +
