@@ -2336,10 +2336,10 @@ function _flattenSingleChildGroups(root, anim) {
 // colors at generation time, giving the node an already-tinted texture
 // instead of the shader. The node then no longer needs a material at
 // all, and becomes eligible for runtime baking (_markBakeableShapes).
-// EXACT formula taken from flash_color_normal.gdshader:
+// EXACT formula taken from flash_color_normal.shader:
 //   COLOR = clamp(tex * color_mult + color_offset_255/255, 0, 1)
 // Deliberate limitation: only the "normal" blend mode (flash_color_
-// normal.gdshader, render_mode blend_mix). "add"/"multiply" depend on the
+// normal.shader, render_mode blend_mix). "add"/"multiply" depend on the
 // content already present in the framebuffer at draw time (real-time GPU
 // blending): impossible to reproduce by pre-tinting a texture, so those
 // shapes keep their material and stay out of baking.
@@ -2397,7 +2397,7 @@ function _bakeStaticShaderTints(root, anim, subResources) {
         var matMatch = String(node.properties["material"]).match(/SubResource\("([^"]+)"\)/);
         if (!matMatch) return;
         var matBlock = findSubResource(matMatch[1]);
-        if (!matBlock || matBlock.indexOf("flash_color_normal.gdshader") === -1) return;
+        if (!matBlock || matBlock.indexOf("flash_color_normal.shader") === -1) return;
 
         var nodePath = (node === root) ? "." : root.getPathTo(node);
         var offInfo = trackInfo(nodePath, "material:shader_parameter/color_offset_255");
@@ -3372,6 +3372,75 @@ function _sliceAnimation(anim, start, end, padShapeResets) {
         }
     }
     return sliced;
+}
+
+// ---------------------------------------------------------------------------
+// Godot 3.x output (target: a Godot 3.6.3 build with the flash backports --
+// Node2D.skew, CanvasItem.clip_children, CanvasGroup, pause_mode DISABLED,
+// VisibleOnScreenEnabler2D). The whole pipeline keeps building its scenes with
+// Godot 4 spellings internally (string ids, Packed*Array, ...) -- several
+// passes parse those strings back (main-scene script injection, cross-symbol
+// dedup, ext_resource pruning) -- and everything that differs in Godot 3's
+// text format is converted once, by _godot3Text, right before a scene is
+// written to disk.
+// ---------------------------------------------------------------------------
+
+// Godot 4 PROCESS_MODE_DISABLED (4) -> PAUSE_MODE_DISABLED (3) in the patched
+// Godot 3.6; INHERIT is 0 in both.
+function _godot3ProcessMode(v) {
+    return v === 4 ? 3 : v;
+}
+
+function _godot3Text(text) {
+    // Header: no uid in Godot 3, format=2.
+    text = text.replace(/^\[gd_scene load_steps=(\d+) format=3[^\]]*\]/, '[gd_scene load_steps=$1 format=2]');
+
+    // Resource ids: Godot 3 wants plain integers (ExtResource( 12 )), never
+    // strings. Numbered per scene, in order of definition, ext and sub
+    // resources being separate namespaces there.
+    var extIds = {}, subIds = {}, extN = 0, subN = 0;
+    text = text.replace(/^\[ext_resource ([^\n]*?)id="([^"]+)"\]/gm, function (m, pre, id) {
+        extIds[id] = ++extN;
+        return '[ext_resource ' + pre + 'id=' + extN + ']';
+    });
+    text = text.replace(/^\[sub_resource ([^\n]*?)id="([^"]+)"\]/gm, function (m, pre, id) {
+        subIds[id] = ++subN;
+        return '[sub_resource ' + pre + 'id=' + subN + ']';
+    });
+    text = text.replace(/ExtResource\("([^"]+)"\)/g, function (m, id) {
+        if (extIds[id] === undefined) throw new Error("godot3 output: unknown ExtResource id " + id);
+        return 'ExtResource( ' + extIds[id] + ' )';
+    });
+    text = text.replace(/SubResource\("([^"]+)"\)/g, function (m, id) {
+        if (subIds[id] === undefined) throw new Error("godot3 output: unknown SubResource id " + id);
+        return 'SubResource( ' + subIds[id] + ' )';
+    });
+
+    // Packed*Array -> Pool*Array (note PoolRealArray for floats).
+    text = text.replace(/PackedVector2Array\(/g, 'PoolVector2Array(')
+               .replace(/PackedVector3Array\(/g, 'PoolVector3Array(')
+               .replace(/PackedInt32Array\(/g, 'PoolIntArray(')
+               .replace(/PackedFloat32Array\(/g, 'PoolRealArray(')
+               .replace(/PackedColorArray\(/g, 'PoolColorArray(')
+               .replace(/PackedStringArray\(/g, 'PoolStringArray(')
+               .replace(/PackedByteArray\(/g, 'PoolByteArray(');
+
+    // Class renames.
+    text = text.replace(/type="GradientTexture1D"/g, 'type="GradientTexture"')
+               .replace(/type="Texture2D"/g, 'type="Texture"')
+               .replace(/type="Sprite2D"/g, 'type="Sprite"');
+
+    // Godot 3 has no Vector4 type: a `uniform vec4` shader parameter takes a
+    // Plane (4 floats, interpolated by animation tracks like any other value).
+    text = text.replace(/Vector4\(/g, 'Plane(');
+
+    // Property renames / value maps (line level).
+    text = text.replace(/shader_parameter\//g, 'shader_param/')
+               .replace(/^offset_(left|top|right|bottom) = /gm, 'margin_$1 = ')
+               .replace(/^process_mode = (-?\d+)$/gm, function (m, v) {
+                   return 'pause_mode = ' + _godot3ProcessMode(parseInt(v, 10));
+               });
+    return text;
 }
 
 function serializeTscn(root, extResources, subResources) {
@@ -4363,11 +4432,11 @@ function _processElementNode(elem, parent, ownerRoot, anim, startTime, duration,
             // project exported straight to its own root, but wrong for any
             // exportDir nested under one, pointing at a "shaders/" folder
             // that was never created there.
-            var shader_path = "res://shaders/flash_color_normal.gdshader";
+            var shader_path = "res://shaders/flash_color_normal.shader";
             if (elem.blendMode === "add")
-                shader_path = "res://shaders/flash_color_add.gdshader";
+                shader_path = "res://shaders/flash_color_add.shader";
             else if (elem.blendMode === "multiply")
-                shader_path = "res://shaders/flash_color_mul.gdshader";
+                shader_path = "res://shaders/flash_color_mul.shader";
 
             var matId = "mat_" + nextId();
             subResources.push('[sub_resource type="ShaderMaterial" id="' + matId + '"]'
@@ -4898,15 +4967,15 @@ function _buildSceneTree(sym, frameRate, exportDir, symbolMap, symbolContainsSha
             // creation further above.
             if (enabler) root.removeChild(enabler);
         } else {
-            var libId = "lib_" + nextId();
-            var libLines = ['_data = {'];
+            // Godot 3 has no AnimationLibrary: every animation is a plain
+            // `anims/<name>` property of the AnimationPlayer node itself.
 
             var resetAnim = _sliceAnimation(anim, 0.0, 0.0);
             var resetId = "anim_" + nextId();
             subResources.push('[sub_resource type="Animation" id="' + resetId + '"]'
                 + '\nstep = ' + _f(resetAnim.step)
                 + '\nlength = 0.001\n' + generateAnimTracksStr(resetAnim));
-            libLines.push('"RESET": SubResource("' + resetId + '"),');
+            animPlayer.properties["anims/RESET"] = 'SubResource("' + resetId + '")';
 
             var hasLabels = false;
             var numCustomAnims = 0;
@@ -4934,12 +5003,11 @@ function _buildSceneTree(sym, frameRate, exportDir, symbolMap, symbolContainsSha
                     var isLooping = !hasStop && onlyDefaultLabel && (_sanitize_name(sorted[i].name) === "default");
                     var aId = "anim_" + nextId();
                     subResources.push('[sub_resource type="Animation" id="' + aId + '"]'
-                        + (isLooping ? '\nloop_mode = 1' : '')
+                        + (isLooping ? '\nloop = true' : '')
                         + '\nstep = ' + _f(sliced.step)
                         + '\nlength = ' + _f(sliced.length) + '\n'
                         + generateAnimTracksStr(sliced));
-                    libLines.push('"' + _sanitize_name(sorted[i].name) + '": SubResource("' + aId + '")'
-                        + (i === sorted.length - 1 ? '' : ','));
+                    animPlayer.properties["anims/" + _sanitize_name(sorted[i].name)] = 'SubResource("' + aId + '")';
                 }
             } else {
                 var aId = "anim_" + nextId();
@@ -4950,17 +5018,13 @@ function _buildSceneTree(sym, frameRate, exportDir, symbolMap, symbolContainsSha
                 // looping by hand on the gameplay side for this simple case).
                 var isLooping = !hasStop;
                 subResources.push('[sub_resource type="Animation" id="' + aId + '"]'
-                    + (isLooping ? '\nloop_mode = 1' : '')
+                    + (isLooping ? '\nloop = true' : '')
                     + '\nstep = ' + _f(slicedDefault.step)
                     + '\nlength = ' + _f(maxTime) + '\n'
                     + generateAnimTracksStr(slicedDefault));
-                libLines.push('"default": SubResource("' + aId + '")');
+                animPlayer.properties["anims/default"] = 'SubResource("' + aId + '")';
             }
 
-            libLines.push('}');
-            subResources.push('[sub_resource type="AnimationLibrary" id="' + libId + '"]\n' + libLines.join('\n'));
-
-            animPlayer.properties["libraries"] = '{\n"": SubResource("' + libId + '")\n}';
             animPlayer.properties["autoplay"] = '"' + firstLabel + '"';
         }
     } else {
@@ -5113,7 +5177,9 @@ function buildSceneForSymbol(sym, frameRate, exportDir, symbolMap, symbolContain
 
     // Post-process .tscn to attach script if we have actionScripts
     if (actionScripts.length > 0) {
-        var gdContent = "extends FlashMovieClip\n\n";
+        // By path, not class_name: a class_name only resolves once the Godot 3 editor has
+        // scanned the project (project.godot), and a fresh export must work without.
+        var gdContent = "extends \"" + RES_PREFIX + "scripts/FlashMovieClip.gd\"\n\n";
         
         var methodsDone = {};
         for (var i = 0; i < actionScripts.length; i++) {
@@ -5127,9 +5193,13 @@ function buildSceneForSymbol(sym, frameRate, exportDir, symbolMap, symbolContain
             translatedCode = translatedCode.replace(/_parent\._parent/g, "get_parent().get_parent()");
             translatedCode = translatedCode.replace(/this\./g, "");
             translatedCode = translatedCode.replace(/\bthis\b/g, "self");
+            // FlashMovieClip's computed properties are setget getters in GDScript 3, which
+            // only run when read through `self.` -- a bare name from a subclass reads the
+            // raw (never assigned) variable instead.
+            translatedCode = translatedCode.replace(/(^|[^.\w])(_totalframes|_currentframe|_level0)\b/g, "$1self.$2");
             translatedCode = translatedCode.replace(/;/g, "");
             translatedCode = translatedCode.replace(/\/\//g, "#");
-            translatedCode = translatedCode.replace(/new\s+Date\(\)/g, "Time.get_datetime_dict_from_system()");
+            translatedCode = translatedCode.replace(/new\s+Date\(\)/g, "OS.get_datetime()");
             translatedCode = translatedCode.replace(/\.getHours\(\)/g, ".hour");
             translatedCode = translatedCode.replace(/Math\.random\(\)/g, "randf()");
             translatedCode = translatedCode.replace(/Math\.floor\(/g, "floor(");
@@ -5245,7 +5315,7 @@ function buildSceneForSymbol(sym, frameRate, exportDir, symbolMap, symbolContain
     if (_deferSceneWrites) {
         _deferSceneWrites.push({ path: scenePath, content: tscnText, kind: "tscn", symbolName: sym.name, isMainScene: !!sym.isMainScene });
     } else {
-        FLfile.write(scenePath, tscnText);
+        FLfile.write(scenePath, _godot3Text(tscnText));
     }
 }
 
@@ -5394,6 +5464,7 @@ function _dedupeAndFlushScenes(buffered, linkedClasses, exportDir) {
                 }
             }
         }
+        if (entry.kind === "tscn") content = _godot3Text(content);
         FLfile.write(entry.path, content);
     }
 
@@ -5409,7 +5480,9 @@ function generateAnimTracksStr(animObj) {
         L.push('tracks/' + i + '/type = "' + tr.type + '"');
         L.push('tracks/' + i + '/imported = false');
         L.push('tracks/' + i + '/enabled = true');
-        L.push('tracks/' + i + '/path = NodePath("' + tr.path + '")');
+        // Godot 3 name/values of Godot 4's `process_mode` (see _godot3ProcessMode).
+        var isProcessMode = tr.path.indexOf(":process_mode") !== -1;
+        L.push('tracks/' + i + '/path = NodePath("' + (isProcessMode ? tr.path.replace(":process_mode", ":pause_mode") : tr.path) + '")');
         L.push('tracks/' + i + '/interp = ' + tr.interp);
         L.push('tracks/' + i + '/loop_wrap = false');
         L.push('tracks/' + i + '/keys = {');
@@ -5429,7 +5502,7 @@ function generateAnimTracksStr(animObj) {
         for (var v = 0; v < tr.keys.values.length; v++) {
             var val = tr.keys.values[v];
             if (typeof val === "boolean")         valsStr.push(val ? "true" : "false");
-            else if (typeof val === "number")     valsStr.push(_f(val));
+            else if (typeof val === "number")     valsStr.push(isProcessMode ? String(_godot3ProcessMode(val)) : _f(val));
             else if (val && val.x !== undefined)  valsStr.push(_vec2(val.x, val.y));
             else if (val && val.ext)              valsStr.push('ExtResource("' + val.ext + '")');
             else if (tr.type === "method" && val.method) {
@@ -5442,7 +5515,7 @@ function generateAnimTracksStr(animObj) {
                     else if (typeof a === "string") argsStrs.push('"' + a + '"');
                     else argsStrs.push(String(a));
                 }
-                valsStr.push('{\n"args": [' + argsStrs.join(', ') + '],\n"method": &"' + val.method + '"\n}');
+                valsStr.push('{\n"args": [' + argsStrs.join(', ') + '],\n"method": "' + val.method + '"\n}');
             }
             else                                  valsStr.push(val);
         }
@@ -5575,9 +5648,9 @@ function buildGodotScenes(doc, data, exportDir) {
     // export into the SAME project keeps writing (identical, idempotent)
     // copies here regardless of which exportDir subfolder triggered it.
     FLfile.createFolder(godotProjectRoot + "/shaders/");
-    FLfile.write(godotProjectRoot + "/shaders/flash_color_normal.gdshader", SHADER_NORMAL);
-    FLfile.write(godotProjectRoot + "/shaders/flash_color_add.gdshader",    SHADER_ADD);
-    FLfile.write(godotProjectRoot + "/shaders/flash_color_mul.gdshader",    SHADER_MUL);
+    FLfile.write(godotProjectRoot + "/shaders/flash_color_normal.shader", SHADER_NORMAL);
+    FLfile.write(godotProjectRoot + "/shaders/flash_color_add.shader",    SHADER_ADD);
+    FLfile.write(godotProjectRoot + "/shaders/flash_color_mul.shader",    SHADER_MUL);
 
     var symbolMap = _buildSymbolMap(data.library.symbols);
 
@@ -5654,51 +5727,54 @@ function buildGodotScenes(doc, data, exportDir) {
     var fmcContent = "extends Node2D\n" +
     "class_name FlashMovieClip\n" +
     "\n" +
-    "var _rng: RandomNumberGenerator\n" +
+    "var _rng\n" +
     "var undefined = null\n" +
     "\n" +
     "## Aggregate fan-out cost tracking -- see AntialiasedPolygon2D.report_and_\n" +
     "## reset's own doc for the full reasoning (same pattern). godotBuilder.jsfl\n" +
     "## generates one .gd file `extends FlashMovieClip` per exported \"movie\n" +
-    "## clip\" symbol (44 distinct ones in this project) and attaches one of\n" +
-    "## them to every instanced symbol root -- this base _ready() runs for\n" +
-    "## every one of those instances (directly, or via a subclass's own\n" +
-    "## super._ready(), if any override even exists).\n" +
-    "static var _perf_ready_count := 0\n" +
-    "static var _perf_ready_usec := 0\n" +
+    "## clip\" symbol and attaches one of them to every instanced symbol root --\n" +
+    "## this base _ready() runs for every one of those instances (directly, or\n" +
+    "## via a subclass's own super._ready(), if any override even exists).\n" +
+    "## GDScript 3 has no static vars: a const Array is shared by every instance\n" +
+    "## and stays mutable, which is all this needs. [ready_count, ready_usec]\n" +
+    "const _perf = [0, 0]\n" +
     "\n" +
-    "static func report_and_reset(perf_log: Node) -> void:\n" +
-    "\tif _perf_ready_count > 0:\n" +
-    "\t\tperf_log.log_action(\"FlashMovieClip _ready fan-out\", \"%d instances, %.3fms total\" % [_perf_ready_count, _perf_ready_usec / 1000.0])\n" +
-    "\t_perf_ready_count = 0\n" +
-    "\t_perf_ready_usec = 0\n" +
+    "static func report_and_reset(perf_log):\n" +
+    "\tif _perf[0] > 0:\n" +
+    "\t\tperf_log.log_action(\"FlashMovieClip _ready fan-out\", \"%d instances, %.3fms total\" % [_perf[0], _perf[1] / 1000.0])\n" +
+    "\t_perf[0] = 0\n" +
+    "\t_perf[1] = 0\n" +
     "\n" +
     "func _ready():\n" +
-    "\tvar _perf_t0 := Time.get_ticks_usec()\n" +
+    "\tvar _perf_t0 = OS.get_ticks_usec()\n" +
     "\t_rng = RandomNumberGenerator.new()\n" +
-    "\t_rng.seed = hash(Time.get_ticks_msec()) + hash(get_instance_id())\n" +
-    "\t_perf_ready_count += 1\n" +
-    "\t_perf_ready_usec += Time.get_ticks_usec() - _perf_t0\n" +
+    "\t_rng.seed = hash(OS.get_ticks_msec()) + hash(get_instance_id())\n" +
+    "\t_perf[0] += 1\n" +
+    "\t_perf[1] += OS.get_ticks_usec() - _perf_t0\n" +
     "\n" +
-    "var _currentframe: int:\n" +
-    "\tget:\n" +
-    "\t\tif has_node(\"AnimationPlayer\") and $AnimationPlayer.current_animation != \"\":\n" +
-    "\t\t\treturn int($AnimationPlayer.current_animation_position * 24.0)\n" +
-    "\t\treturn 0\n" +
+    "# assigned_animation, not current_animation: in Godot 3 current_animation is \"\"\n" +
+    "# whenever the player is not actively playing (i.e. right after pause()),\n" +
+    "# which is exactly the state gotoAndStop()/stop() leave it in.\n" +
+    "func _get_currentframe():\n" +
+    "\tif has_node(\"AnimationPlayer\") and $AnimationPlayer.assigned_animation != \"\":\n" +
+    "\t\treturn int($AnimationPlayer.current_animation_position * 24.0)\n" +
+    "\treturn 0\n" +
+    "var _currentframe setget , _get_currentframe\n" +
     "\n" +
-    "@warning_ignore(\"unused_private_class_variable\")  # used by exported symbol subclasses (extends FlashMovieClip), e.g. etoile.gd's gotoAndPlay(random(_totalframes)) -- Godot's own analysis only checks THIS file's body, not inheriting scripts\n" +
-    "var _totalframes: int:\n" +
-    "\tget:\n" +
-    "\t\tif has_node(\"AnimationPlayer\") and $AnimationPlayer.current_animation != \"\":\n" +
-    "\t\t\treturn int($AnimationPlayer.current_animation_length * 24.0)\n" +
-    "\t\treturn 1\n" +
+    "func _get_totalframes():\n" +
+    "\tif has_node(\"AnimationPlayer\") and $AnimationPlayer.assigned_animation != \"\":\n" +
+    "\t\treturn int($AnimationPlayer.current_animation_length * 24.0)\n" +
+    "\treturn 1\n" +
+    "# used by exported symbol subclasses (extends FlashMovieClip), e.g. etoile.gd's gotoAndPlay(random(_totalframes))\n" +
+    "var _totalframes setget , _get_totalframes\n" +
     "\n" +
-    "@warning_ignore(\"unused_private_class_variable\")  # used by exported symbol subclasses (extends FlashMovieClip), e.g. to_ballades/scripts/main.gd's _level0.profil.items -- see this same note on _totalframes above\n" +
-    "var _level0: Node:\n" +
-    "\tget:\n" +
-    "\t\treturn get_tree().root.get_child(0)\n" +
+    "func _get_level0():\n" +
+    "\treturn get_tree().root.get_child(0)\n" +
+    "# used by exported symbol subclasses, e.g. to_ballades/scripts/main.gd's _level0.profil.items\n" +
+    "var _level0 setget , _get_level0\n" +
     "\n" +
-    "func random(max_val: int) -> int:\n" +
+    "func random(max_val):\n" +
     "\treturn _rng.randi() % max_val\n" +
     "\n" +
     "func gotoAndPlay(frame_or_name):\n" +
@@ -5706,20 +5782,20 @@ function buildGodotScenes(doc, data, exportDir) {
     "\tif typeof(frame_or_name) == TYPE_STRING:\n" +
     "\t\t$AnimationPlayer.play(frame_or_name)\n" +
     "\telse:\n" +
-    "\t\tif $AnimationPlayer.current_animation != \"\":\n" +
+    "\t\tif $AnimationPlayer.assigned_animation != \"\":\n" +
     "\t\t\t$AnimationPlayer.seek(frame_or_name / 24.0, true)\n" +
-    "\t\t\t$AnimationPlayer.play($AnimationPlayer.current_animation)\n" +
+    "\t\t\t$AnimationPlayer.play($AnimationPlayer.assigned_animation)\n" +
     "\n" +
     "func gotoAndStop(frame_or_name):\n" +
     "\tif not has_node(\"AnimationPlayer\"): return\n" +
     "\tif typeof(frame_or_name) == TYPE_STRING:\n" +
     "\t\t$AnimationPlayer.play(frame_or_name)\n" +
-    "\t\t$AnimationPlayer.pause()\n" +
+    "\t\t$AnimationPlayer.stop(false)\n" +
     "\t\t$AnimationPlayer.seek(0, true)\n" +
     "\telse:\n" +
-    "\t\tif $AnimationPlayer.current_animation != \"\":\n" +
-    "\t\t\t$AnimationPlayer.play($AnimationPlayer.current_animation)\n" +
-    "\t\t\t$AnimationPlayer.pause()\n" +
+    "\t\tif $AnimationPlayer.assigned_animation != \"\":\n" +
+    "\t\t\t$AnimationPlayer.play($AnimationPlayer.assigned_animation)\n" +
+    "\t\t\t$AnimationPlayer.stop(false)\n" +
     "\t\t\t$AnimationPlayer.seek(frame_or_name / 24.0, true)\n" +
     "\n" +
     "func nextFrame():\n" +
@@ -5730,11 +5806,11 @@ function buildGodotScenes(doc, data, exportDir) {
     "\n" +
     "func stop():\n" +
     "\tif has_node(\"AnimationPlayer\"):\n" +
-    "\t\t$AnimationPlayer.pause()\n" +
+    "\t\t$AnimationPlayer.stop(false)\n" +
     "\n" +
     "func play():\n" +
-    "\tif has_node(\"AnimationPlayer\") and $AnimationPlayer.current_animation != \"\":\n" +
-    "\t\t$AnimationPlayer.play($AnimationPlayer.current_animation)\n";
+    "\tif has_node(\"AnimationPlayer\") and $AnimationPlayer.assigned_animation != \"\":\n" +
+    "\t\t$AnimationPlayer.play($AnimationPlayer.assigned_animation)\n";
     var scriptDir = godotProjectRoot + "/scripts";
     if (!FLfile.exists(scriptDir)) {
         FLfile.createFolder(scriptDir);
@@ -5744,14 +5820,14 @@ function buildGodotScenes(doc, data, exportDir) {
     // ExclusiveVariantSlot.gd: companion to _convertExclusiveVariantGroups
     // above. Lazily instantiates/frees whichever variant is currently
     // active instead of keeping every alternate pose permanently resident.
-    var evsContent = "@tool\n" +
+    var evsContent = "tool\n" +
     "extends Node2D\n" +
     "class_name ExclusiveVariantSlot\n" +
     "\n" +
-    "@export var variant_paths: Array[String] = []\n" +
+    "export(Array, String) var variant_paths = []\n" +
     "\n" +
-    "var _current_index := -2\n" +
-    "var _current_node: Node = null\n" +
+    "var _current_index = -2\n" +
+    "var _current_node = null\n" +
     "\n" +
     "## Editor-only convenience -- outside a running game, nothing ever calls\n" +
     "## set_active() at all: that only happens via an AnimationPlayer CALL_\n" +
@@ -5766,14 +5842,14 @@ function buildGodotScenes(doc, data, exportDir) {
     "## part -- the whole character, since godotBuilder.jsfl's \"Piste 7\"\n" +
     "## pooling now covers it -- rendered as nothing at all in the editor,\n" +
     "## confirmed a real regression from when these were still permanently-\n" +
-    "## resident siblings. @tool (above) is required for _ready() to run in\n" +
+    "## resident siblings. `tool` (above) is required for _ready() to run in\n" +
     "## the editor at all; is_editor_hint() then keeps this from ever touching\n" +
     "## real play, where starting empty until something explicit activates the\n" +
     "## right pose is by design (real animation playback, or EquipSlot/\n" +
     "## PlayerController, corrects this default to whichever variant is\n" +
     "## actually right the moment it runs) -- this just gives the editor SOME\n" +
     "## pose to render instead of nothing.\n" +
-    "func _ready() -> void:\n" +
+    "func _ready():\n" +
     "\tif Engine.is_editor_hint() and _current_index == -2 and not variant_paths.is_empty():\n" +
     "\t\tset_active(0)\n" +
     "\n" +
@@ -5796,14 +5872,14 @@ function buildGodotScenes(doc, data, exportDir) {
     "## AnimationPlayer's own normal forward playback already fires these\n" +
     "## tracks correctly on its own, and this would just be redundant, wasted\n" +
     "## per-frame work on every pooled slot in the whole tree.\n" +
-    "var _last_scrubbed_anim: StringName = &\"\"\n" +
-    "var _last_scrubbed_pos: float = -1.0\n" +
-    "var _cached_anim_player: AnimationPlayer = null\n" +
+    "var _last_scrubbed_anim = \"\"\n" +
+    "var _last_scrubbed_pos = -1.0\n" +
+    "var _cached_anim_player = null\n" +
     "\n" +
-    "func _process(_delta: float) -> void:\n" +
+    "func _process(_delta):\n" +
     "\tif not Engine.is_editor_hint():\n" +
     "\t\treturn\n" +
-    "\tvar anim_player := _find_anim_player()\n" +
+    "\tvar anim_player = _find_anim_player()\n" +
     "\tif not anim_player:\n" +
     "\t\treturn\n" +
     "\t# assigned_animation, NOT current_animation -- confirmed via Godot's own\n" +
@@ -5818,22 +5894,22 @@ function buildGodotScenes(doc, data, exportDir) {
     "\t# an EARLIER one had left active until Play was actually pressed\n" +
     "\t# (real playback happens to also update current_animation, masking\n" +
     "\t# this from ever showing up there).\n" +
-    "\tvar anim_name: StringName = anim_player.assigned_animation\n" +
+    "\tvar anim_name = anim_player.assigned_animation\n" +
     "\tif anim_name == \"\":\n" +
     "\t\treturn\n" +
-    "\tvar pos: float = anim_player.current_animation_position\n" +
+    "\tvar pos = anim_player.current_animation_position\n" +
     "\tif anim_name == _last_scrubbed_anim and is_equal_approx(pos, _last_scrubbed_pos):\n" +
     "\t\treturn\n" +
     "\t_last_scrubbed_anim = anim_name\n" +
     "\t_last_scrubbed_pos = pos\n" +
-    "\tvar anim: Animation = anim_player.get_animation(anim_name)\n" +
+    "\tvar anim = anim_player.get_animation(anim_name)\n" +
     "\tif not anim:\n" +
     "\t\treturn\n" +
-    "\tvar root: Node = anim_player.get_node(anim_player.root_node)\n" +
+    "\tvar root = anim_player.get_node(anim_player.root_node)\n" +
     "\tif not root:\n" +
     "\t\treturn\n" +
-    "\tvar rel_path: NodePath = root.get_path_to(self)\n" +
-    "\tvar track_idx := anim.find_track(rel_path, Animation.TYPE_METHOD)\n" +
+    "\tvar rel_path = root.get_path_to(self)\n" +
+    "\tvar track_idx = _find_method_track(anim, rel_path)\n" +
     "\t# No method track at all for this slot in the CURRENTLY previewed clip\n" +
     "\t# -- same meaning, same fix, as player_controller._change_animation's\n" +
     "\t# own identical find_track/set_active(-1) pair at runtime (see its own\n" +
@@ -5847,16 +5923,25 @@ function buildGodotScenes(doc, data, exportDir) {
     "\t\treturn\n" +
     "\t# Keys are stored time-sorted -- the LAST one at-or-before `pos` is\n" +
     "\t# whichever set_active() call would already have fired by now.\n" +
-    "\tvar last_key := -1\n" +
+    "\tvar last_key = -1\n" +
     "\tfor k in anim.track_get_key_count(track_idx):\n" +
     "\t\tif anim.track_get_key_time(track_idx, k) <= pos:\n" +
     "\t\t\tlast_key = k\n" +
     "\t\telse:\n" +
     "\t\t\tbreak\n" +
     "\tif last_key != -1:\n" +
-    "\t\tvar params: Array = anim.method_track_get_params(track_idx, last_key)\n" +
+    "\t\tvar params = anim.method_track_get_params(track_idx, last_key)\n" +
     "\t\tif not params.is_empty():\n" +
     "\t\t\tset_active(int(params[0]))\n" +
+    "\n" +
+    "## Godot 3's Animation.find_track only takes a path (no track type), and a\n" +
+    "## clip can hold several tracks for one node (e.g. :position AND set_active) --\n" +
+    "## so look for the METHOD track explicitly.\n" +
+    "func _find_method_track(anim, path):\n" +
+    "\tfor i in anim.get_track_count():\n" +
+    "\t\tif anim.track_get_type(i) == Animation.TYPE_METHOD and anim.track_get_path(i) == path:\n" +
+    "\t\t\treturn i\n" +
+    "\treturn -1\n" +
     "\n" +
     "## Searches from the edited scene's own root (`owner` -- see the class doc\n" +
     "## on `self` never being the scene root here) rather than upward from\n" +
@@ -5865,11 +5950,11 @@ function buildGodotScenes(doc, data, exportDir) {
     "## is_instance_valid, not just a null check -- the found node can be freed\n" +
     "## out from under this reference if the scene is edited) since this is\n" +
     "## called every _process frame.\n" +
-    "func _find_anim_player() -> AnimationPlayer:\n" +
+    "func _find_anim_player():\n" +
     "\tif _cached_anim_player and is_instance_valid(_cached_anim_player):\n" +
     "\t\treturn _cached_anim_player\n" +
-    "\tvar root: Node = owner if owner else self\n" +
-    "\t_cached_anim_player = root.find_child(\"AnimationPlayer\", true, false)\n" +
+    "\tvar root = owner if owner else self\n" +
+    "\t_cached_anim_player = root.find_node(\"AnimationPlayer\", true, false)\n" +
     "\treturn _cached_anim_player\n" +
     "\n" +
     "## Emitted right after a fresh variant is load()ed+instantiate()d+add_child()ed\n" +
@@ -5892,7 +5977,7 @@ function buildGodotScenes(doc, data, exportDir) {
     "## EquipSlot/equipment at all, by design -- pure generic pooling) -- this\n" +
     "## signal is the seam that lets EquipSlot re-attach itself to fresh content\n" +
     "## without this class needing to know anything about what's listening.\n" +
-    "signal content_swapped(new_node: Node)\n" +
+    "signal content_swapped(new_node)\n" +
     "\n" +
     "## True while a real (non-empty, in-range) variant is currently loaded --\n" +
     "## i.e. exactly the case content_swapped's own new_node is non-null for.\n" +
@@ -5904,7 +5989,7 @@ function buildGodotScenes(doc, data, exportDir) {
     "## is_visible_in_tree() (always true for a container that's never itself\n" +
     "## hidden) can't tell which pose is genuinely the active one right now --\n" +
     "## this can.\n" +
-    "func is_active() -> bool:\n" +
+    "func is_active():\n" +
     "\treturn _current_index >= 0\n" +
     "\n" +
     "## The path currently loaded (see is_active()'s own doc), or \"\" when\n" +
@@ -5915,12 +6000,12 @@ function buildGodotScenes(doc, data, exportDir) {
     "## the SAME container, swapped between as the character turns), so the\n" +
     "## container's own fixed node name alone (stable, checked once at attach\n" +
     "## time) isn't enough to know which one is active NOW.\n" +
-    "func current_variant_path() -> String:\n" +
+    "func current_variant_path():\n" +
     "\tif not is_active():\n" +
     "\t\treturn \"\"\n" +
     "\treturn variant_paths[_current_index]\n" +
     "\n" +
-    "func set_active(index: int) -> void:\n" +
+    "func set_active(index):\n" +
     "\tif index == _current_index:\n" +
     "\t\treturn\n" +
     "\tif _current_node:\n" +
@@ -5943,17 +6028,17 @@ function buildGodotScenes(doc, data, exportDir) {
     "\t\t# frame, so a shared label would corrupt their timings the same\n" +
     "\t\t# way ItemSceneCache._load_threaded's own label collision did\n" +
     "\t\t# before it was fixed (see that function's own doc).\n" +
-    "\t\tvar perf_log := get_node_or_null(\"/root/PerfLogger\")\n" +
-    "\t\tvar perf: bool = perf_log != null and perf_log.enabled\n" +
-    "\t\tvar perf_label := \"\"\n" +
+    "\t\tvar perf_log = get_node_or_null(\"/root/PerfLogger\")\n" +
+    "\t\tvar perf = perf_log != null and perf_log.enabled\n" +
+    "\t\tvar perf_label = \"\"\n" +
     "\t\tif perf:\n" +
     "\t\t\tperf_label = \"exclusive_variant_load_%d_%s\" % [get_instance_id(), variant_paths[index].get_file().get_basename()]\n" +
     "\t\t\tperf_log.time_start(perf_label)\n" +
-    "\t\tvar scene: PackedScene = load(variant_paths[index])\n" +
+    "\t\tvar scene = load(variant_paths[index])\n" +
     "\t\tif perf:\n" +
     "\t\t\tperf_log.time_end(perf_label)\n" +
     "\t\tif scene:\n" +
-    "\t\t\t_current_node = scene.instantiate()\n" +
+    "\t\t\t_current_node = scene.instance()\n" +
     "\t\t\tadd_child(_current_node)\n" +
     "\t# Emitted on every actual state change now, not just \"loaded something\"\n" +
     "\t# -- new_node is null when swapping to an empty/out-of-range index (see\n" +
@@ -5962,7 +6047,7 @@ function buildGodotScenes(doc, data, exportDir) {
     "\t# per-container one, see _attach_recursive) needs this null case too,\n" +
     "\t# to hide its directly-attached slot(s) the moment this pose stops\n" +
     "\t# being the active one, not just show them when it starts.\n" +
-    "\tcontent_swapped.emit(_current_node)\n";
+    "\temit_signal(\"content_swapped\", _current_node)\n";
     FLfile.write(scriptDir + "/ExclusiveVariantSlot.gd", evsContent);
 
     // TweenShapeMesh.gd / TweenShapeMeshConverter.gd: written unconditionally
@@ -5981,15 +6066,16 @@ function buildGodotScenes(doc, data, exportDir) {
     "## right after construction, by TweenShapeMeshConverter.gd -- this script\n" +
     "## itself does no triangulation or mesh building of its own.\n" +
     "\n" +
-    "var _meshes: Array[ArrayMesh] = []\n" +
+    "var _meshes = []  # Array of ArrayMesh\n" +
     "\n" +
-    "var mesh_index: int = 0:\n" +
-    "\tset(value):\n" +
-    "\t\tmesh_index = value\n" +
-    "\t\tif value >= 0 and value < _meshes.size() and _meshes[value] != null:\n" +
-    "\t\t\tmesh = _meshes[value]\n" +
+    "var mesh_index = 0 setget set_mesh_index\n" +
     "\n" +
-    "func set_meshes(meshes: Array[ArrayMesh]) -> void:\n" +
+    "func set_mesh_index(value):\n" +
+    "\tmesh_index = value\n" +
+    "\tif value >= 0 and value < _meshes.size() and _meshes[value] != null:\n" +
+    "\t\tmesh = _meshes[value]\n" +
+    "\n" +
+    "func set_meshes(meshes):\n" +
     "\t_meshes = meshes\n" +
     "\tif mesh_index >= 0 and mesh_index < _meshes.size() and _meshes[mesh_index] != null:\n" +
     "\t\tmesh = _meshes[mesh_index]\n";
@@ -6005,7 +6091,7 @@ function buildGodotScenes(doc, data, exportDir) {
     "##\n" +
     "## At _ready(), this script reads those tracks straight off its own\n" +
     "## AnimationPlayer, triangulates each DISTINCT keyframe shape ONCE via\n" +
-    "## Godot's own Geometry2D.triangulate_polygon() (never a hand-rolled\n" +
+    "## Godot's own Geometry.triangulate_polygon() (never a hand-rolled\n" +
     "## triangulator), replaces itself with a TweenShapeMesh (a plain\n" +
     "## MeshInstance2D) holding one pre-built ArrayMesh per keyframe, and adds a\n" +
     "## new \":mesh_index\" int track driving that swap -- so at runtime Godot just\n" +
@@ -6031,11 +6117,16 @@ function buildGodotScenes(doc, data, exportDir) {
     "## Baked into the GENERATED content here too (not just godotBuilder\n" +
     "## .jsfl's own attachment gate) so both consts change together on the\n" +
     "## next export, never drift apart with one flipped and not the other.\n" +
-    "const ENABLED := true\n" +
+    "const ENABLED = true\n" +
+    "\n" +
+    "## Preloaded by path rather than referenced by class_name: a class_name only\n" +
+    "## resolves once the editor has scanned the project (Godot 3 keeps them in\n" +
+    "## project.godot), and this script must work from a fresh export either way.\n" +
+    "const TweenShapeMeshScript = preload(\"res://scripts/TweenShapeMesh.gd\")\n" +
     "\n" +
     "## Shared across EVERY TweenShapeMeshConverter instance in the whole\n" +
-    "## process, key PackedInt32Array (see _shape_signature's own doc for why\n" +
-    "## numeric, not String) -> {\"tris\": PackedInt32Array, \"mesh\": ArrayMesh}.\n" +
+    "## process, key PoolIntArray (see _shape_signature's own doc for why\n" +
+    "## numeric, not String) -> {\"tris\": PoolIntArray, \"mesh\": ArrayMesh}.\n" +
     "## Unlike shape_index_by_key in _ready() below (which only dedupes WITHIN\n" +
     "## one instance's own Pass 1), this dedupes ACROSS pooled duplicate\n" +
     "## instances of the SAME symbol scene -- e.g. __ANIM.tscn's own body-\n" +
@@ -6062,7 +6153,9 @@ function buildGodotScenes(doc, data, exportDir) {
     "## _ready's own cache_key construction), not on which scene/instance it\n" +
     "## came from, so this also helps if the same shape happens to recur in\n" +
     "## visually unrelated symbols, not just exact pooled duplicates.\n" +
-    "static var _global_mesh_cache: Dictionary = {}\n" +
+    "## (GDScript 3 has no static vars: a const Dictionary is shared by every\n" +
+    "## instance and stays mutable, which is all this needs.)\n" +
+    "const _global_mesh_cache = {}\n" +
     "\n" +
     "## Where build_tween_mesh_cache.gd (a dev-only, offline headless pass --\n" +
     "## see its own doc) writes every shape it triangulated across the WHOLE\n" +
@@ -6079,13 +6172,13 @@ function buildGodotScenes(doc, data, exportDir) {
     "## data (a shape not yet covered here, e.g. new art since the last offline\n" +
     "## build, still falls back to computing it live below, exactly as if this\n" +
     "## file didn't exist).\n" +
-    "const CACHE_RES_PATH := \"res://cache/tween_shape_mesh_cache.res\"\n" +
+    "const CACHE_RES_PATH = \"res://cache/tween_shape_mesh_cache.dat\"\n" +
     "\n" +
     "## Guards _ensure_disk_cache_loaded so the (possibly large) disk cache is\n" +
     "## only ever read once per process, not once per instance -- every\n" +
     "## TweenShapeMeshConverter in the whole tree shares the one static\n" +
     "## _global_mesh_cache it feeds into anyway (see that var's own doc).\n" +
-    "static var _disk_cache_loaded := false\n" +
+    "const _disk_cache_loaded = [false]\n" +
     "\n" +
     "## Merges CACHE_RES_PATH's entries (if that file exists -- it won't in the\n" +
     "## editor or in a build that never ran build_tween_mesh_cache.gd, both\n" +
@@ -6097,32 +6190,48 @@ function buildGodotScenes(doc, data, exportDir) {
     "## through to a live, correct (re-)triangulation instead of ever reading\n" +
     "## stale mesh data under a key that no longer matches what's on screen.\n" +
     "static func _ensure_disk_cache_loaded() -> void:\n" +
-    "\tif _disk_cache_loaded:\n" +
+    "\tif _disk_cache_loaded[0]:\n" +
     "\t\treturn\n" +
-    "\t_disk_cache_loaded = true\n" +
-    "\tif not ResourceLoader.exists(CACHE_RES_PATH):\n" +
+    "\t_disk_cache_loaded[0] = true\n" +
+    "\tvar f = File.new()\n" +
+    "\tif not f.file_exists(CACHE_RES_PATH):\n" +
     "\t\treturn\n" +
-    "\tvar res: TweenMeshCacheResource = load(CACHE_RES_PATH)\n" +
-    "\tif res == null:\n" +
+    "\tif f.open(CACHE_RES_PATH, File.READ) != OK:\n" +
     "\t\treturn\n" +
-    "\tfor key in res.entries:\n" +
+    "\tvar loaded = bytes2var(f.get_buffer(f.get_len()), true)\n" +
+    "\tf.close()\n" +
+    "\tif typeof(loaded) != TYPE_DICTIONARY:\n" +
+    "\t\treturn\n" +
+    "\tfor key in loaded:\n" +
     "\t\tif not _global_mesh_cache.has(key):\n" +
-    "\t\t\t_global_mesh_cache[key] = res.entries[key]\n" +
+    "\t\t\t_global_mesh_cache[key] = loaded[key]\n" +
     "\n" +
     "## Called by build_tween_mesh_cache.gd once it's finished sweeping every\n" +
     "## scene in the project (see that script's own doc) -- writes the now-\n" +
     "## fully-populated _global_mesh_cache straight to CACHE_RES_PATH so future\n" +
     "## runs' _ensure_disk_cache_loaded can pick it back up. Not something\n" +
-    "## normal gameplay ever calls.\n" +
+    "## normal gameplay ever calls. A plain var2bytes blob, not a custom Resource\n" +
+    "## subclass: an exported build re-processes custom Resource files tied to a\n" +
+    "## script class, which used to silently reset the cache to empty.\n" +
     "static func save_global_cache_to_disk() -> void:\n" +
-    "\tvar dir := CACHE_RES_PATH.get_base_dir()\n" +
-    "\tif not DirAccess.dir_exists_absolute(dir):\n" +
-    "\t\tDirAccess.make_dir_recursive_absolute(dir)\n" +
-    "\tvar res := TweenMeshCacheResource.new()\n" +
-    "\tres.entries = _global_mesh_cache\n" +
-    "\tvar err := ResourceSaver.save(res, CACHE_RES_PATH)\n" +
+    "\tvar base = CACHE_RES_PATH.get_base_dir()\n" +
+    "\tvar dir = Directory.new()\n" +
+    "\tif not dir.dir_exists(base):\n" +
+    "\t\tdir.make_dir_recursive(base)\n" +
+    "\tvar f = File.new()\n" +
+    "\tvar err = f.open(CACHE_RES_PATH, File.WRITE)\n" +
     "\tif err != OK:\n" +
-    "\t\tpush_error(\"TweenShapeMeshConverter.save_global_cache_to_disk: ResourceSaver.save failed with error %d\" % err)\n" +
+    "\t\tpush_error(\"TweenShapeMeshConverter.save_global_cache_to_disk: cannot open %s (error %d)\" % [CACHE_RES_PATH, err])\n" +
+    "\t\treturn\n" +
+    "\tf.store_buffer(var2bytes(_global_mesh_cache, true))\n" +
+    "\tf.close()\n" +
+    "\n" +
+    "## Written by the \":mesh_index\" tracks this script adds (see Pass 2 in _ready)\n" +
+    "## on any instance whose AnimationPlayer starts playing before this node has\n" +
+    "## been swapped for its TweenShapeMesh (the swap is deferred, and an\n" +
+    "## AnimationPlayer child runs its own _ready()/autoplay first). A plain no-op\n" +
+    "## variable here keeps those early key applications from erroring.\n" +
+    "var mesh_index = 0\n" +
     "\n" +
     "func _ready() -> void:\n" +
     "\tif not ENABLED:\n" +
@@ -6131,14 +6240,14 @@ function buildGodotScenes(doc, data, exportDir) {
     "\tvar root: Node = get_owner()\n" +
     "\tif root == null:\n" +
     "\t\troot = self\n" +
-    "\tvar ap := _find_animation_player(root)\n" +
+    "\tvar ap = _find_animation_player(root)\n" +
     "\tif ap == null:\n" +
     "\t\treturn  # No AnimationPlayer to read tracks from: nothing to optimize.\n" +
     "\n" +
     "\t# Timed via PerfLogger (get_node_or_null pattern -- must work whether\n" +
     "\t# or not the autoload is currently enabled, see PerfLogger.gd's own\n" +
     "\t# doc) -- this class does the only genuine per-instance CPU work\n" +
-    "\t# (Geometry2D.triangulate_polygon() per distinct keyframe shape, see\n" +
+    "\t# (Geometry.triangulate_polygon() per distinct keyframe shape, see\n" +
     "\t# the class doc) found anywhere in the room/player tree's own _ready()\n" +
     "\t# cascade, flagged as the prime suspect for a real, confirmed ~3s\n" +
     "\t# stall during _viewport.add_child(room) in GameRoot._change_room_now\n" +
@@ -6151,47 +6260,47 @@ function buildGodotScenes(doc, data, exportDir) {
     "\t# their timings the same way other per-node-instance labels elsewhere\n" +
     "\t# in this project already had to guard against (see ItemSceneCache.\n" +
     "\t# _load_threaded/ExclusiveVariantSlot.set_active's own docs).\n" +
-    "\tvar perf_log := get_node_or_null(\"/root/PerfLogger\")\n" +
+    "\tvar perf_log = get_node_or_null(\"/root/PerfLogger\")\n" +
     "\tvar perf: bool = perf_log != null and perf_log.enabled\n" +
-    "\tvar perf_label := \"\"\n" +
+    "\tvar perf_label = \"\"\n" +
     "\tif perf:\n" +
     "\t\tperf_label = \"tween_shape_mesh_ready_%d\" % get_instance_id()\n" +
     "\t\tperf_log.time_start(perf_label)\n" +
     "\n" +
-    "\tvar my_path := root.get_path_to(self)\n" +
-    "\tvar poly_track_name := \"%s:polygon\" % my_path\n" +
-    "\tvar uv_track_name := \"%s:uv\" % my_path\n" +
-    "\tvar polys_track_name := \"%s:polygons\" % my_path\n" +
-    "\tvar mesh_index_track_name := \"%s:mesh_index\" % my_path\n" +
+    "\tvar my_path = root.get_path_to(self)\n" +
+    "\tvar poly_track_name = \"%s:polygon\" % my_path\n" +
+    "\tvar uv_track_name = \"%s:uv\" % my_path\n" +
+    "\tvar polys_track_name = \"%s:polygons\" % my_path\n" +
+    "\tvar mesh_index_track_name = \"%s:mesh_index\" % my_path\n" +
     "\n" +
     "\t# Pass 1 (read-only, deterministic): derive every distinct keyframe\n" +
     "\t# shape -- across every animation touching this node path, RESET\n" +
     "\t# included -- from the untouched source tracks. Since the source data\n" +
     "\t# never changes, this produces the exact same shapes/mesh_index mapping\n" +
     "\t# no matter which instance of this scene runs it, or how many times.\n" +
-    "\tvar shapes: Array[PackedVector2Array] = []\n" +
-    "\tvar shape_uvs: Array[PackedVector2Array] = []\n" +
-    "\tvar shape_tris: Array[PackedInt32Array] = []\n" +
-    "\t# The GLOBAL cache key (a PackedInt32Array, see _shape_signature's own\n" +
+    "\tvar shapes: Array = []\n" +
+    "\tvar shape_uvs: Array = []\n" +
+    "\tvar shape_tris: Array = []\n" +
+    "\t# The GLOBAL cache key (a PoolIntArray, see _shape_signature's own\n" +
     "\t# doc for why numeric, not String) for each entry in `shapes` above,\n" +
     "\t# letting the mesh-building loop skip straight to the already-built\n" +
     "\t# ArrayMesh instead -- see _global_mesh_cache's own doc.\n" +
-    "\tvar shape_cache_keys: Array[PackedInt32Array] = []\n" +
+    "\tvar shape_cache_keys: Array = []\n" +
     "\tvar shape_index_by_key: Dictionary = {}\n" +
     "\tvar per_anim: Array = []\n" +
     "\n" +
     "\tfor anim_name in ap.get_animation_list():\n" +
-    "\t\tvar anim := ap.get_animation(anim_name)\n" +
-    "\t\tvar poly_idx := anim.find_track(poly_track_name, Animation.TYPE_VALUE)\n" +
+    "\t\tvar anim = ap.get_animation(anim_name)\n" +
+    "\t\tvar poly_idx = anim.find_track(NodePath(poly_track_name))\n" +
     "\t\tif poly_idx == -1:\n" +
     "\t\t\tcontinue\n" +
-    "\t\tvar key_count := anim.track_get_key_count(poly_idx)\n" +
+    "\t\tvar key_count = anim.track_get_key_count(poly_idx)\n" +
     "\t\tif key_count <= 1:\n" +
     "\t\t\tcontinue  # A single static value: not worth converting.\n" +
     "\n" +
-    "\t\tvar uv_idx := anim.find_track(uv_track_name, Animation.TYPE_VALUE)\n" +
-    "\t\tvar polys_idx := anim.find_track(polys_track_name, Animation.TYPE_VALUE)\n" +
-    "\t\tvar mesh_indices: Array[int] = []\n" +
+    "\t\tvar uv_idx = anim.find_track(NodePath(uv_track_name))\n" +
+    "\t\tvar polys_idx = anim.find_track(NodePath(polys_track_name))\n" +
+    "\t\tvar mesh_indices: Array = []\n" +
     "\t\tmesh_indices.resize(key_count)\n" +
     "\t\t# Fetched ONCE per (anim, track) here, not once per keyframe below --\n" +
     "\t\t# _value_at_time's own binary search still needs each track's key\n" +
@@ -6201,11 +6310,11 @@ function buildGodotScenes(doc, data, exportDir) {
     "\t\t# (a real, if secondary, cost -- see _shape_signature's own doc for\n" +
     "\t\t# the actual DOMINANT cost this loop used to have, found right next\n" +
     "\t\t# to this one while investigating the same stall).\n" +
-    "\t\tvar uv_times := _key_times(anim, uv_idx)\n" +
-    "\t\tvar polys_times := _key_times(anim, polys_idx)\n" +
+    "\t\tvar uv_times = _key_times(anim, uv_idx)\n" +
+    "\t\tvar polys_times = _key_times(anim, polys_idx)\n" +
     "\n" +
     "\t\tfor k in range(key_count):\n" +
-    "\t\t\tvar pts: PackedVector2Array = anim.track_get_key_value(poly_idx, k)\n" +
+    "\t\t\tvar pts: PoolVector2Array = anim.track_get_key_value(poly_idx, k)\n" +
     "\t\t\tvar key_time: float = anim.track_get_key_time(poly_idx, k)\n" +
     "\t\t\t# NOT positional (uv_idx/polys_idx key `k`): addTrackKey (the\n" +
     "\t\t\t# JSFL exporter) skips inserting a key whose value repeats the\n" +
@@ -6216,15 +6325,15 @@ function buildGodotScenes(doc, data, exportDir) {
     "\t\t\t# keyframe. Look up by time instead: whichever key was most\n" +
     "\t\t\t# recently in effect at this exact keyframe's own time, matching\n" +
     "\t\t\t# how discrete tracks are actually applied during playback.\n" +
-    "\t\t\tvar uvs: PackedVector2Array = _value_at_time(anim, uv_idx, uv_times, key_time, PackedVector2Array())\n" +
+    "\t\t\tvar uvs: PoolVector2Array = _value_at_time(anim, uv_idx, uv_times, key_time, PoolVector2Array())\n" +
     "\t\t\tvar groups: Array = _value_at_time(anim, polys_idx, polys_times, key_time, [])\n" +
     "\n" +
-    "\t\t\tvar sig := _shape_signature(pts)\n" +
+    "\t\t\tvar sig = _shape_signature(pts)\n" +
     "\t\t\tif shape_index_by_key.has(sig):\n" +
     "\t\t\t\tmesh_indices[k] = shape_index_by_key[sig]\n" +
     "\t\t\t\tcontinue\n" +
     "\n" +
-    "\t\t\tvar idx := shapes.size()\n" +
+    "\t\t\tvar idx = shapes.size()\n" +
     "\t\t\tshape_index_by_key[sig] = idx\n" +
     "\t\t\tshapes.append(pts)\n" +
     "\t\t\tshape_uvs.append(uvs)\n" +
@@ -6238,7 +6347,7 @@ function buildGodotScenes(doc, data, exportDir) {
     "\t\t\t# produce, so the 3 segments can never bleed into each other\n" +
     "\t\t\t# (see _shape_signature's own doc for why this is numeric, not\n" +
     "\t\t\t# a String, in the first place).\n" +
-    "\t\t\tvar cache_key := PackedInt32Array()\n" +
+    "\t\t\tvar cache_key = PoolIntArray()\n" +
     "\t\t\tcache_key.append_array(sig)\n" +
     "\t\t\tcache_key.append(-2147483648)\n" +
     "\t\t\tcache_key.append_array(_groups_signature(groups))\n" +
@@ -6256,7 +6365,7 @@ function buildGodotScenes(doc, data, exportDir) {
     "\t\t\t\"times\": _key_times(anim, poly_idx), \"mesh_indices\": mesh_indices,\n" +
     "\t\t})\n" +
     "\n" +
-    "\tif per_anim.is_empty():\n" +
+    "\tif per_anim.empty():\n" +
     "\t\tif perf:\n" +
     "\t\t\tperf_log.time_end(perf_label)\n" +
     "\t\treturn  # Nothing animated (or already fully static): stay a plain Polygon2D.\n" +
@@ -6270,14 +6379,14 @@ function buildGodotScenes(doc, data, exportDir) {
     "\t# doing this: see _global_mesh_cache's own doc). A genuine cache MISS\n" +
     "\t# still builds its own mesh here, same as before, and stores it for\n" +
     "\t# whichever instance asks next.\n" +
-    "\tvar meshes: Array[ArrayMesh] = []\n" +
+    "\tvar meshes: Array = []\n" +
     "\tmeshes.resize(shapes.size())\n" +
     "\tfor i in range(shapes.size()):\n" +
-    "\t\tvar cache_key := shape_cache_keys[i]\n" +
+    "\t\tvar cache_key = shape_cache_keys[i]\n" +
     "\t\tif _global_mesh_cache.has(cache_key):\n" +
     "\t\t\tmeshes[i] = _global_mesh_cache[cache_key][\"mesh\"]\n" +
     "\t\t\tcontinue\n" +
-    "\t\tvar built := _build_mesh(shapes[i], shape_uvs[i], shape_tris[i])\n" +
+    "\t\tvar built = _build_mesh(shapes[i], shape_uvs[i], shape_tris[i])\n" +
     "\t\tmeshes[i] = built\n" +
     "\t\t_global_mesh_cache[cache_key] = {\"tris\": shape_tris[i], \"mesh\": built}\n" +
     "\n" +
@@ -6287,8 +6396,8 @@ function buildGodotScenes(doc, data, exportDir) {
     "\t# converted and skip straight past.\n" +
     "\tfor entry in per_anim:\n" +
     "\t\tvar anim: Animation = entry[\"anim\"]\n" +
-    "\t\tif anim.find_track(mesh_index_track_name, Animation.TYPE_VALUE) == -1:\n" +
-    "\t\t\tvar mi_idx := anim.add_track(Animation.TYPE_VALUE)\n" +
+    "\t\tif anim.find_track(NodePath(mesh_index_track_name)) == -1:\n" +
+    "\t\t\tvar mi_idx = anim.add_track(Animation.TYPE_VALUE)\n" +
     "\t\t\tanim.track_set_path(mi_idx, mesh_index_track_name)\n" +
     "\t\t\tanim.value_track_set_update_mode(mi_idx, Animation.UPDATE_DISCRETE)\n" +
     "\t\t\tvar times: Array = entry[\"times\"]\n" +
@@ -6307,7 +6416,7 @@ function buildGodotScenes(doc, data, exportDir) {
     "\t# Swap self for a TweenShapeMesh carrying the same transform/visuals --\n" +
     "\t# every instance does this, unconditionally, since nodes are never\n" +
     "\t# shared across instances the way the Animation resource above is.\n" +
-    "\tvar mesh_node := TweenShapeMesh.new()\n" +
+    "\tvar mesh_node = TweenShapeMeshScript.new()\n" +
     "\tmesh_node.name = name\n" +
     "\tmesh_node.position = position\n" +
     "\tmesh_node.rotation = rotation\n" +
@@ -6355,7 +6464,7 @@ function buildGodotScenes(doc, data, exportDir) {
     "\t# owner. Owner must be an ancestor in the tree\"), since scene_owner\n" +
     "\t# isn't actually an ancestor of child yet at that point. So: swap\n" +
     "\t# self for mesh_node FIRST, re-parent the captured children AFTER.\n" +
-    "\tvar kids := get_children()\n" +
+    "\tvar kids = get_children()\n" +
     "\tparent.remove_child(self)\n" +
     "\tparent.add_child(mesh_node)\n" +
     "\tparent.move_child(mesh_node, index)\n" +
@@ -6368,55 +6477,55 @@ function buildGodotScenes(doc, data, exportDir) {
     "\n" +
     "\n" +
     "# Triangulates one keyframe's fill. `groups`, when non-empty, is the raw\n" +
-    "# value of that keyframe's \":polygons\" track key: one PackedInt32Array per\n" +
+    "# value of that keyframe's \":polygons\" track key: one PoolIntArray per\n" +
     "# disjoint sub-polygon, each listing which indices of `pts` belong to it\n" +
     "# (Polygon2D's own convention for several disconnected shapes sharing one\n" +
-    "# vertex pool). Geometry2D.triangulate_polygon() expects a single simple\n" +
+    "# vertex pool). Geometry.triangulate_polygon() expects a single simple\n" +
     "# polygon, so each sub-polygon is triangulated on its own and the resulting\n" +
     "# LOCAL indices are mapped back to `pts`' global indices before combining.\n" +
-    "func _triangulate(pts: PackedVector2Array, groups: Array) -> PackedInt32Array:\n" +
+    "func _triangulate(pts: PoolVector2Array, groups: Array) -> PoolIntArray:\n" +
     "\tif groups.size() <= 1:\n" +
     "\t\tif pts.size() < 3:\n" +
-    "\t\t\treturn PackedInt32Array()\n" +
-    "\t\treturn Geometry2D.triangulate_polygon(pts)\n" +
+    "\t\t\treturn PoolIntArray()\n" +
+    "\t\treturn Geometry.triangulate_polygon(pts)\n" +
     "\n" +
-    "\tvar combined := PackedInt32Array()\n" +
+    "\tvar combined = PoolIntArray()\n" +
     "\tfor group in groups:\n" +
-    "\t\tvar local_indices: PackedInt32Array = group\n" +
+    "\t\tvar local_indices: PoolIntArray = group\n" +
     "\t\tif local_indices.size() < 3:\n" +
     "\t\t\tcontinue\n" +
-    "\t\tvar sub_pts := PackedVector2Array()\n" +
+    "\t\tvar sub_pts = PoolVector2Array()\n" +
     "\t\tsub_pts.resize(local_indices.size())\n" +
     "\t\tfor i in range(local_indices.size()):\n" +
     "\t\t\tsub_pts[i] = pts[local_indices[i]]\n" +
-    "\t\tvar sub_tris := Geometry2D.triangulate_polygon(sub_pts)\n" +
+    "\t\tvar sub_tris = Geometry.triangulate_polygon(sub_pts)\n" +
     "\t\tfor t in sub_tris:\n" +
     "\t\t\tcombined.append(local_indices[t])\n" +
     "\treturn combined\n" +
     "\n" +
     "\n" +
-    "func _build_mesh(pts_2d: PackedVector2Array, uvs: PackedVector2Array, tri_indices: PackedInt32Array) -> ArrayMesh:\n" +
+    "func _build_mesh(pts_2d: PoolVector2Array, uvs: PoolVector2Array, tri_indices: PoolIntArray) -> ArrayMesh:\n" +
     "\tif pts_2d.size() < 3 or tri_indices.size() < 3:\n" +
     "\t\treturn null  # Degenerate keyframe: TweenShapeMesh leaves `mesh` unset for it.\n" +
-    "\tvar pts_3d := PackedVector3Array()\n" +
+    "\tvar pts_3d = PoolVector3Array()\n" +
     "\tpts_3d.resize(pts_2d.size())\n" +
     "\tfor v in range(pts_2d.size()):\n" +
     "\t\tpts_3d[v] = Vector3(pts_2d[v].x, pts_2d[v].y, 0.0)\n" +
     "\n" +
-    "\tvar arrays := []\n" +
+    "\tvar arrays = []\n" +
     "\tarrays.resize(Mesh.ARRAY_MAX)\n" +
     "\tarrays[Mesh.ARRAY_VERTEX] = pts_3d\n" +
     "\tif uvs.size() == pts_2d.size():\n" +
     "\t\tarrays[Mesh.ARRAY_TEX_UV] = uvs\n" +
     "\tarrays[Mesh.ARRAY_INDEX] = tri_indices\n" +
     "\n" +
-    "\tvar array_mesh := ArrayMesh.new()\n" +
+    "\tvar array_mesh = ArrayMesh.new()\n" +
     "\tarray_mesh.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, arrays)\n" +
     "\treturn array_mesh\n" +
     "\n" +
     "\n" +
-    "func _key_times(anim: Animation, track_idx: int) -> Array[float]:\n" +
-    "\tvar times: Array[float] = []\n" +
+    "func _key_times(anim: Animation, track_idx: int) -> Array:\n" +
+    "\tvar times: Array = []\n" +
     "\t# -1 means \"this track doesn't exist on this anim\" (see this\n" +
     "\t# function's own call sites -- uv_idx/polys_idx come straight from\n" +
     "\t# find_track, which returns -1 on no match) -- track_get_key_count/\n" +
@@ -6437,18 +6546,17 @@ function buildGodotScenes(doc, data, exportDir) {
     "# site doc) -- keys are always stored in ascending time order by the\n" +
     "# exporter, so a binary search over this array finds the same answer a\n" +
     "# linear scan would, without re-walking every earlier key on every call.\n" +
-    "func _value_at_time(anim: Animation, track_idx: int, times: Array[float], time: float, default_value):\n" +
-    "\tif track_idx == -1 or times.is_empty():\n" +
+    "func _value_at_time(anim: Animation, track_idx: int, times: Array, time: float, default_value):\n" +
+    "\tif track_idx == -1 or times.empty():\n" +
     "\t\treturn default_value\n" +
     "\t# Upper bound: first index whose time exceeds time+EPS (same tie-break\n" +
     "\t# margin the original linear scan used) -- the answer is the key right\n" +
     "\t# before it, or `default_value` if even the very first key is already\n" +
     "\t# past `time`.\n" +
-    "\tvar lo := 0\n" +
-    "\tvar hi := times.size()\n" +
+    "\tvar lo = 0\n" +
+    "\tvar hi = times.size()\n" +
     "\twhile lo < hi:\n" +
-    "\t\t@warning_ignore(\"integer_division\")  # intentional: lo/hi/mid are all indices\n" +
-    "\t\tvar mid := (lo + hi) / 2\n" +
+    "\t\tvar mid = (lo + hi) / 2\n" +
     "\t\tif times[mid] <= time + 0.0005:\n" +
     "\t\t\tlo = mid + 1\n" +
     "\t\telse:\n" +
@@ -6465,7 +6573,7 @@ function buildGodotScenes(doc, data, exportDir) {
     "# search: an instanced child scene (PackedScene) may have its own, unrelated\n" +
     "# AnimationPlayer further down the tree, which must never be picked up here.\n" +
     "func _find_animation_player(root: Node) -> AnimationPlayer:\n" +
-    "\tvar direct := root.get_node_or_null(\"AnimationPlayer\")\n" +
+    "\tvar direct = root.get_node_or_null(\"AnimationPlayer\")\n" +
     "\tif direct is AnimationPlayer:\n" +
     "\t\treturn direct\n" +
     "\tfor child in root.get_children():\n" +
@@ -6495,27 +6603,27 @@ function buildGodotScenes(doc, data, exportDir) {
     "## test: two separately-built arrays with the same ints correctly collide\n" +
     "## as the same key), so this works as a Dictionary key exactly like the\n" +
     "## String it replaces did.\n" +
-    "static func _shape_signature(pts: PackedVector2Array) -> PackedInt32Array:\n" +
-    "\tvar out := PackedInt32Array()\n" +
+    "static func _shape_signature(pts: PoolVector2Array) -> PoolIntArray:\n" +
+    "\tvar out = PoolIntArray()\n" +
     "\tout.resize(pts.size() * 2)\n" +
     "\tfor i in range(pts.size()):\n" +
-    "\t\tvar p := pts[i]\n" +
+    "\t\tvar p = pts[i]\n" +
     "\t\tout[i * 2] = int(round(p.x * 100.0))\n" +
     "\t\tout[i * 2 + 1] = int(round(p.y * 100.0))\n" +
     "\treturn out\n" +
     "\n" +
     "## Companion to _shape_signature (see its own doc, including for why this\n" +
     "## is a numeric array, not a String), for _global_mesh_cache's own key --\n" +
-    "## `groups` (the raw \":polygons\" track value, one PackedInt32Array of\n" +
+    "## `groups` (the raw \":polygons\" track value, one PoolIntArray of\n" +
     "## point indices per disjoint sub-polygon, see _triangulate's own doc)\n" +
     "## affects triangulation, so two shapes with identical points but\n" +
     "## different groupings must never collide in the cache. -1 (never a valid\n" +
     "## point index) separates each group's own indices so e.g. [[0,1],[2]]\n" +
     "## and [[0],[1,2]] can never flatten to the same array.\n" +
-    "static func _groups_signature(groups: Array) -> PackedInt32Array:\n" +
-    "\tvar out := PackedInt32Array()\n" +
+    "static func _groups_signature(groups: Array) -> PoolIntArray:\n" +
+    "\tvar out = PoolIntArray()\n" +
     "\tfor group in groups:\n" +
-    "\t\tvar indices: PackedInt32Array = group\n" +
+    "\t\tvar indices: PoolIntArray = group\n" +
     "\t\tout.append_array(indices)\n" +
     "\t\tout.append(-1)\n" +
     "\treturn out\n";
@@ -7141,7 +7249,7 @@ function buildVariantScenes(data, exportDir) {
             _inlineInstancePlaceholders(built.root, symbolMap, frameRate, uri, symbolContainsShader, built.extResources, built.subResources, {});
             built.extResources = _pruneUnusedPackedSceneExtResources(built.root, built.extResources);
             var tscnText = serializeTscn(built.root, built.extResources, built.subResources);
-            FLfile.write(groupDir + (n + 1) + ".tscn", tscnText);
+            FLfile.write(groupDir + (n + 1) + ".tscn", _godot3Text(tscnText));
         }
     }
 }
