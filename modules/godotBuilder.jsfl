@@ -2070,7 +2070,7 @@ function _convertExclusiveVariantGroups(root, anim, getExt) {
             var vp = RES_PREFIX + "symbols/" + spi.subPath + ".tscn";
             pathsLiteral.push("\"" + vp + "\"");
         }
-        slot.properties["variant_paths"] = "Array[String]([" + pathsLiteral.join(", ") + "])";
+        slot.properties["variant_paths"] = "[" + pathsLiteral.join(", ") + "]";
 
         var firstRank = first._renderRank;
         parent.addChildRanked(slot, firstRank !== undefined ? firstRank : 0);
@@ -6175,7 +6175,7 @@ function buildGodotScenes(doc, data, exportDir) {
     "## actually right the moment it runs) -- this just gives the editor SOME\n" +
     "## pose to render instead of nothing.\n" +
     "func _ready():\n" +
-    "\tif Engine.is_editor_hint() and _current_index == -2 and not variant_paths.is_empty():\n" +
+    "\tif Engine.is_editor_hint() and _current_index == -2 and not variant_paths.empty():\n" +
     "\t\tset_active(0)\n" +
     "\n" +
     "## Editor-only: compensates for the SAME Godot quirk _ready's own doc\n" +
@@ -6256,7 +6256,7 @@ function buildGodotScenes(doc, data, exportDir) {
     "\t\t\tbreak\n" +
     "\tif last_key != -1:\n" +
     "\t\tvar params = anim.method_track_get_params(track_idx, last_key)\n" +
-    "\t\tif not params.is_empty():\n" +
+    "\t\tif not params.empty():\n" +
     "\t\t\tset_active(int(params[0]))\n" +
     "\n" +
     "## Godot 3's Animation.find_track only takes a path (no track type), and a\n" +
@@ -6411,18 +6411,25 @@ function buildGodotScenes(doc, data, exportDir) {
     "\n" +
     "## Attached (by godotBuilder.jsfl) to every Polygon2D nothing animates. In the\n" +
     "## EDITOR this script does nothing (no `tool`): the node stays a plain,\n" +
-    "## fully editable Polygon2D. At RUNTIME it draws the fill through a child\n" +
-    "## MeshInstance2D instead: Godot 3's GLES2 batcher re-transforms every vertex\n" +
-    "## of every Polygon2D on the CPU each frame, a mesh keeps its vertices on the\n" +
-    "## GPU (~3x cheaper on a real room, pixel-identical).\n" +
+    "## fully editable Polygon2D. At RUNTIME it swaps ITSELF for a plain\n" +
+    "## MeshInstance2D at the same spot in the tree (same technique as\n" +
+    "## TweenShapeMeshConverter.gd's own _finish_swap, for the animated case) --\n" +
+    "## Godot 3's GLES2 batcher re-transforms every vertex of every Polygon2D on\n" +
+    "## the CPU each frame, a mesh keeps its vertices on the GPU (~3x cheaper on\n" +
+    "## a real room, pixel-identical), and swapping instead of adding a child\n" +
+    "## keeps the runtime node count exactly what it was before this script\n" +
+    "## existed (adding a child mesh under an emptied-but-kept Polygon2D, an\n" +
+    "## earlier version of this script's own approach, was measured to nearly\n" +
+    "## DOUBLE a room's node count for no benefit once the original Polygon2D's\n" +
+    "## own drawing is dead weight anyway).\n" +
     "##\n" +
-    "## The Polygon2D keeps behaving like one for the rest of the game:\n" +
-    "##  - `polygon` still READS back its real points (_get below), while the\n" +
-    "##    node's own drawing is emptied so nothing is drawn twice;\n" +
-    "##  - `color`, `self_modulate`, `texture`, `polygon`, `uv`, `polygons` set at\n" +
-    "##    runtime are mirrored onto the mesh (_set below);\n" +
-    "##  - anything this can't reproduce exactly (offset, texture transform,\n" +
-    "##    invert, vertex colors, antialiased, skeleton) leaves the node alone.\n" +
+    "## Trade-off versus that earlier child-mesh approach: once swapped, this\n" +
+    "## node is a plain MeshInstance2D, not a Polygon2D -- any OTHER script that\n" +
+    "## expects to keep tweaking `color`/`texture`/`polygon` on it after this\n" +
+    "## point (none currently do; CustomizationStore.gd, the Godot 4 script that\n" +
+    "## does exactly this, isn't ported to this Godot 3 project yet) needs to\n" +
+    "## either run before the swap (this frame, before the deferred call below\n" +
+    "## fires) or be updated to also handle a MeshInstance2D.\n" +
     "##\n" +
     "## Meshes are shared between every node with the same shape (in-memory cache\n" +
     "## keyed on a native hash, verified by content) and can be pre-built offline\n" +
@@ -6436,10 +6443,6 @@ function buildGodotScenes(doc, data, exportDir) {
     "## every instance and stays mutable (GDScript 3 has no static vars).\n" +
     "const _cache = {}\n" +
     "const _disk_cache_loaded = [false]\n" +
-    "\n" +
-    "var _mi = null          # the child MeshInstance2D once converted\n" +
-    "var _orig_polygon = PoolVector2Array()\n" +
-    "var _rebuild_pending = false\n" +
     "\n" +
     "static func _key(pts, groups, uvs, size):\n" +
     "\treturn hash([pts, groups, uvs, size])\n" +
@@ -6533,7 +6536,31 @@ function buildGodotScenes(doc, data, exportDir) {
     "\tif not ENABLED or Engine.editor_hint:\n" +
     "\t\treturn\n" +
     "\t_ensure_disk_cache_loaded()\n" +
-    "\t_convert()\n" +
+    "\tif not _can_convert():\n" +
+    "\t\treturn\n" +
+    "\tvar mesh = _mesh_for(polygon)\n" +
+    "\tif mesh == null:\n" +
+    "\t\treturn\n" +
+    "\tvar mesh_node = MeshInstance2D.new()\n" +
+    "\tmesh_node.name = name\n" +
+    "\tmesh_node.position = position\n" +
+    "\tmesh_node.rotation = rotation\n" +
+    "\tmesh_node.scale = scale\n" +
+    "\tmesh_node.skew = skew\n" +
+    "\tmesh_node.z_index = z_index\n" +
+    "\tmesh_node.z_as_relative = z_as_relative\n" +
+    "\tmesh_node.visible = visible\n" +
+    "\tmesh_node.pause_mode = pause_mode\n" +
+    "\tmesh_node.use_parent_material = use_parent_material\n" +
+    "\tmesh_node.mesh = mesh\n" +
+    "\tmesh_node.texture = texture\n" +
+    "\tmesh_node.self_modulate = color * self_modulate\n" +
+    "\n" +
+    "\t# The tree is still mid-setup while sibling _ready() calls are firing\n" +
+    "\t# (this is one of them): add_child()/move_child()/owner all reject\n" +
+    "\t# synchronous calls here (\"Parent node is busy setting up children\"),\n" +
+    "\t# same reasoning as TweenShapeMeshConverter.gd's own _finish_swap.\n" +
+    "\tcall_deferred(\"_finish_swap\", mesh_node, get_parent(), get_index(), owner)\n" +
     "\n" +
     "func _can_convert():\n" +
     "\treturn polygon.size() >= 3 \\\n" +
@@ -6547,76 +6574,31 @@ function buildGodotScenes(doc, data, exportDir) {
     "\t\tand internal_vertex_count == 0 \\\n" +
     "\t\tand skeleton == NodePath()\n" +
     "\n" +
-    "func _convert():\n" +
-    "\tif _mi != null or not _can_convert():\n" +
-    "\t\treturn\n" +
-    "\tvar mesh = _mesh_for(polygon)\n" +
-    "\tif mesh == null:\n" +
-    "\t\treturn\n" +
-    "\t_orig_polygon = polygon\n" +
-    "\tvar mi = MeshInstance2D.new()\n" +
-    "\tmi.name = \"_static_mesh\"\n" +
-    "\tmi.use_parent_material = true\n" +
-    "\tmi.mesh = mesh\n" +
-    "\tmi.texture = texture\n" +
-    "\tmi.self_modulate = color * self_modulate\n" +
-    "\tadd_child(mi)\n" +
-    "\tmove_child(mi, 0)\n" +
-    "\t# Empty the node's own drawing (its real points stay readable, see _get).\n" +
-    "\t# _mi is still null here, so _set doesn't treat this as a user edit.\n" +
-    "\tpolygon = PoolVector2Array()\n" +
-    "\t_mi = mi\n" +
-    "\n" +
     "func _mesh_for(pts):\n" +
     "\tvar size = Vector2.ONE\n" +
     "\tif texture != null:\n" +
     "\t\tsize = texture.get_size()\n" +
     "\treturn _get_mesh(pts, polygons, uv, size, texture != null)\n" +
     "\n" +
-    "func _get(property):\n" +
-    "\tif _mi != null and property == \"polygon\":\n" +
-    "\t\treturn _orig_polygon\n" +
-    "\treturn null\n" +
-    "\n" +
-    "func _set(property, value):\n" +
-    "\tif _mi == null:\n" +
-    "\t\treturn false\n" +
-    "\tmatch property:\n" +
-    "\t\t\"polygon\":\n" +
-    "\t\t\t# Keep the node's own drawing empty; rebuild the mesh from the new points.\n" +
-    "\t\t\t_orig_polygon = value\n" +
-    "\t\t\t_queue_rebuild()\n" +
-    "\t\t\treturn true\n" +
-    "\t\t\"color\":\n" +
-    "\t\t\t_mi.self_modulate = value * self_modulate\n" +
-    "\t\t\"self_modulate\":\n" +
-    "\t\t\t_mi.self_modulate = color * value\n" +
-    "\t\t\"texture\", \"uv\", \"polygons\":\n" +
-    "\t\t\t_queue_rebuild()\n" +
-    "\treturn false\n" +
-    "\n" +
-    "func _queue_rebuild():\n" +
-    "\tif not _rebuild_pending:\n" +
-    "\t\t_rebuild_pending = true\n" +
-    "\t\tcall_deferred(\"_rebuild\")\n" +
-    "\n" +
-    "func _rebuild():\n" +
-    "\t_rebuild_pending = false\n" +
-    "\tif _mi == null:\n" +
-    "\t\treturn\n" +
-    "\tvar mesh = null\n" +
-    "\tif _orig_polygon.size() >= 3:\n" +
-    "\t\tmesh = _mesh_for(_orig_polygon)\n" +
-    "\tif mesh == null:\n" +
-    "\t\t# Can't build it: give the drawing back to the Polygon2D itself.\n" +
-    "\t\tvar pts = _orig_polygon\n" +
-    "\t\t_mi.queue_free()\n" +
-    "\t\t_mi = null\n" +
-    "\t\tpolygon = pts\n" +
-    "\t\treturn\n" +
-    "\t_mi.mesh = mesh\n" +
-    "\t_mi.texture = texture\n" +
-    "\t_mi.self_modulate = color * self_modulate\n";
+    "func _finish_swap(mesh_node, parent, index, scene_owner): ##LOCK_SYMBOLS\n" +
+    "\t# LOCK_SYMBOLS: called only by name, via call_deferred(\"_finish_swap\",\n" +
+    "\t# ...) above -- see TweenShapeMeshConverter.gd's own _finish_swap doc\n" +
+    "\t# for why (an obfuscated web build renames declarations but not string\n" +
+    "\t# literals, breaking the deferred call silently).\n" +
+    "\t# Any of self's own children (rare for a plain fill, but see\n" +
+    "\t# TweenShapeMeshConverter's own doc: not impossible) move over the same\n" +
+    "\t# way: mesh_node must already be in the tree with its own owner set\n" +
+    "\t# before a child's owner can be set to scene_owner.\n" +
+    "\tvar kids = get_children()\n" +
+    "\tparent.remove_child(self)\n" +
+    "\tparent.add_child(mesh_node)\n" +
+    "\tparent.move_child(mesh_node, index)\n" +
+    "\tmesh_node.owner = scene_owner\n" +
+    "\tfor child in kids:\n" +
+    "\t\tremove_child(child)\n" +
+    "\t\tmesh_node.add_child(child)\n" +
+    "\t\tchild.owner = scene_owner\n" +
+    "\tqueue_free()\n";
     FLfile.write(scriptDir + "/StaticPolygonMesh.gd", staticPolygonMeshContent);
 
     var tweenConverterContent = "extends Polygon2D\n" +
