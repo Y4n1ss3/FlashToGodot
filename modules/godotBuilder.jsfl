@@ -87,6 +87,30 @@ var MIN_TWEEN_MESH_DURATION_SEC = 3.0;
 //   "off"     -- plain Polygon2D.
 var STATIC_POLYGON_MESH_MODE = "runtime";
 
+// Rasterizes STATIC shape elements (a Polygon2D/Line2D wrapper on a
+// single-keyframe layer, i.e. isStaticLayer && !elem._isTweenShape --
+// exactly the boundary this file already uses everywhere to decide
+// "static property" vs "animation track") into a PNG texture + Sprite2D
+// node instead of native vector geometry. Off by default: purely
+// additive, existing vector output is untouched when this is false.
+// Technique adapted from a reference AS3/AIR tool (GodotExport.as) that
+// rasterizes a whole SWF's DisplayObjects via BitmapData.draw() + a
+// pixel-hash dedup cache -- JSFL has no in-memory BitmapData/canvas, so
+// rasterizing here instead goes through Flash's OWN renderer on the live
+// document (see _rasterizeElementToPNG: isolate the original element,
+// Convert to Symbol, exportToPNGSequence, undo), and the dedup cache
+// (SHAPE_RASTER_CACHE) is keyed on the already-extracted vertex/color
+// geometry rather than rendered pixel bytes (JSFL can't read pixels back
+// out of an exported PNG the way BitmapData.getPixels() does).
+// Tweened/animated shape geometry is intentionally NOT eligible (would
+// need one PNG per keyframe) and stays vector, same as today.
+// Because this intercepts BEFORE any Polygon2D/Line2D node is ever
+// created, the existing same-color merge, static-mesh-swap and
+// antialiasing-addon passes further down the pipeline simply never see
+// a rasterized element (they all key off node.type === "Polygon2D"/
+// "Line2D") -- no separate short-circuit needed for those.
+var SHAPE_RASTER_MODE = true;
+
 var ENABLE_ANTIALIASED_SHAPES = true;
 
 function _sanitize_name(name) {
@@ -3613,6 +3637,337 @@ function _clearExcessNamedSlots(node, variantPathStr, anim, startIndex, prefix, 
     }
 }
 
+// ---------------------------------------------------------------------
+// SHAPE_RASTER_MODE: rasterize a static shape element to PNG + Sprite2D
+// ---------------------------------------------------------------------
+
+// Geometry-signature dedup cache: sig string (vertices+colors, built by
+// _shapeGeomSignature) -> { pngResPath: "res://..." }. Two elements with
+// identical fill/stroke geometry (a very common case -- pooled/repeated
+// art) share one PNG instead of re-rasterizing through Flash each time.
+var SHAPE_RASTER_CACHE = {};
+var SHAPE_RASTER_COUNT = 0;
+
+// No JSON.stringify relied on here (older JSFL JS engines don't reliably
+// have it) -- build the signature by hand from exactly the fields that
+// affect what gets drawn.
+function _shapeGeomSignature(elem) {
+    var parts = [];
+    if (elem.polygons) {
+        for (var p = 0; p < elem.polygons.length; p++) {
+            var pd = elem.polygons[p];
+            parts.push("F:" + (pd.color || ""));
+            if (pd.gradient) {
+                var gr = pd.gradient;
+                parts.push("G:" + (gr.style || "") + ":" + (gr.colors ? gr.colors.join(",") : "") + ":" + (gr.pos ? gr.pos.join(",") : ""));
+            }
+            var verts = pd.vertices || [];
+            for (var v = 0; v < verts.length; v++) parts.push(verts[v].x + "," + verts[v].y);
+            if (pd.holes) {
+                for (var h = 0; h < pd.holes.length; h++) {
+                    var hv = pd.holes[h];
+                    for (var v2 = 0; v2 < hv.length; v2++) parts.push("H" + h + ":" + hv[v2].x + "," + hv[v2].y);
+                }
+            }
+        }
+    }
+    if (elem.strokes) {
+        for (var s = 0; s < elem.strokes.length; s++) {
+            var sd = elem.strokes[s];
+            parts.push("S:" + (sd.color || "") + ":" + sd.thickness);
+            var pts = sd.pts || sd.path || [];
+            for (var v3 = 0; v3 < pts.length; v3++) parts.push(pts[v3].x + "," + pts[v3].y);
+        }
+    }
+    return parts.join("|");
+}
+
+// Local (already parent-resolved, unscaled Flash-pixel-space) bounds of
+// every fill + stroke this element carries -- same space _processElement
+// Node's vertex-emission loop reads px/py from directly (no separate
+// node position/transform exists for Polygon2D/Line2D in this pipeline;
+// it's all baked into the vertex coordinates by inspector.jsfl). Used
+// both as an eligibility check (empty/degenerate shapes stay vector, same
+// as exportSprite's colorBounds check in the AS3 reference) and to center
+// the replacement Sprite2D.
+function _shapeLocalBounds(elem) {
+    var minX = 999999, minY = 999999, maxX = -999999, maxY = -999999, any = false;
+    if (elem.polygons) {
+        for (var p = 0; p < elem.polygons.length; p++) {
+            var verts = elem.polygons[p].vertices || [];
+            for (var v = 0; v < verts.length; v++) {
+                any = true;
+                if (verts[v].x < minX) minX = verts[v].x;
+                if (verts[v].x > maxX) maxX = verts[v].x;
+                if (verts[v].y < minY) minY = verts[v].y;
+                if (verts[v].y > maxY) maxY = verts[v].y;
+            }
+        }
+    }
+    if (elem.strokes) {
+        for (var s = 0; s < elem.strokes.length; s++) {
+            var sd = elem.strokes[s];
+            var pts = sd.pts || sd.path || [];
+            var halfW = (sd.thickness || 0) / 2;
+            for (var v2 = 0; v2 < pts.length; v2++) {
+                any = true;
+                if (pts[v2].x - halfW < minX) minX = pts[v2].x - halfW;
+                if (pts[v2].x + halfW > maxX) maxX = pts[v2].x + halfW;
+                if (pts[v2].y - halfW < minY) minY = pts[v2].y - halfW;
+                if (pts[v2].y + halfW > maxY) maxY = pts[v2].y + halfW;
+            }
+        }
+    }
+    if (!any) return null;
+    return { width: maxX - minX, height: maxY - minY, centerX: (minX + maxX) / 2, centerY: (minY + maxY) / 2 };
+}
+
+// Selects ONE element live -- symName's timeline, live-document layer
+// index #layerIndex, frame #frameIndex, element #elementIndex within that
+// frame's own `elements` array (all live-document indices, matching
+// inspector.jsfl's own extraction order 1:1, NOT Godot-side names/paths)
+// -- and returns its on-stage bounding-box CENTER via Flash's own
+// getSelectionRect() (same primitive already probed standalone in this
+// repo's test_png_bounds.jsfl), leaving the selection active so the
+// caller can optionally continue into _exportSelectedElementToPNG without
+// re-selecting. Returns null (selection left however it ended up; caller
+// doesn't depend on it) if the element can't be found/selected.
+//
+// This is in PARENT/layer space, i.e. AFTER elem.matrix's rotation/
+// scale/skew -- NOT the shape's local pre-matrix space
+// _shapeLocalBounds/_shapeGeomSignature use. That matters for whoever
+// renders from this selection: Flash draws the element WITH elem.matrix
+// already applied, so a PNG exported from it has that rotation/scale
+// baked into the pixels -- reapplying elem.matrix again on the resulting
+// Godot node (the way section 7 generically does for a Polygon2D
+// wrapper, whose raw vertices are genuinely still in local space) would
+// double it. A rasterized node therefore gets a plain, un-rotated,
+// unscaled position instead -- see node._rasterized's guard on section 7.
+//
+// NEEDS A LIVE-ANIMATE SMOKE TEST before trusting broadly -- written from
+// the documented JSFL API surface (editItem/element.selected/
+// getSelectionRect), not verified end-to-end in Animate by this change.
+function _selectLiveElement(doc, symName, layerIndex, frameIndex, elementIndex) {
+    try {
+        doc.library.editItem(symName);
+        var tl = doc.getTimeline();
+        doc.currentFrame = frameIndex;
+        tl.setSelectedLayers(layerIndex, true);
+        doc.selectNone();
+
+        var frame = tl.layers[layerIndex] && tl.layers[layerIndex].frames[frameIndex];
+        if (!frame || !frame.elements || !frame.elements[elementIndex]) return null;
+        frame.elements[elementIndex].selected = true;
+
+        var rect = doc.getSelectionRect();
+        if (!rect) return null;
+        return { centerX: (rect.left + rect.right) / 2, centerY: (rect.top + rect.bottom) / 2 };
+    } catch (eSel) {
+        __log("SHAPE_RASTER_MODE: selection failed for " + symName + " layer " + layerIndex + " frame " + frameIndex + " elem " + elementIndex + " : " + eSel);
+        return null;
+    }
+}
+
+// Sweeps the library for temp items left behind by a PREVIOUS export run
+// that crashed/errored before its own cleanup ran (or, historically, by
+// the doc.undo()-based version of this code below, which turned out not
+// to reliably clean up at all -- see _exportElementToPNG's own doc).
+// Runs once per export (guarded by SHAPE_RASTER_CLEANED_UP), so a name
+// collision on "__raster_tmp_0" et al never recurs even after a bad prior
+// run, and so leftover orphans never get misidentified as real content by
+// unrelated logic elsewhere (confirmed happening for real: a mask-inline
+// pass picked up a stale "__raster_tmp_52" from a previous run as if it
+// were a genuine symbol).
+var SHAPE_RASTER_CLEANED_UP = false;
+function _cleanupStaleRasterTempItems(doc) {
+    if (SHAPE_RASTER_CLEANED_UP) return;
+    SHAPE_RASTER_CLEANED_UP = true;
+    try {
+        var items = doc.library.items;
+        var toDelete = [];
+        for (var i = 0; i < items.length; i++) {
+            var nm = items[i].name;
+            var base = nm.indexOf("/") !== -1 ? nm.substring(nm.lastIndexOf("/") + 1) : nm;
+            if (/^__raster_(tmp|dup)_\d+$/.test(base)) toDelete.push(nm);
+        }
+        for (var j = 0; j < toDelete.length; j++) {
+            try { doc.library.deleteItem(toDelete[j]); } catch (eDel) {}
+        }
+        if (toDelete.length > 0) {
+            __log("SHAPE_RASTER_MODE: cleaned up " + toDelete.length + " stale temp symbol(s) left over from a previous run.");
+        }
+    } catch (eSweep) {}
+}
+
+// Rasterizes ONE element (symName's timeline, live layer index
+// #layerIndex, frame #frameIndex, element #elementIndex -- same
+// coordinates as _selectLiveElement) to outPngPath.
+//
+// Never mutates symName's OWN timeline. Everything happens on a
+// disposable DUPLICATE of the whole symbol (doc.library.duplicateItem()),
+// exactly the pattern this project's own inspector.jsfl already uses
+// (successfully, in production) for its shape-tween baking -- see its
+// "_tempGodotExportShapeTween" duplicate + doc.currentTimeline restore +
+// deleteItem cleanup, notably WITHOUT ever calling doc.undo().
+//
+// An EARLIER version of this function called doc.convertToSymbol()
+// DIRECTLY on the live selection (mutating symName's real timeline in
+// place) and relied on doc.undo() to revert it afterward. Confirmed
+// broken in real Animate: undo did not reliably restore the timeline or
+// remove the created library item, so temp symbols piled up across
+// export runs, collided by name on the next run ("Le nom '__raster_tmp_0'
+// est déjà attribué"), and a leftover one even got misidentified as real
+// content by the mask-inlining pass. Never go back to that approach --
+// duplicate-first is what makes this safe to run repeatedly without risk
+// to the artist's actual document.
+//
+// NEEDS A LIVE-ANIMATE SMOKE TEST before trusting broadly -- written from
+// the documented JSFL API surface (duplicateItem/convertToSymbol/
+// exportToPNGSequence/currentTimeline), the duplicate/restore half
+// already proven by inspector.jsfl, the convertToSymbol/export half not
+// yet verified end-to-end by this specific change.
+function _exportElementToPNG(doc, symName, layerIndex, frameIndex, elementIndex, outPngPath, rasterId) {
+    _cleanupStaleRasterTempItems(doc);
+
+    var originalTl = doc.currentTimeline;
+    var dupBaseName = "__raster_dup_" + rasterId;
+    var innerTempName = "__raster_tmp_" + rasterId;
+    var ok = false;
+
+    try {
+        // Keep the duplicate in the SAME library folder as symName: Flash's
+        // Item.name setter eats '/' and treats the whole string as a base
+        // name otherwise (see inspector.jsfl's own identical note on this
+        // exact pitfall, hit for real on a nested-folder symbol).
+        var slashIdx = symName.lastIndexOf("/");
+        var folderPath = slashIdx !== -1 ? symName.substring(0, slashIdx + 1) : "";
+        var dupFullName = folderPath + dupBaseName;
+
+        if (doc.library.itemExists(dupFullName)) doc.library.deleteItem(dupFullName);
+
+        doc.library.selectItem(symName);
+        doc.library.duplicateItem();
+        var selItems = doc.library.getSelectedItems();
+        if (!selItems || selItems.length === 0) return false;
+        selItems[0].name = dupBaseName; // base name only -- see the note above
+
+        doc.library.editItem(dupFullName);
+        var tl = doc.getTimeline();
+        doc.currentFrame = frameIndex;
+        tl.setSelectedLayers(layerIndex, true);
+        doc.selectNone();
+
+        var frame = tl.layers[layerIndex] && tl.layers[layerIndex].frames[frameIndex];
+        if (!frame || !frame.elements || !frame.elements[elementIndex]) {
+            doc.currentTimeline = originalTl;
+            try { doc.library.deleteItem(dupFullName); } catch (eDel0) {}
+            return false;
+        }
+        frame.elements[elementIndex].selected = true;
+
+        // Mutates the DUPLICATE's timeline -- fine, it's deleted whole
+        // below regardless of what state convertToSymbol leaves it in.
+        doc.convertToSymbol("graphic", innerTempName, "top left");
+        var innerIdx = doc.library.findItemIndex(innerTempName);
+        if (innerIdx === -1) {
+            doc.currentTimeline = originalTl;
+            try { doc.library.deleteItem(dupFullName); } catch (eDel1) {}
+            return false;
+        }
+
+        doc.library.items[innerIdx].exportToPNGSequence(outPngPath);
+        var firstFrame = outPngPath.replace(/\.png$/i, "0001.png");
+        if (FLfile.exists(firstFrame)) {
+            if (FLfile.exists(outPngPath)) FLfile.remove(outPngPath);
+            FLfile.copy(firstFrame, outPngPath);
+            FLfile.remove(firstFrame);
+        }
+        ok = FLfile.exists(outPngPath);
+
+        doc.currentTimeline = originalTl; // back to symName's REAL timeline, which was never touched
+        // convertToSymbol created innerTempName as its own top-level library
+        // item (not nested inside dupFullName), so it needs its own cleanup
+        // in addition to the outer duplicate's.
+        try { if (doc.library.itemExists(innerTempName)) doc.library.deleteItem(innerTempName); } catch (eDel2) {}
+        try { if (doc.library.itemExists(dupFullName)) doc.library.deleteItem(dupFullName); } catch (eDel3) {}
+    } catch (eRaster) {
+        __log("SHAPE_RASTER_MODE: PNG export failed for " + outPngPath + " : " + eRaster);
+        try { doc.currentTimeline = originalTl; } catch (eRestore) {}
+    }
+    return ok;
+}
+
+// Orchestrates the above: eligibility test, dedup cache lookup, and (on a
+// cache miss) the live rasterization -- then builds the replacement
+// Sprite2D GNode. Always re-selects the live element to get THIS
+// occurrence's own on-stage position, even on a cache hit -- two
+// elements can share identical local geometry (same signature, same PNG,
+// a repeated/pooled shape used twice) while sitting at different stage
+// positions, so only the PNG itself is safe to reuse from the cache, not
+// the position. Returns null (never partial state) whenever this element
+// isn't eligible OR rasterization failed, so the caller falls straight
+// back to the normal vector Polygon2D/Line2D path for it -- SHAPE_RASTER_
+// MODE degrades per-element, never all-or-nothing, and is a complete
+// no-op (returns null immediately) outside Animate (no `fl` global),
+// which is what keeps the offline pipeline_snapshot.js harness working
+// with this flag left on.
+function _maybeRasterizeShapeElement(elem, wrapperName, symName, layerIndex, frameIndex, elementIndex, exportDir, scaleFactor, isStaticLayer, getExt) {
+    if (!SHAPE_RASTER_MODE) return null;
+    if (typeof fl === "undefined") return null;
+    if (elem.elementType !== "shape") return null;
+    if (!isStaticLayer || elem._isTweenShape || elem._isOrientationVariant || elem._isMaskShape) return null;
+
+    var hasFill = elem.polygons && elem.polygons.length > 0;
+    var hasStroke = elem.strokes && elem.strokes.length > 0;
+    if (!hasFill && !hasStroke) return null;
+
+    var localBounds = _shapeLocalBounds(elem); // cheap pre-check only (see its own doc)
+    if (!localBounds || localBounds.width <= 0 || localBounds.height <= 0) return null;
+
+    var liveDoc = fl.getDocumentDOM();
+    if (!liveDoc) return null;
+
+    var selected = _selectLiveElement(liveDoc, symName, layerIndex, frameIndex, elementIndex);
+    if (!selected) return null;
+
+    var sig = _shapeGeomSignature(elem);
+    var cached = SHAPE_RASTER_CACHE[sig];
+    var pngResPath;
+
+    if (cached) {
+        pngResPath = cached.pngResPath;
+    } else {
+        var texDir = exportDir + "textures_raster/";
+        if (!FLfile.exists(texDir)) FLfile.createFolder(texDir);
+
+        var rasterId = SHAPE_RASTER_COUNT++;
+        var safeName = "shape_" + rasterId + "_" + _sanitize_name(wrapperName);
+        var pngPath = texDir + safeName + ".png";
+
+        if (!_exportElementToPNG(liveDoc, symName, layerIndex, frameIndex, elementIndex, pngPath, rasterId)) return null;
+
+        pngResPath = pngPath.replace(exportDir, RES_PREFIX);
+        SHAPE_RASTER_CACHE[sig] = { pngResPath: pngResPath };
+    }
+
+    var extId = getExt(pngResPath, "Texture2D");
+    var node = new GNode(wrapperName, "Sprite2D");
+    node.properties["texture"] = "ExtResource(\"" + extId + "\")";
+    node.properties["centered"] = true;
+    node.properties["position"] = _vec2(selected.centerX * scaleFactor, selected.centerY * scaleFactor);
+    // The exported PNG is native (1x, unscaled) Flash pixels -- exportToPNGSequence
+    // just rasterizes the stage as-is, it doesn't know about scaleFactor. Every
+    // OTHER coordinate this pipeline emits (vertex points, positions, the line
+    // above) gets multiplied by scaleFactor when written to .tscn, so without
+    // scaling the SPRITE ITSELF by the same factor, its on-screen size would be
+    // wrong by that ratio (~4.17x too small at this project's current
+    // scaleFactor) while its center position is correctly placed -- exactly a
+    // "shrunk and off" symptom, not a random one.
+    node.properties["scale"] = _vec2(scaleFactor, scaleFactor);
+    node._rasterized = true; // tells _processElementNode's shape/stroke emission blocks (and section 7) to skip
+    return node;
+}
+
 // --- _processElementNode section 1, extracted: lookup or creation of the
 // Godot wrapper/node for THIS Flash element at THIS keyframe. Pure over
 // its inputs (elem/parent/ownerRoot/wrapperName/shaderNeeds/
@@ -3620,7 +3975,7 @@ function _clearExcessNamedSlots(node, variantPathStr, anim, startIndex, prefix, 
 // creating/attaching the node itself (parent.addChildRanked, node.owner),
 // never anim.tracks nor subResources -- so it can be extracted without
 // threading the rest of _processElementNode's state.
-function _resolveElementNode(elem, parent, ownerRoot, wrapperName, shaderNeeds, modulateNeedsCanvasGroup, layerZIndex, getExt, isStaticLayer, symbolMaxTime) {
+function _resolveElementNode(elem, parent, ownerRoot, wrapperName, shaderNeeds, modulateNeedsCanvasGroup, layerZIndex, getExt, isStaticLayer, symbolMaxTime, symName, layerIndex, frameIndex, elementIndex, exportDir, scaleFactor) {
     if (parent !== ownerRoot && !parent.parent) {
         ownerRoot.addChild(parent);
     }
@@ -3638,7 +3993,10 @@ function _resolveElementNode(elem, parent, ownerRoot, wrapperName, shaderNeeds, 
         if (!node) {
             isNewNode = true;
             isNewWrapper = true;
-            if (elem.polygons && elem.polygons.length > 0) {
+            var _rasterNode = _maybeRasterizeShapeElement(elem, wrapperName, symName, layerIndex, frameIndex, elementIndex, exportDir, scaleFactor, isStaticLayer, getExt);
+            if (_rasterNode) {
+                node = _rasterNode;
+            } else if (elem.polygons && elem.polygons.length > 0) {
                 node = new GNode(wrapperName, "Polygon2D");
                 node.properties["color"] = "Color(1, 1, 1, 1)";
                 if (ENABLE_TWEEN_SHAPE_MESH_CONVERTER && (!isStaticLayer || elem._isTweenShape) && !elem._isOrientationVariant
@@ -3745,9 +4103,10 @@ function _resolveElementNode(elem, parent, ownerRoot, wrapperName, shaderNeeds, 
 function _processElementNode(elem, parent, ownerRoot, anim, startTime, duration, frameRate,
                              wrapperName, exportDir, scaleFactor, symName, startFrameIndex,
                              maxTime, kfTransition, shaderNeeds, layerType,
-                             getExt, subResources, isStaticLayer, modulateNeedsCanvasGroup, gradCache, layerZIndex) {
+                             getExt, subResources, isStaticLayer, modulateNeedsCanvasGroup, gradCache, layerZIndex,
+                             layerIndex, elementIndex) {
     // --- 1. Wrapper/node: lookup or creation -----------------------------
-    var _resolved = _resolveElementNode(elem, parent, ownerRoot, wrapperName, shaderNeeds, modulateNeedsCanvasGroup, layerZIndex, getExt, isStaticLayer, maxTime);
+    var _resolved = _resolveElementNode(elem, parent, ownerRoot, wrapperName, shaderNeeds, modulateNeedsCanvasGroup, layerZIndex, getExt, isStaticLayer, maxTime, symName, layerIndex, startFrameIndex, elementIndex, exportDir, scaleFactor);
     var node = _resolved.node;
     var wrapperNode = _resolved.wrapperNode;
     var isNewNode = _resolved.isNewNode;
@@ -3790,7 +4149,10 @@ function _processElementNode(elem, parent, ownerRoot, anim, startTime, duration,
     }
 
     // --- 3. Shape geometry: polyGroups, triangulation, gradients/textures ---
-    if (elem.elementType === "shape" || elem._inlineSprite) {
+    // Skipped entirely for a node SHAPE_RASTER_MODE already replaced with a
+    // textured Sprite2D (_maybeRasterizeShapeElement, called from
+    // _resolveElementNode above) -- no vector geometry left to write.
+    if ((elem.elementType === "shape" || elem._inlineSprite) && !node._rasterized) {
         var polyGroups = null;
         if (elem.polygons && elem.polygons.length > 0) {
             polyGroups = [];
@@ -4215,7 +4577,7 @@ function _processElementNode(elem, parent, ownerRoot, anim, startTime, duration,
 
         // --- 4. Strokes -> Line2D -----------------------------------------
         var hasStrokes = elem.strokes && elem.strokes.length > 0;
-        if (hasStrokes && (elem.elementType === "shape" || elem._inlineSprite)) {
+        if (hasStrokes && (elem.elementType === "shape" || elem._inlineSprite) && !node._rasterized) {
             // Symmetric demotion of the Polygon2D/Poly_N case above: this
             // pooled occurrence had been created as a direct Line2D (a
             // single stroke on its first keyframe), but a later keyframe
@@ -4301,20 +4663,22 @@ function _processElementNode(elem, parent, ownerRoot, anim, startTime, duration,
         // (the exact same reset values used identically on the animated-track
         // side and the static-property side).
         // ----------------------------------------------------------------
-        var polyCount = polyGroups ? polyGroups.length : 0;
-        var useAnimForSlots = !(isStaticLayer && !elem._isTweenShape);
-        _clearExcessNamedSlots(node, variantPathStr, anim, polyCount, "Poly_", "Polygon2D", useAnimForSlots, startTime, [
-            { name: "polygon", value: "PackedVector2Array()" },
-            { name: "polygons", value: "[]" },
-            { name: "uv", value: "PackedVector2Array()" },
-            { name: "visible", value: false }
-        ]);
+        if (!node._rasterized) {
+            var polyCount = polyGroups ? polyGroups.length : 0;
+            var useAnimForSlots = !(isStaticLayer && !elem._isTweenShape);
+            _clearExcessNamedSlots(node, variantPathStr, anim, polyCount, "Poly_", "Polygon2D", useAnimForSlots, startTime, [
+                { name: "polygon", value: "PackedVector2Array()" },
+                { name: "polygons", value: "[]" },
+                { name: "uv", value: "PackedVector2Array()" },
+                { name: "visible", value: false }
+            ]);
 
-        var strokeCount = (elem.strokes && elem.strokes.length) || 0;
-        _clearExcessNamedSlots(node, variantPathStr, anim, strokeCount, "Line_", "Line2D", useAnimForSlots, startTime, [
-            { name: "points", value: "PackedVector2Array()" },
-            { name: "visible", value: false }
-        ]);
+            var strokeCount = (elem.strokes && elem.strokes.length) || 0;
+            _clearExcessNamedSlots(node, variantPathStr, anim, strokeCount, "Line_", "Line2D", useAnimForSlots, startTime, [
+                { name: "points", value: "PackedVector2Array()" },
+                { name: "visible", value: false }
+            ]);
+        }
     }
 
     // --- 6. visible/process_mode tracks -----------------------------------
@@ -4343,7 +4707,12 @@ function _processElementNode(elem, parent, ownerRoot, anim, startTime, duration,
     // exact same elem.matrix.
     var _matDec = elem.matrix ? _decomposeMatrix(elem.matrix, elem) : null;
 
-    if (isNewWrapper && elem.matrix) {
+    // node._rasterized (SHAPE_RASTER_MODE) already gave this wrapper a
+    // fixed, final position (Flash's own on-stage bounds, elem.matrix
+    // already baked into the exported pixels) -- applying elem.matrix
+    // here too, as static properties AND/OR animation tracks, would
+    // double it. See _selectLiveElement's own doc.
+    if (isNewWrapper && elem.matrix && !node._rasterized) {
         var m = elem.matrix;
         var initDec = _matDec;
         wrapperNode.properties["position"] = _vec2(m.tx * scaleFactor, m.ty * scaleFactor);
@@ -4354,7 +4723,10 @@ function _processElementNode(elem, parent, ownerRoot, anim, startTime, duration,
         }
     }
 
-    if (elem.elementType === "shape" && !elem._isTweenShape && (!elem.polygons || elem.polygons.length === 0) && (!elem.strokes || elem.strokes.length === 0)) {
+    if (node._rasterized) {
+        // Skip both the empty-shape branch and the generic "else if
+        // (elem.matrix)" animation-track branch below entirely.
+    } else if (elem.elementType === "shape" && !elem._isTweenShape && (!elem.polygons || elem.polygons.length === 0) && (!elem.strokes || elem.strokes.length === 0)) {
         // A truly empty shape (no contours at all) can report left/top as
         // Flash's "no bounds" sentinel (observed: -107374182.4, i.e.
         // INT32_MIN twips / 20) instead of 0/undefined -- treat anything
@@ -4953,7 +5325,8 @@ function _buildSceneTree(sym, frameRate, exportDir, symbolMap, symbolContainsSha
 
                     _processElementNode(elem, targetParent, root, anim, startTime, duration, frameRate,
                         uniqueNodeName, exportDir, scaleFactor, sym.name, kf.startFrame, maxTime,
-                        kfTransition, shaderNeeds, layer.layerType, getExt, subResources, (layer.keyframes.length === 1), modulateNeedsCanvasGroup, gradCache, layerZIndex);
+                        kfTransition, shaderNeeds, layer.layerType, getExt, subResources, (layer.keyframes.length === 1), modulateNeedsCanvasGroup, gradCache, layerZIndex,
+                        i, e);
                 }
                 lastElemPositions = _recordElemPositions(_explodedMain, _stableMain);
             }
