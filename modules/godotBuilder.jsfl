@@ -4196,18 +4196,20 @@ function generateAnimTracksStr(animObj) {
     var L = [];
     for (var i = 0; i < animObj.tracks.length; i++) {
         var tr = animObj.tracks[i];
-        L.push('tracks/' + i + '/type = "' + tr.type + '"');
-        L.push('tracks/' + i + '/imported = false');
-        L.push('tracks/' + i + '/enabled = true');
-        L.push('tracks/' + i + '/path = NodePath("' + tr.path + '")');
-        L.push('tracks/' + i + '/interp = ' + tr.interp);
-        L.push('tracks/' + i + '/loop_wrap = false');
-        L.push('tracks/' + i + '/keys = {');
+        var pre = 'tracks/' + i + '/'; // computed once per track
+        L.push(pre + 'type = "' + tr.type + '"');
+        L.push(pre + 'imported = false');
+        L.push(pre + 'enabled = true');
+        L.push(pre + 'path = NodePath("' + tr.path + '")');
+        L.push(pre + 'interp = ' + tr.interp);
+        L.push(pre + 'loop_wrap = false');
+        L.push(pre + 'keys = {');
 
-        var timesStr = [];
-        for (var ti = 0; ti < tr.keys.times.length; ti++) timesStr.push(_f(tr.keys.times[ti]));
-        var transStr = [];
-        for (var trI = 0; trI < tr.keys.transitions.length; trI++) transStr.push(_f(tr.keys.transitions[trI]));
+        var times = tr.keys.times, trans = tr.keys.transitions, vals = tr.keys.values;
+        var timesStr = new Array(times.length);
+        for (var ti = 0; ti < times.length; ti++) timesStr[ti] = _f(times[ti]);
+        var transStr = new Array(trans.length);
+        for (var trI = 0; trI < trans.length; trI++) transStr[trI] = _f(trans[trI]);
 
         L.push('"times": PackedFloat32Array(' + timesStr.join(', ') + '),');
         L.push('"transitions": PackedFloat32Array(' + transStr.join(', ') + '),');
@@ -4216,8 +4218,8 @@ function generateAnimTracksStr(animObj) {
         }
 
         var valsStr = [];
-        for (var v = 0; v < tr.keys.values.length; v++) {
-            var val = tr.keys.values[v];
+        for (var v = 0; v < vals.length; v++) {
+            var val = vals[v];
             if (typeof val === "boolean")         valsStr.push(val ? "true" : "false");
             else if (typeof val === "number")     valsStr.push(_f(val));
             else if (val && val.x !== undefined)  valsStr.push(_vec2(val.x, val.y));
